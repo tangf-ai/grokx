@@ -89,7 +89,6 @@ button {
 .brand {
   display: flex;
   align-items: center;
-  gap: 8px;
   font-weight: 700;
   font-size: 17px;
   letter-spacing: -0.02em;
@@ -105,11 +104,6 @@ button {
 
 .brand-btn:hover {
   opacity: 0.85;
-}
-
-.brand-mark {
-  color: var(--accent, #111);
-  flex-shrink: 0;
 }
 
 .icon-btn {
@@ -451,11 +445,16 @@ button {
 .sidebar-bottom {
   border-top: 1px solid var(--border);
   padding-top: 10px;
-  margin-top: 8px;
+  margin-top: auto;
+  flex-shrink: 0;
+}
+
+.sidebar-settings-btn {
+  margin-bottom: 4px;
 }
 
 .sidebar-meta {
-  padding: 6px 12px 0;
+  padding: 4px 12px 0;
   font-size: 11px;
   color: var(--muted-2);
 }

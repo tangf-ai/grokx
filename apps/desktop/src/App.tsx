@@ -5,7 +5,6 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import {
   IconAlert,
-  IconBrand,
   IconChevronLeft,
   IconChevronRight,
   IconInfo,
@@ -1796,18 +1795,7 @@ export default function App() {
             title="Back to workspace"
             onClick={() => setView("workspace")}
           >
-            <IconBrand size={20} className="brand-mark" />
-            <span>Grokx</span>
-          </button>
-          <button
-            className={`icon-btn${view === "settings" ? " active" : ""}`}
-            title="Settings"
-            onClick={() => {
-              setView("settings");
-              void loadSettings();
-            }}
-          >
-            <IconSettings size={16} />
+            Grokx
           </button>
         </div>
 
@@ -1958,6 +1946,22 @@ export default function App() {
         </div>
 
         <div className="sidebar-bottom">
+          <button
+            type="button"
+            className={`nav-item sidebar-settings-btn${
+              view === "settings" ? " active" : ""
+            }`}
+            title="Settings · model, API key, engine"
+            onClick={() => {
+              setView("settings");
+              void loadSettings();
+            }}
+          >
+            <span className="nav-glyph">
+              <IconSettings size={16} />
+            </span>
+            Settings
+          </button>
           <div className="sidebar-meta">v{appVersion}</div>
         </div>
       </aside>

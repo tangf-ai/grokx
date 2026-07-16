@@ -126,6 +126,13 @@ The packaged binary is **not** committed; local builds write to `apps/desktop/sr
 ./tools/sync-upstream.sh
 ```
 
+## Community
+
+Questions, feedback, and showcases are welcome on **[LINUX DO](https://linux.do/)** — a community we like and recommend for discussion around Grokx and related tooling.
+
+- Forum: [https://linux.do/](https://linux.do/)
+- GitHub Issues remain the place for bugs and pull requests.
+
 ## License
 
 - Product code: Apache-2.0 (see `LICENSE`)
