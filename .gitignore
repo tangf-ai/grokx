@@ -25,8 +25,9 @@ packaging/dist/
 *.deb
 *.rpm
 
-# Bundled runtime artifacts (built, not source)
-apps/desktop/src-tauri/resources/runtime/
+# Bundled runtime artifacts (built binaries only; keep version.json tracked)
+apps/desktop/src-tauri/resources/runtime/grok
+apps/desktop/src-tauri/resources/runtime/grok.exe
 /runtime-dist/
 
 # IDE / OS
