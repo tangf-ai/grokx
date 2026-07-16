@@ -126,6 +126,31 @@ The packaged binary is **not** committed; local builds write to `apps/desktop/sr
 ./tools/sync-upstream.sh
 ```
 
+## FAQ
+
+### macOS: “app is damaged” / Gatekeeper blocks Grokx after download
+
+The macOS build is not Developer ID signed or notarized yet, so Gatekeeper may block the first launch (or report the app as damaged / untrusted).
+
+**Option A — clear quarantine (recommended):**
+
+```bash
+xattr -cr /Applications/Grokx.app
+```
+
+Then open Grokx again (from Applications, or Spotlight).
+
+**Option B — open once via Finder:**
+
+1. Right-click (or Control-click) **Grokx** in Applications  
+2. Choose **Open** → confirm **Open** again  
+
+If you installed from a DMG but did not copy the app to Applications, run the same command on the mounted path, for example:
+
+```bash
+xattr -cr /Volumes/Grokx/Grokx.app
+```
+
 ## Community
 
 Questions, feedback, and showcases are welcome on **[LINUX DO](https://linux.do/)** — a community we like and recommend for discussion around Grokx and related tooling.
