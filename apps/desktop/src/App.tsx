@@ -360,6 +360,15 @@ export default function App() {
   /** Auto-title only once per task after the first successful assistant reply. */
   const autoTitledSessionRef = useRef<Set<string>>(new Set());
   const sessionsRef = useRef<SessionListRow[]>([]);
+  /**
+   * Chat auto-follow: content can stream fast, but viewport eases toward the
+   * bottom slowly. Once the user scrolls manually, stop until they send again
+   * or return near the bottom.
+   */
+  const autoScrollEnabledRef = useRef(true);
+  const userScrollIntentRef = useRef(false);
+  const scrollAnimRef = useRef<number | null>(null);
+  const lastProgrammaticScrollRef = useRef(0);
 
   useEffect(() => {
     linesRef.current = lines;
@@ -743,6 +752,67 @@ export default function App() {
     return null;
   }, [lines]);
 
+  const distanceFromBottom = useCallback((el: HTMLElement) => {
+    return el.scrollHeight - el.scrollTop - el.clientHeight;
+  }, []);
+
+  const isNearBottom = useCallback(
+    (el: HTMLElement, threshold = 80) => distanceFromBottom(el) <= threshold,
+    [distanceFromBottom],
+  );
+
+  /** Ease viewport toward bottom (slow + smooth). Does not jump. */
+  const ensureSmoothAutoScroll = useCallback(() => {
+    if (!autoScrollEnabledRef.current) return;
+    if (scrollAnimRef.current != null) return;
+
+    const step = () => {
+      scrollAnimRef.current = null;
+      if (!autoScrollEnabledRef.current) return;
+      const el = chatScrollRef.current;
+      if (!el) return;
+
+      const remaining = distanceFromBottom(el);
+      if (remaining <= 1.5) {
+        // Snap residual for crisp bottom alignment.
+        if (remaining > 0) {
+          lastProgrammaticScrollRef.current = performance.now();
+          el.scrollTop = el.scrollHeight;
+        }
+        return;
+      }
+
+      // Ease: move a fraction of remaining distance each frame (slow follow).
+      // Cap step so long streams don't race the eye.
+      const ease = 0.08;
+      const minStep = 0.6;
+      const maxStep = 14;
+      let delta = remaining * ease;
+      if (delta < minStep) delta = Math.min(minStep, remaining);
+      if (delta > maxStep) delta = maxStep;
+
+      lastProgrammaticScrollRef.current = performance.now();
+      el.scrollTop += delta;
+      scrollAnimRef.current = requestAnimationFrame(step);
+    };
+
+    scrollAnimRef.current = requestAnimationFrame(step);
+  }, [distanceFromBottom]);
+
+  const enableAutoScroll = useCallback(() => {
+    autoScrollEnabledRef.current = true;
+    userScrollIntentRef.current = false;
+    ensureSmoothAutoScroll();
+  }, [ensureSmoothAutoScroll]);
+
+  const disableAutoScroll = useCallback(() => {
+    autoScrollEnabledRef.current = false;
+    if (scrollAnimRef.current != null) {
+      cancelAnimationFrame(scrollAnimRef.current);
+      scrollAnimRef.current = null;
+    }
+  }, []);
+
   const updateStickyUser = useCallback(() => {
     const scroller = chatScrollRef.current;
     if (!scroller || !lastUserMessage) {
@@ -766,39 +836,125 @@ export default function App() {
     setStickyUserId(scrolledPast && hasAfter ? lastUserMessage.id : null);
   }, [lastUserMessage, lines]);
 
+  // When chat content grows, ease toward bottom only if auto-follow is on.
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
-    // After auto-scroll to bottom, user msg is past — show sticky.
+    if (!autoScrollEnabledRef.current) {
+      updateStickyUser();
+      return;
+    }
+    ensureSmoothAutoScroll();
     requestAnimationFrame(() => updateStickyUser());
-  }, [lines, busy, pendingPerm, updateStickyUser]);
+  }, [lines, busy, pendingPerm, ensureSmoothAutoScroll, updateStickyUser]);
 
+  // Detect user-driven scroll vs programmatic ease.
   useEffect(() => {
     const scroller = chatScrollRef.current;
     if (!scroller) return;
-    const onScroll = () => updateStickyUser();
-    scroller.addEventListener("scroll", onScroll, { passive: true });
-    window.addEventListener("resize", onScroll);
-    updateStickyUser();
-    return () => {
-      scroller.removeEventListener("scroll", onScroll);
-      window.removeEventListener("resize", onScroll);
+
+    const markUserIntent = () => {
+      userScrollIntentRef.current = true;
+      // Any wheel/touch/keys means the user is in control.
+      disableAutoScroll();
     };
-  }, [updateStickyUser, view]);
+
+    const onWheel = () => markUserIntent();
+    const onTouchStart = () => markUserIntent();
+    const onPointerDown = (e: PointerEvent) => {
+      // Trackpad/mouse drag on scrollbar or content.
+      if (e.pointerType === "mouse" || e.pointerType === "pen" || e.pointerType === "touch") {
+        markUserIntent();
+      }
+    };
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (
+        e.key === "PageUp" ||
+        e.key === "PageDown" ||
+        e.key === "Home" ||
+        e.key === "End" ||
+        e.key === "ArrowUp" ||
+        e.key === "ArrowDown" ||
+        e.key === " " 
+      ) {
+        // Only if chat is focused / event not from input.
+        const t = e.target as HTMLElement | null;
+        if (t && (t.tagName === "TEXTAREA" || t.tagName === "INPUT")) return;
+        markUserIntent();
+      }
+    };
+
+    const onScroll = () => {
+      updateStickyUser();
+      // Ignore scroll events we just caused programmatically.
+      if (performance.now() - lastProgrammaticScrollRef.current < 48) {
+        return;
+      }
+      // Native scrollbar drag often only fires scroll, not pointer on content.
+      if (userScrollIntentRef.current) {
+        disableAutoScroll();
+        return;
+      }
+      // If user dragged scrollbar without prior intent flag, treat large jumps
+      // away from bottom as manual.
+      if (!isNearBottom(scroller, 100)) {
+        disableAutoScroll();
+      }
+    };
+
+    // Re-enable when user scrolls back to the live edge.
+    const onScrollEndCheck = () => {
+      if (autoScrollEnabledRef.current) return;
+      if (isNearBottom(scroller, 40)) {
+        // User returned to bottom — resume gentle follow.
+        userScrollIntentRef.current = false;
+        enableAutoScroll();
+      }
+    };
+
+    let endTimer: ReturnType<typeof setTimeout> | null = null;
+    const onScrollWithEnd = () => {
+      onScroll();
+      if (endTimer) clearTimeout(endTimer);
+      endTimer = setTimeout(onScrollEndCheck, 140);
+    };
+
+    scroller.addEventListener("wheel", onWheel, { passive: true });
+    scroller.addEventListener("touchstart", onTouchStart, { passive: true });
+    scroller.addEventListener("pointerdown", onPointerDown, { passive: true });
+    scroller.addEventListener("scroll", onScrollWithEnd, { passive: true });
+    window.addEventListener("keydown", onKeyDown);
+    window.addEventListener("resize", updateStickyUser);
+    updateStickyUser();
+
+    return () => {
+      if (endTimer) clearTimeout(endTimer);
+      if (scrollAnimRef.current != null) {
+        cancelAnimationFrame(scrollAnimRef.current);
+        scrollAnimRef.current = null;
+      }
+      scroller.removeEventListener("wheel", onWheel);
+      scroller.removeEventListener("touchstart", onTouchStart);
+      scroller.removeEventListener("pointerdown", onPointerDown);
+      scroller.removeEventListener("scroll", onScrollWithEnd);
+      window.removeEventListener("keydown", onKeyDown);
+      window.removeEventListener("resize", updateStickyUser);
+    };
+  }, [updateStickyUser, view, disableAutoScroll, enableAutoScroll, isNearBottom]);
 
   const jumpToUserMessage = useCallback(
     (id: string) => {
       const el = userMsgEls.current.get(id);
       const scroller = chatScrollRef.current;
       if (!el || !scroller) return;
+      // Manual navigation — pause auto-follow.
+      disableAutoScroll();
       el.scrollIntoView({ behavior: "smooth", block: "start" });
       setHighlightUserId(id);
       window.setTimeout(() => {
         setHighlightUserId((cur) => (cur === id ? null : cur));
       }, 1600);
-      // After scroll animation, recompute sticky
       window.setTimeout(() => updateStickyUser(), 400);
     },
-    [updateStickyUser],
+    [updateStickyUser, disableAutoScroll],
   );
 
   const stickyUserText = useMemo(() => {
@@ -1274,6 +1430,15 @@ export default function App() {
     if (historyEpochRef.current !== epoch) return;
     setLines(history);
     linesRef.current = history;
+    // Land at bottom of restored history, then allow gentle follow again.
+    autoScrollEnabledRef.current = true;
+    userScrollIntentRef.current = false;
+    requestAnimationFrame(() => {
+      const el = chatScrollRef.current;
+      if (!el) return;
+      lastProgrammaticScrollRef.current = performance.now();
+      el.scrollTop = el.scrollHeight;
+    });
 
     try {
       if (s.project_root) {
@@ -1704,6 +1869,8 @@ export default function App() {
       textareaRef.current.style.height = "auto";
     }
     turnStartedAtRef.current = Date.now();
+    // New user turn: resume gentle auto-follow from the bottom.
+    enableAutoScroll();
     const display =
       pendingAttachments.length > 0
         ? `${text || "(attachments)"}${text ? "\n\n" : ""}📎 ${pendingAttachments
