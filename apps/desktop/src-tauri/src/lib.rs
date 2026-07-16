@@ -93,6 +93,9 @@ struct SendPromptInput {
 }
 
 fn resource_dir(app: &AppHandle) -> Option<PathBuf> {
+    // Tauri resource_dir → typically Contents/Resources in a .app bundle.
+    // Bundled runtime may live at Resources/runtime/grok OR
+    // Resources/resources/runtime/grok depending on tauri.conf resources paths.
     app.path().resource_dir().ok().or_else(|| {
         Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources"))
     })
@@ -119,7 +122,9 @@ async fn resolve_engine(
     core: State<'_, CoreState>,
 ) -> Result<EngineInfo, String> {
     let resource_dir = resource_dir(&app);
-    let allow_path = cfg!(debug_assertions);
+    // Always allow PATH fallback as last resort so packaged apps still work
+    // when resource layout differs or users have a local grok install.
+    let allow_path = true;
 
     match core
         .0
@@ -307,7 +312,8 @@ async fn connect_workspace(
         .map(PathBuf::from)
         .or(selected)
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-    let allow_path = cfg!(debug_assertions);
+    // Prefer bundled engine; PATH is a last-resort fallback (see resolve_engine).
+    let allow_path = true;
     // Default OFF for real permission flow; UI can opt into auto-approve.
     let auto_approve = auto_approve.unwrap_or(false);
 
@@ -343,7 +349,7 @@ async fn reconnect_session(
     auto_approve: Option<bool>,
 ) -> Result<SessionInfo, String> {
     let sid = parse_session_id(&session_id)?;
-    let allow_path = cfg!(debug_assertions);
+    let allow_path = true;
     let auto_approve = auto_approve.unwrap_or(false);
     let new_id = core
         .0
