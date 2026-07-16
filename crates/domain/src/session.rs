@@ -18,7 +18,7 @@ impl Default for SessionId {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct ProjectId(pub Uuid);
 
 impl ProjectId {

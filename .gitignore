@@ -6,7 +6,9 @@ Cargo.lock.bak
 
 # Node / frontend
 node_modules/
-dist/
+# Vite output (keep a tiny tracked placeholder for tauri generate_context)
+apps/desktop/dist/*
+!apps/desktop/dist/index.html
 .vite/
 *.local
 .DS_Store
