@@ -4,11 +4,13 @@
 //! easy to test and safe to depend on from every layer.
 
 mod permission;
+mod prompt;
 mod session;
 mod tool_call;
 mod turn;
 
 pub use permission::*;
+pub use prompt::*;
 pub use session::*;
 pub use tool_call::*;
 pub use turn::*;

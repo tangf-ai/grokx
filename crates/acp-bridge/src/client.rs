@@ -3,8 +3,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use std::path::Path;
+
+use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use domain::{
-    AgentConnectionStatus, AppEvent, PermissionDecision, SessionId, TurnState,
+    AgentConnectionStatus, AppEvent, ModelInfo, PermissionDecision, PromptRequest,
+    ReasoningEffort, SessionId, TurnState,
 };
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -58,6 +62,8 @@ struct Shared {
     events: mpsc::UnboundedSender<AppEvent>,
     /// Permission RPCs waiting for UI when auto_approve is false.
     permission_gate: Mutex<PermissionGate>,
+    available_models: Mutex<Vec<ModelInfo>>,
+    current_model: Mutex<Option<String>>,
 }
 
 /// Live ACP connection. Clone-friendly handle for commands; reader task owns the process pipes.
@@ -122,6 +128,8 @@ impl AcpClient {
             options: options.clone(),
             events: events_tx,
             permission_gate: Mutex::new(PermissionGate::new()),
+            available_models: Mutex::new(Vec::new()),
+            current_model: Mutex::new(options.model.clone()),
         });
 
         let reader_shared = Arc::clone(&shared);
@@ -233,6 +241,7 @@ impl AcpClientHandle {
             .to_string();
 
         *self.shared.engine_session_id.lock().await = Some(engine_id);
+        self.ingest_models_from_session_new(&result).await;
 
         let _ = self.shared.events.send(AppEvent::AgentStatus {
             status: AgentConnectionStatus::Ready,
@@ -240,6 +249,59 @@ impl AcpClientHandle {
         });
 
         Ok(())
+    }
+
+    async fn ingest_models_from_session_new(&self, result: &Value) {
+        let mut models = Vec::new();
+        if let Some(arr) = result
+            .pointer("/models/availableModels")
+            .or_else(|| result.pointer("/availableModels"))
+            .and_then(|v| v.as_array())
+        {
+            for m in arr {
+                let id = m
+                    .get("modelId")
+                    .or_else(|| m.get("id"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                if id.is_empty() {
+                    continue;
+                }
+                let name = m
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(&id)
+                    .to_string();
+                models.push(ModelInfo { id, name });
+            }
+        }
+        if models.is_empty() {
+            // Sensible defaults when engine doesn't advertise models.
+            models.extend([
+                ModelInfo {
+                    id: "grok-4.5".into(),
+                    name: "Grok 4.5".into(),
+                },
+                ModelInfo {
+                    id: "grok-code".into(),
+                    name: "Grok Code".into(),
+                },
+                ModelInfo {
+                    id: "grok-build".into(),
+                    name: "Grok Build".into(),
+                },
+            ]);
+        }
+        let current = result
+            .pointer("/models/currentModelId")
+            .or_else(|| result.get("currentModelId"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .or_else(|| self.shared.options.model.clone())
+            .or_else(|| models.first().map(|m| m.id.clone()));
+        *self.shared.available_models.lock().await = models;
+        *self.shared.current_model.lock().await = current;
     }
 
     pub async fn engine_session_id(&self) -> Option<String> {
@@ -250,28 +312,83 @@ impl AcpClientHandle {
         self.shared.app_session_id.lock().await.clone()
     }
 
-    /// Send a user prompt and stream updates until the prompt RPC completes.
+    pub async fn available_models(&self) -> Vec<ModelInfo> {
+        self.shared.available_models.lock().await.clone()
+    }
+
+    pub async fn current_model(&self) -> Option<String> {
+        self.shared.current_model.lock().await.clone()
+    }
+
+    /// Best-effort model switch for the live session.
+    pub async fn set_model(&self, model_id: &str) -> Result<(), BridgeError> {
+        let engine_session_id = self
+            .engine_session_id()
+            .await
+            .ok_or_else(|| BridgeError::Message("no engine session".into()))?;
+        let res = self
+            .request(
+                "session/set_model",
+                json!({
+                    "sessionId": engine_session_id,
+                    "modelId": model_id
+                }),
+            )
+            .await;
+        // Some agents may not support set_model; keep local selection either way.
+        *self.shared.current_model.lock().await = Some(model_id.to_string());
+        if let Err(err) = res {
+            debug!(error = %err, model = model_id, "session/set_model failed (kept local selection)");
+        }
+        Ok(())
+    }
+
+    /// Send a user prompt (text + optional attachments) and stream until complete.
     pub async fn prompt(&self, text: &str) -> Result<(), BridgeError> {
+        self.prompt_request(PromptRequest {
+            text: text.to_string(),
+            attachments: vec![],
+            model: None,
+            effort: None,
+        })
+        .await
+    }
+
+    pub async fn prompt_request(&self, req: PromptRequest) -> Result<(), BridgeError> {
         let engine_session_id = self
             .engine_session_id()
             .await
             .ok_or_else(|| BridgeError::Message("no engine session".into()))?;
         let app_session_id = self.app_session_id().await;
 
+        if let Some(model) = req.model.as_deref().filter(|s| !s.is_empty()) {
+            let _ = self.set_model(model).await;
+        }
+
+        let prompt_blocks = build_prompt_blocks(&req)?;
+        if prompt_blocks.is_empty() {
+            return Err(BridgeError::Message("empty prompt".into()));
+        }
+
+        let effort = req.effort.unwrap_or(ReasoningEffort::Medium);
+        let mut params = json!({
+            "sessionId": engine_session_id,
+            "prompt": prompt_blocks,
+            "_meta": {
+                "reasoningEffort": effort.as_str(),
+                "x.ai/effort": effort.as_str(),
+            }
+        });
+        if let Some(model) = req.model.as_ref().or(self.current_model().await.as_ref()) {
+            params["_meta"]["modelId"] = json!(model);
+        }
+
         let _ = self.shared.events.send(AppEvent::TurnState {
             session_id: app_session_id.clone(),
             state: TurnState::Streaming,
         });
 
-        let result = self
-            .request(
-                "session/prompt",
-                json!({
-                    "sessionId": engine_session_id,
-                    "prompt": [{ "type": "text", "text": text }]
-                }),
-            )
-            .await;
+        let result = self.request("session/prompt", params).await;
 
         match result {
             Ok(_) => {
@@ -537,6 +654,107 @@ fn parse_id(id: Option<&Value>) -> Option<u64> {
         return s.parse().ok();
     }
     None
+}
+
+fn build_prompt_blocks(req: &PromptRequest) -> Result<Vec<Value>, BridgeError> {
+    let mut blocks = Vec::new();
+    let text = req.text.trim();
+    if !text.is_empty() {
+        blocks.push(json!({ "type": "text", "text": text }));
+    }
+
+    let mut file_notes = Vec::new();
+    for att in &req.attachments {
+        let path = Path::new(&att.path);
+        if !path.is_file() {
+            return Err(BridgeError::Message(format!(
+                "attachment not found: {}",
+                att.path
+            )));
+        }
+        let mime = att
+            .mime
+            .clone()
+            .or_else(|| {
+                mime_guess::from_path(path)
+                    .first()
+                    .map(|m| m.essence_str().to_string())
+            })
+            .unwrap_or_else(|| "application/octet-stream".into());
+
+        if mime.starts_with("image/") {
+            let bytes = std::fs::read(path).map_err(BridgeError::Io)?;
+            // Cap very large images in the JSON payload (~8MB binary).
+            if bytes.len() > 8 * 1024 * 1024 {
+                return Err(BridgeError::Message(format!(
+                    "image too large (max 8MB): {}",
+                    att.name
+                )));
+            }
+            let data = B64.encode(&bytes);
+            blocks.push(json!({
+                "type": "image",
+                "mimeType": mime,
+                "data": data,
+            }));
+        } else if mime.starts_with("text/")
+            || matches!(
+                path.extension().and_then(|e| e.to_str()).unwrap_or(""),
+                "md" | "json" | "toml" | "yaml" | "yml" | "rs" | "ts" | "tsx" | "js" | "py"
+                    | "go" | "java" | "c" | "cpp" | "h" | "css" | "html" | "txt" | "csv"
+                    | "sh" | "sql" | "xml"
+            )
+        {
+            let content = std::fs::read_to_string(path).map_err(BridgeError::Io)?;
+            let clipped = if content.len() > 200_000 {
+                format!(
+                    "{}\n\n… [truncated, {} bytes total]",
+                    &content[..200_000],
+                    content.len()
+                )
+            } else {
+                content
+            };
+            blocks.push(json!({
+                "type": "text",
+                "text": format!("Attached file `{}`:\n```\n{}\n```", att.name, clipped)
+            }));
+        } else {
+            // Non-text binary: pass path reference for the agent to open.
+            file_notes.push(format!("{} ({mime})", att.path));
+        }
+    }
+
+    if !file_notes.is_empty() {
+        blocks.push(json!({
+            "type": "text",
+            "text": format!(
+                "Attached files (open on disk):\n{}",
+                file_notes
+                    .iter()
+                    .map(|s| format!("- `{s}`"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            )
+        }));
+    }
+
+    // Ensure we always have at least a path note if only binary files.
+    if blocks.is_empty() && !req.attachments.is_empty() {
+        blocks.push(json!({
+            "type": "text",
+            "text": format!(
+                "Please review these attachments: {}",
+                req.attachments
+                    .iter()
+                    .map(|a| a.path.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        }));
+    }
+
+    Ok(blocks)
 }
 
 #[cfg(test)]

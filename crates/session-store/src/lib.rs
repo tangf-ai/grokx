@@ -16,6 +16,8 @@ pub enum StoreError {
     SessionNotFound(SessionId),
     #[error("project not found: {0:?}")]
     ProjectNotFound(ProjectId),
+    #[error("session title cannot be empty")]
+    EmptyTitle,
 }
 
 /// Flattened row for UI session lists.
@@ -123,6 +125,20 @@ impl SessionStore {
         s.updated_at = Utc::now();
         Ok(())
     }
+
+    pub fn rename_session(&mut self, id: &SessionId, title: impl Into<String>) -> Result<(), StoreError> {
+        let title = title.into().trim().to_string();
+        if title.is_empty() {
+            return Err(StoreError::EmptyTitle);
+        }
+        let s = self
+            .sessions
+            .get_mut(id)
+            .ok_or_else(|| StoreError::SessionNotFound(id.clone()))?;
+        s.title = title;
+        s.updated_at = Utc::now();
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -179,5 +195,34 @@ mod tests {
         assert_eq!(list[1].session_id, s_old);
         assert_eq!(list[1].project_name, "a");
         assert_eq!(list[1].engine_session_id.as_deref(), Some("eng-old"));
+    }
+
+    #[test]
+    fn rename_session_updates_title() {
+        let mut store = SessionStore::new();
+        let pid = ProjectId::new();
+        let sid = SessionId::new();
+        let now = Utc::now();
+        store.upsert_project(Project {
+            id: pid.clone(),
+            root_path: "/tmp/a".into(),
+            name: "a".into(),
+            created_at: now,
+        });
+        store.upsert_session(SessionMeta {
+            id: sid.clone(),
+            project_id: pid,
+            engine_session_id: None,
+            title: "old name".into(),
+            model: None,
+            created_at: now,
+            updated_at: now,
+        });
+        store.rename_session(&sid, "  新会话名  ").unwrap();
+        assert_eq!(store.get_session(&sid).unwrap().title, "新会话名");
+        assert!(matches!(
+            store.rename_session(&sid, "   "),
+            Err(StoreError::EmptyTitle)
+        ));
     }
 }

@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "grokx",
+  "productName": "Grokx",
   "version": "0.1.0",
   "identifier": "app.grokx.desktop",
   "build": {
@@ -12,10 +12,11 @@
   "app": {
     "windows": [
       {
-        "title": "grokx",
-        "width": 1280,
-        "height": 800,
-        "resizable": true
+        "title": "Grokx",
+        "width": 1360,
+        "height": 860,
+        "resizable": true,
+        "backgroundColor": "#f4f4f5"
       }
     ],
     "security": {
@@ -26,7 +27,11 @@
     "active": true,
     "targets": "all",
     "icon": [
-      "icons/icon.png"
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/henry.w@example.net",
+      "icons/icon.icns",
+      "icons/icon.ico"
     ],
     "resources": [
       "resources/runtime/*"

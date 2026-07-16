@@ -43,3 +43,5 @@ uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 directories = "6"
 which = "7"
+base64 = "0.22"
+mime_guess = "2"

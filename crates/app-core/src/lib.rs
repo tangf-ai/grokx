@@ -5,11 +5,11 @@ use std::sync::Arc;
 
 use acp_bridge::{AcpClient, AcpClientHandle, BridgeError, ConnectOptions};
 use agent_process::{resolve_engine, spawn_agent_stdio, ResolvedEngine, SpawnOptions};
-use app_config::{AppPaths, UserSettings};
+use app_config::{AppPaths, PublicUserSettings, SettingsUpdate, UserSettings};
 use chrono::Utc;
 use domain::{
-    AgentConnectionStatus, AppEvent, PermissionDecision, Project, ProjectId, SessionId,
-    SessionMeta, TurnState,
+    AgentConnectionStatus, AppEvent, ModelInfo, PermissionDecision, Project, ProjectId,
+    PromptRequest, ReasoningEffort, SessionId, SessionMeta, TurnState,
 };
 use permissions::{PermissionBroker, Policy};
 use session_store::{SessionListItem, SessionStore};
@@ -65,10 +65,13 @@ impl AppCore {
     pub fn bootstrap() -> Result<Arc<Self>, CoreError> {
         let paths = AppPaths::discover()?;
         paths.ensure_dirs()?;
+        let settings = UserSettings::load(&paths.config_file).unwrap_or_else(|_| {
+            UserSettings::product_defaults()
+        });
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         Ok(Arc::new(Self {
             paths,
-            settings: RwLock::new(UserSettings::product_defaults()),
+            settings: RwLock::new(settings),
             store: Mutex::new(SessionStore::new()),
             permissions: Mutex::new(PermissionBroker::new()),
             policy: RwLock::new(Policy::default()),
@@ -80,6 +83,25 @@ impl AppCore {
             event_tx,
             event_rx: Mutex::new(Some(event_rx)),
         }))
+    }
+
+    pub async fn public_settings(&self) -> PublicUserSettings {
+        self.settings.read().await.public_view()
+    }
+
+    pub async fn update_settings(&self, update: SettingsUpdate) -> Result<PublicUserSettings, CoreError> {
+        let public = {
+            let mut settings = self.settings.write().await;
+            settings.apply_update(update);
+            settings
+                .save(&self.paths.config_file)
+                .map_err(CoreError::Config)?;
+            if let Err(err) = settings.sync_endpoint_to_grok_toml() {
+                warn!(error = %err, "failed to sync endpoint to ~/.grok/config.toml");
+            }
+            settings.public_view()
+        };
+        Ok(public)
     }
 
     /// Take the primary event receiver (call once from the shell).
@@ -145,6 +167,18 @@ impl AppCore {
         self.store.lock().await.list_sessions()
     }
 
+    pub async fn rename_session(
+        &self,
+        session_id: &SessionId,
+        title: impl Into<String>,
+    ) -> Result<(), CoreError> {
+        self.store
+            .lock()
+            .await
+            .rename_session(session_id, title)
+            .map_err(|e| CoreError::Message(e.to_string()))
+    }
+
     /// Start (or restart) the agent for a project workspace.
     pub async fn connect_workspace(
         self: &Arc<Self>,
@@ -187,14 +221,26 @@ impl AppCore {
         });
 
         let settings = self.settings.read().await.clone();
-        // Do not override GROK_HOME by default: agent needs the user's existing
-        // auth (~/.grok). Product-specific isolation can be opt-in later.
-        let env = vec![];
+        // Inject API key / base URL for the engine; keep user ~/.grok for auth/skills.
+        let env = settings.engine_env();
+
+        let model = settings
+            .model
+            .clone()
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                let id = settings.endpoint.model_id.trim();
+                if id.is_empty() {
+                    None
+                } else {
+                    Some(id.to_string())
+                }
+            });
 
         let child = spawn_agent_stdio(
             engine,
             SpawnOptions {
-                model: settings.model.clone(),
+                model,
                 env,
                 agent_args: if auto_approve {
                     vec!["--always-approve".into()]
@@ -318,8 +364,21 @@ impl AppCore {
 
     /// Send a user prompt on the active session.
     pub async fn send_prompt(self: &Arc<Self>, text: String) -> Result<(), CoreError> {
-        let text = text.trim().to_string();
-        if text.is_empty() {
+        self.send_prompt_request(PromptRequest {
+            text,
+            attachments: vec![],
+            model: None,
+            effort: None,
+        })
+        .await
+    }
+
+    pub async fn send_prompt_request(
+        self: &Arc<Self>,
+        mut req: PromptRequest,
+    ) -> Result<(), CoreError> {
+        req.text = req.text.trim().to_string();
+        if req.text.is_empty() && req.attachments.is_empty() {
             return Err(CoreError::Message("empty prompt".into()));
         }
 
@@ -331,15 +390,31 @@ impl AppCore {
             *busy = true;
         }
 
+        // Persist preferred model in settings.
+        if let Some(model) = req.model.clone() {
+            let mut settings = self.settings.write().await;
+            settings.model = Some(model);
+        }
+
         let (handle, session_id) = {
             let live = self.live.lock().await;
             let live = live.as_ref().ok_or(CoreError::NotConnected)?;
             (live.handle.clone(), live.app_session_id.clone())
         };
 
+        let mut display = req.text.clone();
+        if !req.attachments.is_empty() {
+            let names: Vec<_> = req.attachments.iter().map(|a| a.name.as_str()).collect();
+            if display.is_empty() {
+                display = format!("(attachments: {})", names.join(", "));
+            } else {
+                display = format!("{display}\n\n📎 {}", names.join(", "));
+            }
+        }
+
         self.emit(AppEvent::UserMessage {
             session_id: session_id.clone(),
-            text: text.clone(),
+            text: display,
         });
         self.emit(AppEvent::TurnState {
             session_id: session_id.clone(),
@@ -348,7 +423,7 @@ impl AppCore {
 
         let core = Arc::clone(self);
         tokio::spawn(async move {
-            let result = handle.prompt(&text).await;
+            let result = handle.prompt_request(req).await;
             if let Err(err) = result {
                 warn!(error = %err, "prompt failed");
                 core.emit(AppEvent::AgentError {
@@ -364,6 +439,39 @@ impl AppCore {
         });
 
         Ok(())
+    }
+
+    pub async fn available_models(&self) -> Vec<ModelInfo> {
+        let live = self.live.lock().await;
+        match live.as_ref() {
+            Some(l) => l.handle.available_models().await,
+            None => default_models(),
+        }
+    }
+
+    pub async fn current_model(&self) -> Option<String> {
+        if let Some(live) = self.live.lock().await.as_ref() {
+            if let Some(m) = live.handle.current_model().await {
+                return Some(m);
+            }
+        }
+        self.settings.read().await.model.clone()
+    }
+
+    pub async fn set_model(&self, model_id: String) -> Result<(), CoreError> {
+        {
+            let mut settings = self.settings.write().await;
+            settings.model = Some(model_id.clone());
+        }
+        let live = self.live.lock().await;
+        if let Some(l) = live.as_ref() {
+            l.handle.set_model(&model_id).await?;
+        }
+        Ok(())
+    }
+
+    pub fn effort_options() -> Vec<ReasoningEffort> {
+        ReasoningEffort::all().to_vec()
     }
 
     pub async fn cancel_turn(&self) -> Result<(), CoreError> {
@@ -433,6 +541,23 @@ impl AppCore {
             detail: Some("disconnected".into()),
         });
     }
+}
+
+fn default_models() -> Vec<ModelInfo> {
+    vec![
+        ModelInfo {
+            id: "grok-4.5".into(),
+            name: "Grok 4.5".into(),
+        },
+        ModelInfo {
+            id: "grok-code".into(),
+            name: "Grok Code".into(),
+        },
+        ModelInfo {
+            id: "grok-build".into(),
+            name: "Grok Build".into(),
+        },
+    ]
 }
 
 #[cfg(test)]

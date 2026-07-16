@@ -2,9 +2,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use agent_process::EngineSource;
+use app_config::{PublicUserSettings, SettingsUpdate};
 use app_core::AppCore;
-use domain::{AppEvent, PermissionDecision, SessionId};
-use serde::Serialize;
+use domain::{
+    AppEvent, PermissionDecision, PromptAttachment, PromptRequest, ReasoningEffort, SessionId,
+};
+use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State};
 use uuid::Uuid;
 
@@ -32,6 +35,35 @@ struct SessionListRow {
     title: String,
     engine_session_id: Option<String>,
     updated_at: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ModelOption {
+    id: String,
+    name: String,
+}
+
+#[derive(Debug, Serialize)]
+struct EffortOption {
+    id: String,
+    label: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AttachmentInput {
+    path: String,
+    name: Option<String>,
+    mime: Option<String>,
+    size: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SendPromptInput {
+    text: String,
+    #[serde(default)]
+    attachments: Vec<AttachmentInput>,
+    model: Option<String>,
+    effort: Option<String>,
 }
 
 fn resource_dir(app: &AppHandle) -> Option<PathBuf> {
@@ -109,6 +141,19 @@ async fn list_sessions(core: State<'_, CoreState>) -> Result<Vec<SessionListRow>
 }
 
 #[tauri::command]
+async fn rename_session(
+    core: State<'_, CoreState>,
+    session_id: String,
+    title: String,
+) -> Result<(), String> {
+    let sid = parse_session_id(&session_id)?;
+    core.0
+        .rename_session(&sid, title)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 async fn connect_workspace(
     app: AppHandle,
     core: State<'_, CoreState>,
@@ -172,6 +217,135 @@ async fn reconnect_session(
 #[tauri::command]
 async fn send_prompt(core: State<'_, CoreState>, text: String) -> Result<(), String> {
     core.0.send_prompt(text).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn send_prompt_rich(
+    core: State<'_, CoreState>,
+    payload: SendPromptInput,
+) -> Result<(), String> {
+    let effort = payload
+        .effort
+        .as_deref()
+        .and_then(ReasoningEffort::parse);
+    let attachments = payload
+        .attachments
+        .into_iter()
+        .map(|a| {
+            let path = std::path::PathBuf::from(&a.path);
+            let name = a.name.unwrap_or_else(|| {
+                path.file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| a.path.clone())
+            });
+            let size = a.size.or_else(|| std::fs::metadata(&path).ok().map(|m| m.len()));
+            PromptAttachment {
+                path: a.path,
+                name,
+                mime: a.mime,
+                size,
+            }
+        })
+        .collect();
+    core.0
+        .send_prompt_request(PromptRequest {
+            text: payload.text,
+            attachments,
+            model: payload.model,
+            effort,
+        })
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn list_models(core: State<'_, CoreState>) -> Result<Vec<ModelOption>, String> {
+    let models = core.0.available_models().await;
+    Ok(models
+        .into_iter()
+        .map(|m| ModelOption {
+            id: m.id,
+            name: m.name,
+        })
+        .collect())
+}
+
+#[tauri::command]
+async fn current_model(core: State<'_, CoreState>) -> Result<Option<String>, String> {
+    Ok(core.0.current_model().await)
+}
+
+#[tauri::command]
+async fn set_model(core: State<'_, CoreState>, model_id: String) -> Result<(), String> {
+    core.0.set_model(model_id).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn list_efforts() -> Vec<EffortOption> {
+    AppCore::effort_options()
+        .into_iter()
+        .map(|e| EffortOption {
+            id: e.as_str().to_string(),
+            label: e.label().to_string(),
+        })
+        .collect()
+}
+
+#[tauri::command]
+async fn get_settings(core: State<'_, CoreState>) -> Result<PublicUserSettings, String> {
+    Ok(core.0.public_settings().await)
+}
+
+#[tauri::command]
+async fn save_settings(
+    core: State<'_, CoreState>,
+    update: SettingsUpdate,
+) -> Result<PublicUserSettings, String> {
+    core.0
+        .update_settings(update)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn pick_attachments(app: AppHandle) -> Result<Vec<AttachmentInput>, String> {
+    use tauri_plugin_dialog::DialogExt;
+    let files = app
+        .dialog()
+        .file()
+        .set_title("Attach files")
+        .add_filter(
+            "Common",
+            &[
+                "png", "jpg", "jpeg", "gif", "webp", "pdf", "txt", "md", "json", "rs", "ts",
+                "tsx", "js", "py", "go", "toml", "yaml", "yml", "csv", "html", "css",
+            ],
+        )
+        .blocking_pick_files();
+    let Some(files) = files else {
+        return Ok(vec![]);
+    };
+    let mut out = Vec::new();
+    for f in files {
+        let path = f
+            .into_path()
+            .map_err(|e| format!("invalid path: {e}"))?;
+        let name = path
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string());
+        let size = std::fs::metadata(&path).ok().map(|m| m.len());
+        let mime = mime_guess::from_path(&path)
+            .first()
+            .map(|m| m.essence_str().to_string());
+        out.push(AttachmentInput {
+            path: path.display().to_string(),
+            name: Some(name),
+            mime,
+            size,
+        });
+    }
+    Ok(out)
 }
 
 #[tauri::command]
@@ -283,6 +457,7 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_dialog::init())
         .manage(CoreState(core.clone()))
         .setup(move |app| {
             spawn_event_forwarder(app.handle().clone(), core);
@@ -293,9 +468,18 @@ pub fn run() {
             resolve_engine,
             set_project_root,
             list_sessions,
+            rename_session,
             connect_workspace,
             reconnect_session,
             send_prompt,
+            send_prompt_rich,
+            list_models,
+            current_model,
+            set_model,
+            list_efforts,
+            get_settings,
+            save_settings,
+            pick_attachments,
             cancel_turn,
             resolve_permission,
             permission_is_pending,
