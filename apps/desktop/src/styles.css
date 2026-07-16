@@ -1,0 +1,157 @@
+:root {
+  color-scheme: dark;
+  font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif;
+  --bg: #0f1115;
+  --panel: #171a21;
+  --border: #2a2f3a;
+  --text: #e8eaed;
+  --muted: #9aa3b2;
+  --accent: #7aa2ff;
+  --error: #ff7b72;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  margin: 0;
+  height: 100%;
+  background: var(--bg);
+  color: var(--text);
+}
+
+.layout {
+  display: grid;
+  grid-template-columns: 220px 1fr 280px;
+  height: 100%;
+}
+
+.sidebar,
+.right {
+  background: var(--panel);
+  border-right: 1px solid var(--border);
+  padding: 16px;
+}
+
+.right {
+  border-right: none;
+  border-left: 1px solid var(--border);
+}
+
+.brand {
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  margin-bottom: 24px;
+}
+
+.nav-item {
+  padding: 8px 10px;
+  border-radius: 8px;
+  margin-bottom: 4px;
+}
+
+.nav-item.active {
+  background: #222836;
+  color: var(--accent);
+}
+
+.sidebar-footer {
+  position: absolute;
+  bottom: 16px;
+  left: 16px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.sidebar {
+  position: relative;
+}
+
+.main {
+  padding: 20px 24px;
+  overflow: auto;
+}
+
+.topbar h1 {
+  margin: 0 0 4px;
+  font-size: 20px;
+}
+
+.subtitle,
+.muted,
+.hint {
+  color: var(--muted);
+}
+
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 16px;
+  margin-top: 16px;
+}
+
+.panel h2 {
+  margin: 0 0 12px;
+  font-size: 14px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+}
+
+.kv {
+  display: grid;
+  grid-template-columns: 100px 1fr;
+  gap: 8px 12px;
+  margin: 0;
+}
+
+.kv dt {
+  color: var(--muted);
+}
+
+.kv dd {
+  margin: 0;
+  word-break: break-all;
+}
+
+.mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+}
+
+.error {
+  color: var(--error);
+  white-space: pre-wrap;
+}
+
+.composer {
+  display: flex;
+  gap: 8px;
+  margin-top: 16px;
+}
+
+.composer input {
+  flex: 1;
+  background: #0f1115;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text);
+  padding: 10px 12px;
+}
+
+.composer button {
+  background: #2a3550;
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0 16px;
+}
+
+code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.9em;
+}

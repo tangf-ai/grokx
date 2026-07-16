@@ -1,0 +1,30 @@
+[package]
+name = "grokx-desktop"
+version.workspace = true
+description = "grokx desktop shell"
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "grokx_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+app-core = { workspace = true }
+agent-process = { workspace = true }
+app-config = { workspace = true }
+domain = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tauri = { version = "2", features = [] }
+tauri-plugin-shell = "2"
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]

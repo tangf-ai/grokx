@@ -1,0 +1,17 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  product-crates:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Check product crates
+        run: cargo check -p domain -p app-config -p agent-process -p acp-bridge -p permissions -p session-store -p app-core
+      - name: Test libraries
+        run: cargo test -p domain -p app-config -p agent-process -p acp-bridge -p permissions -p session-store

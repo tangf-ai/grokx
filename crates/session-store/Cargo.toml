@@ -1,0 +1,12 @@
+[package]
+name = "session-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Local session/project metadata store (SQLite later)"
+
+[dependencies]
+domain = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+chrono = { workspace = true }

@@ -1,0 +1,44 @@
+[workspace]
+resolver = "2"
+members = [
+  "apps/desktop/src-tauri",
+  "crates/domain",
+  "crates/app-config",
+  "crates/app-core",
+  "crates/acp-bridge",
+  "crates/agent-process",
+  "crates/permissions",
+  "crates/session-store",
+]
+# Engine is built independently and bundled as a binary runtime.
+# Keeping it out of the main workspace avoids dependency graph coupling
+# and makes upstream merges cheaper.
+exclude = [
+  "engine/grok-build",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/example/grokx"
+authors = ["grokx contributors"]
+
+[workspace.dependencies]
+domain = { path = "crates/domain" }
+app-config = { path = "crates/app-config" }
+app-core = { path = "crates/app-core" }
+acp-bridge = { path = "crates/acp-bridge" }
+agent-process = { path = "crates/agent-process" }
+permissions = { path = "crates/permissions" }
+session-store = { path = "crates/session-store" }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "sync", "time", "fs"] }
+tracing = "0.1"
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+directories = "6"
+which = "7"

@@ -1,0 +1,6 @@
+# Populated after subtree import / each sync.
+engine_name=grok-build
+engine_version=pending
+engine_commit=pending-subtree
+upstream=https://github.com/xai-org/grok-build.git
+prefix=engine/grok-build

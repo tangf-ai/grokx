@@ -1,0 +1,15 @@
+[package]
+name = "acp-bridge"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "ACP JSON-RPC client adapter producing domain AppEvents"
+
+[dependencies]
+domain = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }

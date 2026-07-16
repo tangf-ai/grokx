@@ -1,0 +1,8 @@
+{
+  "app_version": "0.1.0",
+  "engine_name": "grok-build",
+  "engine_version": "pending",
+  "engine_commit": "pending-subtree",
+  "engine_channel": "bundled",
+  "compatible_app_range": ">=0.1.0 <0.2.0"
+}

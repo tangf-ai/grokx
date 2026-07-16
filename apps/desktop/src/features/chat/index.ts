@@ -1,0 +1,1 @@
+// chat feature module (placeholder)

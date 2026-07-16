@@ -1,0 +1,17 @@
+[package]
+name = "app-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Application use-cases and orchestration"
+
+[dependencies]
+acp-bridge = { workspace = true }
+agent-process = { workspace = true }
+app-config = { workspace = true }
+domain = { workspace = true }
+permissions = { workspace = true }
+session-store = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }

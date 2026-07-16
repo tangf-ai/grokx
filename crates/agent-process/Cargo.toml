@@ -1,0 +1,15 @@
+[package]
+name = "agent-process"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Resolve and supervise the bundled (or custom) Grok Build runtime"
+
+[dependencies]
+app-config = { workspace = true }
+domain = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+which = { workspace = true }

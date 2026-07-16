@@ -1,0 +1,7 @@
+# App ↔ engine compatibility matrix (expand as releases ship).
+
+[[entry]]
+app = "0.1.0"
+engine_commit = "pending-subtree"
+status = "scaffold"
+notes = "Initial monorepo; ACP loop not wired yet."

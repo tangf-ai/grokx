@@ -1,0 +1,52 @@
+# Rust
+/target
+**/target
+**/*.rs.bk
+Cargo.lock.bak
+
+# Node / frontend
+node_modules/
+dist/
+.vite/
+*.local
+.DS_Store
+
+# Tauri / bundling
+apps/desktop/src-tauri/gen/
+apps/desktop/src-tauri/target/
+apps/desktop/src-tauri/WixTools/
+apps/desktop/src-tauri/*.log
+packaging/out/
+packaging/dist/
+*.dmg
+*.AppImage
+*.msi
+*.exe
+*.deb
+*.rpm
+
+# Bundled runtime artifacts (built, not source)
+apps/desktop/src-tauri/resources/runtime/
+/runtime-dist/
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Env / secrets
+.env
+.env.*
+!.env.example
+*.pem
+
+# Logs / local data
+*.log
+.cache/
+tmp/
+.temp/
+
+# Engine local build outputs (source stays tracked)
+engine/grok-build/target/

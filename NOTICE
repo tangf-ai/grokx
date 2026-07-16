@@ -1,0 +1,12 @@
+grokx
+Copyright 2026 grokx contributors
+
+This product includes software developed as a thin fork / redistribution of:
+
+  Grok Build
+  https://github.com/xai-org/grok-build
+  Copyright of the respective upstream authors
+  Licensed under the Apache License, Version 2.0
+
+See engine/grok-build/LICENSE and any NOTICE files under engine/grok-build/
+for upstream attribution details.
