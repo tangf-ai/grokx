@@ -42,6 +42,12 @@ impl SessionStore {
             .ok_or_else(|| StoreError::SessionNotFound(id.clone()))
     }
 
+    pub fn get_session_mut(&mut self, id: &SessionId) -> Result<&mut SessionMeta, StoreError> {
+        self.sessions
+            .get_mut(id)
+            .ok_or_else(|| StoreError::SessionNotFound(id.clone()))
+    }
+
     pub fn list_sessions_for_project(&self, project_id: &ProjectId) -> Vec<&SessionMeta> {
         let mut items: Vec<_> = self
             .sessions

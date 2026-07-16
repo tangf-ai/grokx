@@ -1,0 +1,12 @@
+[package]
+name = "acp-smoke"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+app-core = { path = "../../crates/app-core" }
+domain = { path = "../../crates/domain" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }

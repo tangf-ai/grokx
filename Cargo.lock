@@ -90,6 +90,7 @@ dependencies = [
  "acp-bridge",
  "agent-process",
  "app-config",
+ "chrono",
  "domain",
  "permissions",
  "serde",

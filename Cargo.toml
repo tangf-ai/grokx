@@ -15,6 +15,7 @@ members = [
 # and makes upstream merges cheaper.
 exclude = [
   "engine/grok-build",
+  "tools/acp-smoke",
 ]
 
 [workspace.package]

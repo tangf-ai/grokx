@@ -12,6 +12,7 @@ app-config = { workspace = true }
 domain = { workspace = true }
 permissions = { workspace = true }
 session-store = { workspace = true }
+chrono = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }

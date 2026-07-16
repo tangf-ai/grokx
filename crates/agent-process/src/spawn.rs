@@ -28,22 +28,27 @@ pub struct SpawnOptions {
     pub model: Option<String>,
     /// Extra env vars (e.g. isolated engine data dir).
     pub env: Vec<(String, String)>,
-    pub args_before_mode: Vec<String>,
+    /// Extra args inserted after `agent` and before `stdio`
+    /// (e.g. `--always-approve`).
+    pub agent_args: Vec<String>,
 }
 
 /// Spawn `grok agent stdio` with stdin/stdout piped for ACP.
+///
+/// Final argv: `grok agent [agent_args...] [--model <id>] stdio`
 pub fn spawn_agent_stdio(
     engine: ResolvedEngine,
     options: SpawnOptions,
 ) -> Result<AgentChild, SpawnError> {
     let mut cmd = Command::new(&engine.path);
-    for arg in &options.args_before_mode {
+    cmd.arg("agent");
+    for arg in &options.agent_args {
         cmd.arg(arg);
     }
     if let Some(model) = &options.model {
         cmd.arg("--model").arg(model);
     }
-    cmd.arg("agent").arg("stdio");
+    cmd.arg("stdio");
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());

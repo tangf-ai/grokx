@@ -30,6 +30,14 @@ pub enum AppEvent {
         status: AgentConnectionStatus,
         detail: Option<String>,
     },
+    SessionReady {
+        session_id: SessionId,
+        engine_session_id: Option<String>,
+    },
+    UserMessage {
+        session_id: SessionId,
+        text: String,
+    },
     MessageDelta {
         session_id: SessionId,
         text: String,
@@ -53,6 +61,10 @@ pub enum AppEvent {
     PlanUpdated {
         session_id: SessionId,
         steps: Vec<String>,
+    },
+    TurnState {
+        session_id: SessionId,
+        state: TurnState,
     },
     TurnFinished {
         session_id: SessionId,
