@@ -47,7 +47,14 @@ impl AppPaths {
         std::fs::create_dir_all(&self.data_dir)?;
         std::fs::create_dir_all(&self.logs_dir)?;
         std::fs::create_dir_all(&self.engine_data_dir)?;
+        // Ensure task workspaces root exists for history recovery.
+        let _ = std::fs::create_dir_all(Self::tasks_root());
         Ok(())
+    }
+
+    /// JSON index of projects + sessions (survives app restarts).
+    pub fn sessions_index_file(&self) -> PathBuf {
+        self.data_dir.join("sessions-index.json")
     }
 
     /// Default path of the Grok CLI config that the engine reads.
@@ -55,6 +62,22 @@ impl AppPaths {
         directories::UserDirs::new()
             .map(|u| u.home_dir().join(".grok").join("config.toml"))
             .unwrap_or_else(|| PathBuf::from("~/.grok/config.toml"))
+    }
+
+    /// Temporary task workspaces: `~/.grokx/tasks/<session_id>/`.
+    /// Each task has its own cwd; project sources are linked in as `project/`.
+    pub fn tasks_root() -> PathBuf {
+        directories::UserDirs::new()
+            .map(|u| u.home_dir().join(".grokx").join("tasks"))
+            .unwrap_or_else(|| PathBuf::from("~/.grokx/tasks"))
+    }
+
+    /// Default project directory when the user creates a task without
+    /// picking a folder: `~/.grokx/workspace`.
+    pub fn default_project_root() -> PathBuf {
+        directories::UserDirs::new()
+            .map(|u| u.home_dir().join(".grokx").join("workspace"))
+            .unwrap_or_else(|| PathBuf::from("~/.grokx/workspace"))
     }
 }
 

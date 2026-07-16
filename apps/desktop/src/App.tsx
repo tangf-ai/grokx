@@ -3,6 +3,22 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import {
+  IconAlert,
+  IconBrand,
+  IconChevronLeft,
+  IconChevronRight,
+  IconInfo,
+  IconPaperclip,
+  IconPen,
+  IconPlus,
+  IconRefresh,
+  IconSend,
+  IconSettings,
+  IconStop,
+  IconTool,
+  IconTrash,
+} from "./icons";
 
 type EngineInfo = {
   path: string;
@@ -13,15 +29,35 @@ type EngineInfo = {
 type SessionInfo = {
   session_id: string;
   project_root?: string | null;
+  /** Temporary task cwd under ~/.grokx/tasks/<id> */
+  work_path?: string | null;
   status: string;
 };
 
 type SessionListRow = {
   session_id: string;
+  project_id: string;
   project_root: string;
   project_name: string;
+  work_path: string;
   title: string;
   engine_session_id?: string | null;
+  /** Stable list order key (newest-created first). */
+  created_at: string;
+  updated_at: string;
+};
+
+/**
+ * Product model:
+ * - Project = concrete workspace path (stable, user-chosen folder)
+ * - Task (API: session) = temporary cwd at ~/.grokx/tasks/<id>
+ *   with a `project` symlink for source access
+ */
+type ProjectListRow = {
+  project_id: string;
+  name: string;
+  root_path: string;
+  session_count: number;
   updated_at: string;
 };
 
@@ -37,6 +73,8 @@ type Attachment = {
   name: string;
   mime?: string | null;
   size?: number | null;
+  /** Optional object URL for image preview in the composer. */
+  previewUrl?: string | null;
 };
 
 type ModelOption = { id: string; name: string };
@@ -69,6 +107,55 @@ function formatBytes(n?: number | null): string {
   return `${(n / (1024 * 1024)).toFixed(1)} MB`;
 }
 
+function formatDuration(ms: number): string {
+  if (ms < 1000) return `${Math.max(1, Math.round(ms))}ms`;
+  const sec = ms / 1000;
+  if (sec < 60) return `${sec.toFixed(sec < 10 ? 1 : 0)}s`;
+  const m = Math.floor(sec / 60);
+  const s = Math.round(sec % 60);
+  return `${m}m ${s.toString().padStart(2, "0")}s`;
+}
+
+/** Short sidebar title from first user message + optional first assistant reply. */
+function summarizeChatTitle(userText: string, assistantText?: string): string {
+  const firstLine = (t: string) =>
+    t
+      .split(/\r?\n/)
+      .map((l) => l.trim())
+      .find((l) => l.length > 0) ?? "";
+
+  let user = firstLine(userText)
+    .replace(/https?:\/\/\S+/gi, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!user) {
+    user = firstLine(userText).replace(/\s+/g, " ").trim();
+  }
+
+  const asst = firstLine(assistantText ?? "")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  let title = user;
+  if (asst && asst.length <= 28 && user) {
+    title = `${user} · ${asst}`;
+  } else if (!user && asst) {
+    title = asst;
+  }
+
+  const chars = [...title];
+  if (chars.length > 40) {
+    return `${chars.slice(0, 40).join("")}…`;
+  }
+  return title || "New task";
+}
+
+type TraceItem = {
+  id: string;
+  kind: "thought" | "tool" | "system" | "waiting";
+  text: string;
+};
+
 type ChatLine =
   | { id: string; kind: "user"; text: string }
   | { id: string; kind: "assistant"; text: string }
@@ -76,12 +163,83 @@ type ChatLine =
   | { id: string; kind: "tool"; text: string }
   | { id: string; kind: "system"; text: string }
   | { id: string; kind: "error"; text: string }
-  | { id: string; kind: "waiting"; text: string };
+  | { id: string; kind: "waiting"; text: string }
+  /** Collapsed process (thinking / tools / status) after a turn finishes. */
+  | {
+      id: string;
+      kind: "trace";
+      items: TraceItem[];
+      durationMs: number;
+      expanded: boolean;
+    };
 
 let chatLineSeq = 0;
 function nextLineId(kind: string): string {
   chatLineSeq += 1;
   return `${kind}-${Date.now()}-${chatLineSeq}`;
+}
+
+/** After a turn ends: fold thought/tool/system into one collapsible trace above the answer. */
+function collapseTurnProcess(
+  lines: ChatLine[],
+  durationMs: number,
+): ChatLine[] {
+  let lastUser = -1;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (lines[i].kind === "user") {
+      lastUser = i;
+      break;
+    }
+  }
+  if (lastUser < 0) return lines;
+
+  const head = lines.slice(0, lastUser + 1);
+  const tail = lines.slice(lastUser + 1);
+  // Don't collapse twice.
+  if (tail.some((l) => l.kind === "trace")) return lines;
+
+  const items: TraceItem[] = [];
+  const answers: ChatLine[] = [];
+  const rest: ChatLine[] = [];
+
+  for (const line of tail) {
+    if (line.kind === "waiting") continue; // drop typing placeholder
+    if (
+      line.kind === "thought" ||
+      line.kind === "tool" ||
+      line.kind === "system"
+    ) {
+      items.push({ id: line.id, kind: line.kind, text: line.text });
+    } else if (line.kind === "assistant") {
+      answers.push(line);
+    } else {
+      rest.push(line);
+    }
+  }
+
+  if (items.length === 0) return lines;
+
+  const trace: ChatLine = {
+    id: nextLineId("trace"),
+    kind: "trace",
+    items,
+    durationMs: Math.max(0, durationMs),
+    expanded: false,
+  };
+
+  return [...head, trace, ...answers, ...rest];
+}
+
+function summarizeTrace(items: TraceItem[]): string {
+  const thoughts = items.filter((i) => i.kind === "thought").length;
+  const tools = items.filter((i) => i.kind === "tool").length;
+  const systems = items.filter((i) => i.kind === "system").length;
+  const parts: string[] = [];
+  if (thoughts) parts.push(thoughts === 1 ? "thinking" : `${thoughts} thoughts`);
+  if (tools) parts.push(tools === 1 ? "1 tool" : `${tools} tools`);
+  if (systems && !thoughts && !tools) parts.push("activity");
+  if (parts.length === 0) parts.push(`${items.length} steps`);
+  return parts.join(" · ");
 }
 
 type AgentEvent = {
@@ -121,22 +279,30 @@ function shortPath(p: string | null | undefined): string {
   return `…/${parts.slice(-2).join("/")}`;
 }
 
-function chipIcon(kind: ChatLine["kind"]): string {
+function ChipIcon({ kind }: { kind: ChatLine["kind"] | TraceItem["kind"] }) {
   switch (kind) {
     case "tool":
-      return "⌘";
+      return <IconTool size={14} />;
     case "system":
-      return "ⓘ";
+      return <IconInfo size={14} />;
     case "error":
-      return "!";
+      return <IconAlert size={14} />;
+    case "thought":
+      return <IconPen size={14} />;
+    case "waiting":
+      return <IconInfo size={14} />;
     default:
-      return "·";
+      return <IconInfo size={14} />;
   }
 }
 
 export default function App() {
   const [engine, setEngine] = useState<EngineInfo | null>(null);
   const [session, setSession] = useState<SessionInfo | null>(null);
+  const [projects, setProjects] = useState<ProjectListRow[]>([]);
+  const [selectedProjectId, setSelectedProjectId] = useState<string | null>(
+    null,
+  );
   const [sessions, setSessions] = useState<SessionListRow[]>([]);
   const [renamingId, setRenamingId] = useState<string | null>(null);
   const [renameDraft, setRenameDraft] = useState("");
@@ -153,6 +319,8 @@ export default function App() {
   const [pendingPerm, setPendingPerm] = useState<PendingPermission | null>(null);
   /** Main view: workspace chat vs full settings page. */
   const [view, setView] = useState<"workspace" | "settings">("workspace");
+  /** Right Outputs rail — collapsible to free chat space. */
+  const [outputsOpen, setOutputsOpen] = useState(true);
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   const [models, setModels] = useState<ModelOption[]>([]);
   const [modelId, setModelId] = useState<string>("grok-4.5");
@@ -181,59 +349,389 @@ export default function App() {
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const chatScrollRef = useRef<HTMLDivElement | null>(null);
   const userMsgEls = useRef<Map<string, HTMLDivElement>>(new Map());
+  /** Wall-clock start of the in-flight agent turn (for duration on collapse). */
+  const turnStartedAtRef = useRef<number | null>(null);
+  /** Keep latest lines for flush-to-disk without stale closures. */
+  const linesRef = useRef<ChatLine[]>([]);
+  const sessionIdRef = useRef<string | null>(null);
+  const workPathRef = useRef<string | null>(null);
+  const historySaveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  /** Bump when switching tasks so stale reconnect logs don't overwrite history. */
+  const historyEpochRef = useRef(0);
+  /** Auto-title only once per task after the first successful assistant reply. */
+  const autoTitledSessionRef = useRef<Set<string>>(new Set());
+  const sessionsRef = useRef<SessionListRow[]>([]);
 
-  const refreshSessions = useCallback(async () => {
+  useEffect(() => {
+    linesRef.current = lines;
+  }, [lines]);
+
+  useEffect(() => {
+    sessionsRef.current = sessions;
+  }, [sessions]);
+
+  useEffect(() => {
+    sessionIdRef.current = session?.session_id ?? null;
+    workPathRef.current = session?.work_path ?? null;
+  }, [session?.session_id, session?.work_path]);
+
+  /** Connection / reconnect noise — never persist or restore these alone. */
+  const isConnectionNoise = useCallback((line: ChatLine): boolean => {
+    if (line.kind === "waiting") return true;
+    if (line.kind !== "system") return false;
+    const t = line.text.toLowerCase();
+    return (
+      t.startsWith("starting:") ||
+      t.startsWith("ready:") ||
+      t.startsWith("task ready") ||
+      t.startsWith("switched task") ||
+      t.startsWith("new task") ||
+      t.startsWith("opened project") ||
+      t.startsWith("using default") ||
+      t.startsWith("connected") ||
+      t.includes("acp handshake") ||
+      t.includes("acp session ready") ||
+      t.includes("spawning ") ||
+      t.includes("task cwd ")
+    );
+  }, []);
+
+  const hasRealChatContent = useCallback((chatLines: ChatLine[]) => {
+    return chatLines.some(
+      (l) =>
+        l.kind === "user" ||
+        l.kind === "assistant" ||
+        l.kind === "trace" ||
+        l.kind === "thought" ||
+        l.kind === "tool" ||
+        l.kind === "error",
+    );
+  }, []);
+
+  const persistChatHistory = useCallback(
+    async (
+      sessionId: string,
+      chatLines: ChatLine[],
+      workPath?: string | null,
+    ) => {
+      // Never wipe a good history file with only reconnect noise.
+      if (!hasRealChatContent(chatLines)) return;
+      const toSave = chatLines.filter(
+        (l) => l.kind !== "waiting" && !isConnectionNoise(l),
+      );
+      if (toSave.length === 0) return;
+      try {
+        await invoke("save_chat_history", {
+          sessionId,
+          json: JSON.stringify(toSave),
+          workPath: workPath || workPathRef.current || null,
+        });
+      } catch (e) {
+        console.warn("save_chat_history failed", e);
+      }
+    },
+    [hasRealChatContent, isConnectionNoise],
+  );
+
+  const schedulePersistHistory = useCallback(() => {
+    const sid = sessionIdRef.current;
+    if (!sid) return;
+    // Don't schedule saves of pure noise after reconnect.
+    if (!hasRealChatContent(linesRef.current)) return;
+    if (historySaveTimer.current) clearTimeout(historySaveTimer.current);
+    const epoch = historyEpochRef.current;
+    const work = workPathRef.current;
+    historySaveTimer.current = setTimeout(() => {
+      // Drop if user switched tasks since schedule.
+      if (historyEpochRef.current !== epoch) return;
+      if (sessionIdRef.current !== sid) return;
+      void persistChatHistory(sid, linesRef.current, work);
+    }, 500);
+  }, [persistChatHistory, hasRealChatContent]);
+
+  const flushPersistHistory = useCallback(async () => {
+    if (historySaveTimer.current) {
+      clearTimeout(historySaveTimer.current);
+      historySaveTimer.current = null;
+    }
+    const sid = sessionIdRef.current;
+    const work = workPathRef.current;
+    if (!sid) return;
+    await persistChatHistory(sid, linesRef.current, work);
+  }, [persistChatHistory]);
+
+  const loadChatHistory = useCallback(
+    async (sessionId: string, workPath?: string | null) => {
+      try {
+        const raw = await invoke<string | null>("load_chat_history", {
+          sessionId,
+          workPath: workPath || null,
+        });
+        if (!raw) return [] as ChatLine[];
+        const parsed = JSON.parse(raw) as ChatLine[];
+        if (!Array.isArray(parsed)) return [] as ChatLine[];
+        return parsed.filter(
+          (l) => l && l.kind && l.kind !== "waiting" && !isConnectionNoise(l),
+        );
+      } catch {
+        return [] as ChatLine[];
+      }
+    },
+    [isConnectionNoise],
+  );
+
+  const refreshProjects = useCallback(async () => {
     try {
-      const rows = await invoke<SessionListRow[]>("list_sessions");
-      setSessions(rows);
+      const rows = await invoke<ProjectListRow[]>("list_projects");
+      setProjects(rows);
+      return rows;
     } catch {
-      /* store empty until first connect */
+      return [] as ProjectListRow[];
     }
   }, []);
 
-  const push = useCallback((line: Omit<ChatLine, "id"> & { id?: string }) => {
-    const full = { ...line, id: line.id ?? nextLineId(line.kind) } as ChatLine;
-    setLines((prev) => [...prev, full]);
-    return full.id;
+  const refreshSessions = useCallback(
+    async (projectId?: string | null) => {
+      const pid = projectId === undefined ? selectedProjectId : projectId;
+      try {
+        let rows: SessionListRow[];
+        if (pid) {
+          // Tasks under a user-selected Project.
+          rows = await invoke<SessionListRow[]>("list_sessions_for_project", {
+            projectId: pid,
+          });
+        } else {
+          // No project selected: show all tasks (including default-sandbox ones).
+          rows = await invoke<SessionListRow[]>("list_sessions");
+        }
+        // Stable UI order: newest-created first. Clicking a task must not reorder.
+        rows = [...rows].sort((a, b) => {
+          const ca = Date.parse(a.created_at || a.updated_at);
+          const cb = Date.parse(b.created_at || b.updated_at);
+          return (Number.isFinite(cb) ? cb : 0) - (Number.isFinite(ca) ? ca : 0);
+        });
+        setSessions(rows);
+        return rows;
+      } catch {
+        return [] as SessionListRow[];
+      }
+    },
+    [selectedProjectId],
+  );
+
+  /** After connect / activate: sync projects + tasks. */
+  const refreshHierarchy = useCallback(
+    async (opts?: {
+      projectId?: string | null;
+      projectRoot?: string | null;
+      /** When true, keep Tasks unbound to Projects list (New task default). */
+      standaloneTask?: boolean;
+    }) => {
+      const projRows = await refreshProjects();
+      // Only match against user-visible projects (default sandbox is filtered out).
+      let pid: string | null =
+        opts?.standaloneTask
+          ? null
+          : (opts?.projectId ?? selectedProjectId);
+      if (pid && !projRows.some((p) => p.project_id === pid)) {
+        pid = null;
+      }
+      if (!pid && opts?.projectRoot && !opts.standaloneTask) {
+        const match = projRows.find((p) => p.root_path === opts.projectRoot);
+        pid = match?.project_id ?? null;
+      }
+      if (pid) {
+        setSelectedProjectId(pid);
+        const hit = projRows.find((p) => p.project_id === pid);
+        if (hit?.root_path) setProjectRoot(hit.root_path);
+        await refreshSessions(pid);
+      } else {
+        // Standalone / default-sandbox tasks: clear project highlight, list all tasks.
+        setSelectedProjectId(null);
+        await refreshSessions(null);
+      }
+      return pid;
+    },
+    [refreshProjects, refreshSessions, selectedProjectId],
+  );
+
+  type PushLine =
+    | { kind: "user"; text: string; id?: string }
+    | { kind: "assistant"; text: string; id?: string }
+    | { kind: "thought"; text: string; id?: string }
+    | { kind: "tool"; text: string; id?: string }
+    | { kind: "system"; text: string; id?: string }
+    | { kind: "error"; text: string; id?: string }
+    | { kind: "waiting"; text: string; id?: string };
+
+  const push = useCallback(
+    (line: PushLine) => {
+      const full = {
+        ...line,
+        id: line.id ?? nextLineId(line.kind),
+      } as ChatLine;
+      setLines((prev) => {
+        const next = [...prev, full];
+        linesRef.current = next;
+        return next;
+      });
+      schedulePersistHistory();
+      return full.id;
+    },
+    [schedulePersistHistory],
+  );
+
+  const appendAssistant = useCallback(
+    (text: string) => {
+      setLines((prev) => {
+        // Drop waiting placeholder once real content starts.
+        let base = prev;
+        if (base.length && base[base.length - 1].kind === "waiting") {
+          base = base.slice(0, -1);
+        }
+        const last = base[base.length - 1];
+        let next: ChatLine[];
+        if (last && last.kind === "assistant") {
+          const copy = base.slice(0, -1);
+          copy.push({ ...last, text: last.text + text });
+          next = copy;
+        } else {
+          next = [
+            ...base,
+            { id: nextLineId("assistant"), kind: "assistant", text },
+          ];
+        }
+        linesRef.current = next;
+        return next;
+      });
+      schedulePersistHistory();
+    },
+    [schedulePersistHistory],
+  );
+
+  const maybeAutoTitleFromChat = useCallback(async (chat: ChatLine[]) => {
+    const sid = sessionIdRef.current;
+    if (!sid || autoTitledSessionRef.current.has(sid)) return;
+
+    const currentTitle =
+      sessionsRef.current.find((s) => s.session_id === sid)?.title?.trim() ||
+      "";
+    const isPlaceholder =
+      !currentTitle ||
+      currentTitle === "New task" ||
+      currentTitle === "Restored task";
+    if (!isPlaceholder) {
+      autoTitledSessionRef.current.add(sid);
+      return;
+    }
+
+    const firstUser = chat.find(
+      (l): l is Extract<ChatLine, { kind: "user" }> =>
+        l.kind === "user" && Boolean(l.text.trim()),
+    );
+    const firstAssistant = chat.find(
+      (l): l is Extract<ChatLine, { kind: "assistant" }> =>
+        l.kind === "assistant" && Boolean(l.text.trim()),
+    );
+    if (!firstUser || !firstAssistant) return;
+
+    const title = summarizeChatTitle(firstUser.text, firstAssistant.text);
+    if (!title) return;
+
+    autoTitledSessionRef.current.add(sid);
+    try {
+      await invoke("rename_session", { sessionId: sid, title });
+      // Patch local list in place so order is unchanged (created_at sort on server).
+      setSessions((prev) =>
+        prev.map((s) => (s.session_id === sid ? { ...s, title } : s)),
+      );
+    } catch {
+      autoTitledSessionRef.current.delete(sid);
+    }
   }, []);
 
-  const appendAssistant = useCallback((text: string) => {
-    setLines((prev) => {
-      // Drop waiting placeholder once real content starts.
-      let base = prev;
-      if (base.length && base[base.length - 1].kind === "waiting") {
-        base = base.slice(0, -1);
-      }
-      const last = base[base.length - 1];
-      if (last && last.kind === "assistant") {
-        const copy = base.slice(0, -1);
-        copy.push({ ...last, text: last.text + text });
-        return copy;
-      }
-      return [...base, { id: nextLineId("assistant"), kind: "assistant", text }];
-    });
-  }, []);
+  const finishTurnCollapse = useCallback(
+    (error?: boolean) => {
+      const started = turnStartedAtRef.current;
+      turnStartedAtRef.current = null;
+      const durationMs = started != null ? Date.now() - started : 0;
+      setLines((prev) => {
+        let next = collapseTurnProcess(prev, durationMs);
+        if (error) {
+          const hasError = next.some((l) => l.kind === "error");
+          if (!hasError) {
+            next = [
+              ...next,
+              {
+                id: nextLineId("error"),
+                kind: "error",
+                text: "Turn ended with error",
+              },
+            ];
+          }
+        }
+        linesRef.current = next;
+        // After first successful assistant reply, summarize and rename the task.
+        if (!error) {
+          void maybeAutoTitleFromChat(next);
+        }
+        return next;
+      });
+      // Persist immediately after a turn settles.
+      void flushPersistHistory();
+    },
+    [flushPersistHistory, maybeAutoTitleFromChat],
+  );
 
-  const appendThought = useCallback((text: string) => {
-    setLines((prev) => {
-      let base = prev;
-      if (base.length && base[base.length - 1].kind === "waiting") {
-        base = base.slice(0, -1);
-      }
-      const last = base[base.length - 1];
-      if (last && last.kind === "thought") {
-        const copy = base.slice(0, -1);
-        copy.push({ ...last, text: last.text + text });
-        return copy;
-      }
-      return [...base, { id: nextLineId("thought"), kind: "thought", text }];
-    });
-  }, []);
+  const toggleTrace = useCallback(
+    (id: string) => {
+      setLines((prev) => {
+        const next = prev.map((line) =>
+          line.kind === "trace" && line.id === id
+            ? { ...line, expanded: !line.expanded }
+            : line,
+        );
+        linesRef.current = next;
+        return next;
+      });
+      schedulePersistHistory();
+    },
+    [schedulePersistHistory],
+  );
+
+  const appendThought = useCallback(
+    (text: string) => {
+      setLines((prev) => {
+        let base = prev;
+        if (base.length && base[base.length - 1].kind === "waiting") {
+          base = base.slice(0, -1);
+        }
+        const last = base[base.length - 1];
+        let next: ChatLine[];
+        if (last && last.kind === "thought") {
+          const copy = base.slice(0, -1);
+          copy.push({ ...last, text: last.text + text });
+          next = copy;
+        } else {
+          next = [
+            ...base,
+            { id: nextLineId("thought"), kind: "thought", text },
+          ];
+        }
+        linesRef.current = next;
+        return next;
+      });
+      schedulePersistHistory();
+    },
+    [schedulePersistHistory],
+  );
 
   const clearWaiting = useCallback(() => {
     setLines((prev) => {
       if (prev.length && prev[prev.length - 1].kind === "waiting") {
-        return prev.slice(0, -1);
+        const next = prev.slice(0, -1);
+        linesRef.current = next;
+        return next;
       }
       return prev;
     });
@@ -307,7 +805,7 @@ export default function App() {
   const stickyUserText = useMemo(() => {
     if (!stickyUserId) return null;
     const line = lines.find((l) => l.id === stickyUserId && l.kind === "user");
-    return line?.text ?? null;
+    return line && line.kind === "user" ? line.text : null;
   }, [stickyUserId, lines]);
 
   const refreshModels = useCallback(async () => {
@@ -391,8 +889,8 @@ export default function App() {
       });
       setSettingsMsg(
         cfgSyncGrok
-          ? "已保存，并同步到 Grok 引擎配置。重新 Connect 后生效。"
-          : "已保存。重新 Connect 后生效。",
+          ? "Saved and synced to Grok engine config. Reconnect to apply."
+          : "Saved. Reconnect to apply.",
       );
     } catch (e) {
       setSettingsMsg(String(e));
@@ -409,7 +907,7 @@ export default function App() {
         update: { clear_api_key: true },
       });
       applyPublicSettings(s);
-      setSettingsMsg("API Key 已清除。");
+      setSettingsMsg("API key cleared.");
     } catch (e) {
       setSettingsMsg(String(e));
     } finally {
@@ -440,10 +938,10 @@ export default function App() {
         ]);
       });
 
-    void refreshSessions();
+    void refreshHierarchy();
     void refreshModels();
     void loadSettings();
-  }, [refreshSessions, refreshModels, loadSettings]);
+  }, [refreshHierarchy, refreshModels, loadSettings]);
 
   useEffect(() => {
     let unlisten: UnlistenFn | undefined;
@@ -455,17 +953,12 @@ export default function App() {
         switch (ev.type) {
           case "agent_status":
             setAgentStatus(ev.status ?? "unknown");
-            if (ev.detail) {
-              push({ kind: "system", text: `${ev.status}: ${ev.detail}` });
-            }
+            // Connection lifecycle stays in the status pill — not the chat transcript.
             break;
           case "session_ready":
             setAgentStatus("ready");
-            push({
-              kind: "system",
-              text: `Session ready${ev.engine_session_id ? ` · ${ev.engine_session_id.slice(0, 8)}` : ""}`,
-            });
-            void refreshSessions();
+            // Don't push "Task ready" into chat (pollutes history on reconnect).
+            void refreshHierarchy();
             void refreshModels();
             break;
           case "user_message":
@@ -524,13 +1017,19 @@ export default function App() {
             clearWaiting();
             if (ev.state === "error") {
               push({ kind: "error", text: "Turn ended with error" });
+              finishTurnCollapse(true);
+            } else {
+              // Collapse thinking / tools; keep final assistant answer below.
+              finishTurnCollapse(false);
             }
-            void refreshSessions();
+            // Refresh titles/metadata only — list order is stable (created_at).
+            void refreshSessions(selectedProjectId);
             break;
           case "agent_error":
             setBusy(false);
             clearWaiting();
             push({ kind: "error", text: ev.message ?? "Agent error" });
+            finishTurnCollapse(true);
             break;
           default:
             void sessionIdOf(ev);
@@ -549,8 +1048,11 @@ export default function App() {
     appendThought,
     clearWaiting,
     push,
-    refreshSessions,
+    refreshHierarchy,
     refreshModels,
+    refreshSessions,
+    selectedProjectId,
+    finishTurnCollapse,
   ]);
 
   const resizeTextarea = () => {
@@ -560,34 +1062,74 @@ export default function App() {
     el.style.height = `${Math.min(el.scrollHeight, 160)}px`;
   };
 
-  const onSetProject = async () => {
-    const root = projectRoot.trim();
-    if (!root) {
-      setError("Enter a project directory path");
-      return;
-    }
-    setError(null);
-    try {
-      const path = await invoke<string>("set_project_root", { projectRoot: root });
-      setProjectRoot(path);
-      push({ kind: "system", text: `Project set · ${path}` });
-    } catch (e) {
-      setError(String(e));
-    }
-  };
+  const selectedProject = useMemo(
+    () => projects.find((p) => p.project_id === selectedProjectId) ?? null,
+    [projects, selectedProjectId],
+  );
 
-  const onConnect = async () => {
-    setConnecting(true);
-    setError(null);
+  /** Select a project (stable path). Loads its tasks; does not start an agent. */
+  const onSelectProject = async (p: ProjectListRow) => {
+    setSelectedProjectId(p.project_id);
+    setProjectRoot(p.root_path);
     setView("workspace");
     try {
-      if (projectRoot.trim()) {
-        await invoke<string>("set_project_root", {
-          projectRoot: projectRoot.trim(),
-        });
-      }
+      await invoke<string>("set_project_root", { projectRoot: p.root_path });
+    } catch {
+      /* ignore path errors; still show tasks */
+    }
+    await refreshSessions(p.project_id);
+  };
+
+  /** Reconnect agent on the current task (or create one if none). */
+  const onConnect = async () => {
+    if (session?.session_id) {
+      await onActivateSession(
+        sessions.find((s) => s.session_id === session.session_id) ?? {
+          session_id: session.session_id,
+          project_id: selectedProjectId ?? "",
+          project_root: session.project_root ?? projectRoot,
+          project_name: selectedProject?.name ?? "",
+          work_path: session.work_path ?? "",
+          title: "",
+          created_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
+        },
+      );
+      return;
+    }
+    await onNewSession();
+  };
+
+  /** New task under current project. */
+  const onNewTask = async () => {
+    setPendingPerm(null);
+    setView("workspace");
+    await onNewSession();
+  };
+
+  /**
+   * Pick a folder as project (fixed path) via native dialog, then create
+   * the first temporary task under ~/.grokx/tasks/<id>.
+   */
+  const onOpenProject = async () => {
+    if (connecting || busy) return;
+    setView("workspace");
+    setError(null);
+    try {
+      const picked = await invoke<string | null>("pick_project_dir");
+      if (!picked) return;
+      await flushPersistHistory();
+      setLines([]);
+      linesRef.current = [];
+      setPendingPerm(null);
+      setAttachments([]);
+      setDraft("");
+      setConnecting(true);
+      const root = picked;
+      setProjectRoot(root);
+      await invoke<string>("set_project_root", { projectRoot: root });
       const info = await invoke<SessionInfo>("connect_workspace", {
-        projectRoot: projectRoot.trim() || null,
+        projectRoot: root,
         autoApprove,
       });
       setSession(info);
@@ -595,9 +1137,15 @@ export default function App() {
       setAgentStatus(info.status);
       push({
         kind: "system",
-        text: `Connected · ${info.project_root ?? "."}`,
+        text: `Opened project · ${info.project_root ?? root}`,
       });
-      await refreshSessions();
+      if (info.work_path) {
+        push({
+          kind: "system",
+          text: `Task workspace · ${info.work_path} (project via ./project)`,
+        });
+      }
+      await refreshHierarchy({ projectRoot: info.project_root ?? root });
       await refreshModels();
     } catch (e) {
       setError(String(e));
@@ -606,48 +1154,60 @@ export default function App() {
     }
   };
 
-  const onNewTask = async () => {
-    setLines([]);
-    setPendingPerm(null);
-    setView("workspace");
-    await onConnect();
-  };
-
-  /** Create a brand-new session (Sessions list + button). */
+  /**
+   * New temporary task in Tasks only.
+   * - If a user Project is selected: attach to that project.
+   * - Otherwise: use internal default sandbox (~/.grokx/workspace) — NOT
+     shown under Projects.
+   * Task cwd: ~/.grokx/tasks/<id>.
+   */
   const onNewSession = async () => {
     if (connecting || busy) return;
     setView("workspace");
+    // Save current task transcript before leaving.
+    await flushPersistHistory();
+    historyEpochRef.current += 1;
     setLines([]);
+    linesRef.current = [];
     setPendingPerm(null);
     setAttachments([]);
     setDraft("");
     setError(null);
-    // Prefer last known project so + always works from the list.
-    const root =
-      projectRoot.trim() ||
-      session?.project_root?.trim() ||
-      sessions[0]?.project_root?.trim() ||
-      "";
-    if (root && root !== projectRoot) {
-      setProjectRoot(root);
-    }
+    setBusy(false);
+    turnStartedAtRef.current = null;
     setConnecting(true);
+    // Only treat an explicitly selected sidebar Project as a real project.
+    const userProject = selectedProject;
+    const standalone = !userProject;
     try {
-      if (root) {
+      let root = userProject?.root_path?.trim() || "";
+      if (!root) {
+        // Internal sandbox for standalone tasks — never appears in Projects.
+        root = await invoke<string>("ensure_default_project");
+        setProjectRoot(root);
+      } else {
+        if (root !== projectRoot) setProjectRoot(root);
         await invoke<string>("set_project_root", { projectRoot: root });
       }
       const info = await invoke<SessionInfo>("connect_workspace", {
-        projectRoot: root || null,
+        projectRoot: root,
         autoApprove,
       });
       setSession(info);
-      if (info.project_root) setProjectRoot(info.project_root);
+      sessionIdRef.current = info.session_id;
+      workPathRef.current = info.work_path ?? null;
+      if (info.project_root && !standalone) {
+        setProjectRoot(info.project_root);
+      }
       setAgentStatus(info.status);
-      push({
-        kind: "system",
-        text: `新建会话 · ${info.project_root ?? (root || ".")}`,
+      // Fresh task — empty history (no connection spam).
+      setLines([]);
+      linesRef.current = [];
+      await refreshHierarchy({
+        projectId: standalone ? null : userProject?.project_id ?? null,
+        projectRoot: standalone ? null : info.project_root ?? root,
+        standaloneTask: standalone,
       });
-      await refreshSessions();
       await refreshModels();
     } catch (e) {
       setError(String(e));
@@ -656,26 +1216,68 @@ export default function App() {
     }
   };
 
-  /** Activate an existing session from the list (click). */
+  /** Activate an existing task (click) — restore history, never creates a new row. */
   const onActivateSession = async (s: SessionListRow) => {
     if (renamingId === s.session_id || connecting) return;
     setView("workspace");
 
-    // Already the active session — just focus workspace, no reconnect.
+    // Highlight parent Project only if it is a user-visible project.
+    const visibleProject = projects.find((p) => p.project_id === s.project_id);
+    if (visibleProject) {
+      setSelectedProjectId(visibleProject.project_id);
+    } else {
+      setSelectedProjectId(null);
+    }
+
+    // Already the active task — just focus workspace, no engine restart.
+    // Do not refresh/reorder the list on click.
     if (session?.session_id === s.session_id) {
       return;
     }
 
+    // Persist the task we're leaving so we can resume it later.
+    const leavingId = sessionIdRef.current;
+    const leavingWork = workPathRef.current;
+    const leavingLines = linesRef.current;
+    if (historySaveTimer.current) {
+      clearTimeout(historySaveTimer.current);
+      historySaveTimer.current = null;
+    }
+    if (leavingId && hasRealChatContent(leavingLines)) {
+      await persistChatHistory(leavingId, leavingLines, leavingWork);
+    }
+
+    // Invalidate any pending saves from the previous task.
+    historyEpochRef.current += 1;
+    const epoch = historyEpochRef.current;
+
     setConnecting(true);
     setError(null);
-    setLines([]);
     setPendingPerm(null);
     setAttachments([]);
     setDraft("");
+    setBusy(false);
+    turnStartedAtRef.current = null;
+
+    // Optimistically highlight the clicked row immediately.
+    setSession({
+      session_id: s.session_id,
+      project_root: s.project_root,
+      work_path: s.work_path,
+      status: "Starting",
+    });
+    sessionIdRef.current = s.session_id;
+    workPathRef.current = s.work_path || null;
+    if (s.project_root) setProjectRoot(s.project_root);
+
+    // Restore transcript ASAP (by work_path) so chat is visible during reconnect.
+    const history = await loadChatHistory(s.session_id, s.work_path);
+    if (historyEpochRef.current !== epoch) return;
+    setLines(history);
+    linesRef.current = history;
+
     try {
-      // Ensure project path matches the session before reconnect.
       if (s.project_root) {
-        setProjectRoot(s.project_root);
         try {
           await invoke<string>("set_project_root", {
             projectRoot: s.project_root,
@@ -684,24 +1286,54 @@ export default function App() {
           /* path may still work via reconnect metadata */
         }
       }
+      // reconnect_session reuses this session_id — does not append a new list item.
       const info = await invoke<SessionInfo>("reconnect_session", {
         sessionId: s.session_id,
         autoApprove,
       });
-      setSession(info);
-      if (info.project_root) setProjectRoot(info.project_root);
-      else if (s.project_root) setProjectRoot(s.project_root);
-      setAgentStatus(info.status);
-      push({
-        kind: "system",
-        text: `已激活会话 · ${s.title || s.session_id.slice(0, 8)}`,
+      if (historyEpochRef.current !== epoch) return;
+      if (info.session_id !== s.session_id) {
+        console.warn(
+          "activate returned different session id",
+          info.session_id,
+          "expected",
+          s.session_id,
+        );
+      }
+      setSession({
+        session_id: s.session_id,
+        project_root: info.project_root ?? s.project_root,
+        work_path: info.work_path ?? s.work_path,
+        status: info.status,
       });
-      await refreshSessions();
+      sessionIdRef.current = s.session_id;
+      workPathRef.current = info.work_path ?? s.work_path ?? null;
+      if (info.project_root) setProjectRoot(info.project_root);
+      setAgentStatus(info.status);
+
+      // Re-load history after reconnect in case first load raced; never clear real chat.
+      const history2 = await loadChatHistory(
+        s.session_id,
+        info.work_path ?? s.work_path,
+      );
+      if (historyEpochRef.current !== epoch) return;
+      if (history2.length > 0) {
+        setLines(history2);
+        linesRef.current = history2;
+      } else if (hasRealChatContent(linesRef.current)) {
+        // Keep what we already showed.
+      }
+
+      // Keep list order stable: only refresh session metadata/titles, no full hierarchy reshuffle.
+      await refreshSessions(visibleProject ? s.project_id : null);
       await refreshModels();
     } catch (e) {
       setError(String(e));
+      // Keep restored history visible even if reconnect fails.
     } finally {
-      setConnecting(false);
+      if (historyEpochRef.current === epoch) {
+        setConnecting(false);
+      }
     }
   };
 
@@ -720,7 +1352,14 @@ export default function App() {
     if (!title) return;
     try {
       await invoke("rename_session", { sessionId: id, title });
-      await refreshSessions();
+      // Mark as user-named so auto-title won't overwrite.
+      autoTitledSessionRef.current.add(id);
+      // Patch in place — keep list order (created_at).
+      setSessions((prev) =>
+        prev.map((row) =>
+          row.session_id === id ? { ...row, title } : row,
+        ),
+      );
     } catch (err) {
       setError(String(err));
     }
@@ -730,6 +1369,77 @@ export default function App() {
     setRenamingId(null);
     setRenameDraft("");
   };
+
+  const onDeleteSession = async (s: SessionListRow, e?: React.MouseEvent) => {
+    e?.stopPropagation();
+    if (connecting || busy) return;
+    const label = s.title || s.session_id.slice(0, 8);
+    const ok = window.confirm(
+      `Delete task “${label}”?\n\nThis removes the task and its chat history from disk.`,
+    );
+    if (!ok) return;
+
+    // If deleting the active task, clear chat UI after.
+    const wasActive = session?.session_id === s.session_id;
+    if (wasActive) {
+      await flushPersistHistory();
+      historyEpochRef.current += 1;
+    }
+
+    try {
+      await invoke("delete_session", { sessionId: s.session_id });
+      setSessions((prev) => prev.filter((row) => row.session_id !== s.session_id));
+      autoTitledSessionRef.current.delete(s.session_id);
+
+      if (wasActive) {
+        setSession(null);
+        sessionIdRef.current = null;
+        workPathRef.current = null;
+        setLines([]);
+        linesRef.current = [];
+        setPendingPerm(null);
+        setAttachments([]);
+        setDraft("");
+        setBusy(false);
+        setAgentStatus("disconnected");
+      }
+      // Refresh project counts if needed.
+      void refreshProjects();
+    } catch (err) {
+      setError(String(err));
+    }
+  };
+
+  const addAttachments = useCallback(
+    (
+      files: Array<{
+        path: string;
+        name?: string | null;
+        mime?: string | null;
+        size?: number | null;
+        previewUrl?: string | null;
+      }>,
+    ) => {
+      if (!files.length) return;
+      setAttachments((prev) => {
+        const seen = new Set(prev.map((p) => p.path));
+        const next = [...prev];
+        for (const f of files) {
+          if (seen.has(f.path)) continue;
+          seen.add(f.path);
+          next.push({
+            path: f.path,
+            name: f.name || f.path.split(/[/\\]/).pop() || f.path,
+            mime: f.mime,
+            size: f.size,
+            previewUrl: f.previewUrl ?? null,
+          });
+        }
+        return next;
+      });
+    },
+    [],
+  );
 
   const onPickAttachments = async () => {
     try {
@@ -742,27 +1452,238 @@ export default function App() {
         }>
       >("pick_attachments");
       if (!files?.length) return;
-      setAttachments((prev) => {
-        const seen = new Set(prev.map((p) => p.path));
-        const next = [...prev];
-        for (const f of files) {
-          if (seen.has(f.path)) continue;
-          next.push({
-            path: f.path,
-            name: f.name || f.path.split(/[/\\]/).pop() || f.path,
-            mime: f.mime,
-            size: f.size,
-          });
-        }
-        return next;
-      });
+      addAttachments(files);
     } catch (e) {
       setError(String(e));
     }
   };
 
+  const fileToBase64 = (file: File | Blob): Promise<string> =>
+    new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => {
+        const result = reader.result;
+        if (typeof result !== "string") {
+          reject(new Error("failed to read file"));
+          return;
+        }
+        const comma = result.indexOf(",");
+        resolve(comma >= 0 ? result.slice(comma + 1) : result);
+      };
+      reader.onerror = () => reject(reader.error ?? new Error("read failed"));
+      reader.readAsDataURL(file);
+    });
+
+  const savePastedBlob = async (
+    blob: Blob,
+    nameHint?: string | null,
+  ): Promise<Attachment | null> => {
+    let mime = (blob.type || "").trim();
+    if (!mime || mime === "application/octet-stream") {
+      // macOS screenshots often omit type; assume PNG for image-like blobs.
+      mime = "image/png";
+    }
+    const dataBase64 = await fileToBase64(blob);
+    const saved = await invoke<{
+      path: string;
+      name?: string | null;
+      mime?: string | null;
+      size?: number | null;
+    }>("save_pasted_attachment", {
+      payload: {
+        dataBase64,
+        mime,
+        name: nameHint || null,
+      },
+    });
+    let previewUrl: string | null = null;
+    if (mime.startsWith("image/")) {
+      try {
+        previewUrl = URL.createObjectURL(blob);
+      } catch {
+        previewUrl = null;
+      }
+    }
+    return {
+      path: saved.path,
+      name:
+        saved.name ||
+        nameHint ||
+        saved.path.split(/[/\\]/).pop() ||
+        "paste.png",
+      mime: saved.mime ?? mime,
+      size: saved.size ?? blob.size,
+      previewUrl,
+    };
+  };
+
+  /** Collect image/file entries from a paste event (macOS screenshots included). */
+  const collectPasteFiles = (cd: DataTransfer): File[] => {
+    const out: File[] = [];
+    const seen = new Set<string>();
+    const pushFile = (f: File | null) => {
+      if (!f || f.size === 0) return;
+      const key = `${f.name}|${f.size}|${f.type}|${f.lastModified}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+      out.push(f);
+    };
+
+    // 1) items: preferred — catches image/png from Cmd+Ctrl+Shift+4 / Cmd+C
+    if (cd.items) {
+      for (let i = 0; i < cd.items.length; i++) {
+        const item = cd.items[i];
+        const type = (item.type || "").toLowerCase();
+        if (item.kind === "file" || type.startsWith("image/")) {
+          pushFile(item.getAsFile());
+        }
+      }
+    }
+    // 2) files list
+    if (cd.files) {
+      for (let i = 0; i < cd.files.length; i++) {
+        pushFile(cd.files.item(i));
+      }
+    }
+    return out;
+  };
+
+  const attachOsClipboardImage = async (): Promise<boolean> => {
+    try {
+      const saved = await invoke<{
+        path: string;
+        name?: string | null;
+        mime?: string | null;
+        size?: number | null;
+      } | null>("read_clipboard_image");
+      if (!saved?.path) return false;
+      addAttachments([
+        {
+          path: saved.path,
+          name: saved.name || "clipboard.png",
+          mime: saved.mime || "image/png",
+          size: saved.size,
+          previewUrl: null,
+        },
+      ]);
+      return true;
+    } catch (e) {
+      console.warn("read_clipboard_image failed", e);
+      return false;
+    }
+  };
+
+  const onComposerPaste = async (
+    e: React.ClipboardEvent<HTMLTextAreaElement>,
+  ) => {
+    const cd = e.clipboardData;
+    if (!cd) return;
+
+    const fileItems = collectPasteFiles(cd);
+    const types = cd.types ? Array.from(cd.types) : [];
+    const looksLikeImage =
+      fileItems.some((f) => (f.type || "").startsWith("image/") || !f.type) ||
+      types.some((t) => t.toLowerCase().startsWith("image/") || t === "Files");
+
+    // Pure text paste — leave to the browser.
+    if (fileItems.length === 0 && !looksLikeImage) {
+      return;
+    }
+
+    // We handle image/file ourselves so text doesn't swallow the paste.
+    if (fileItems.length > 0 || looksLikeImage) {
+      e.preventDefault();
+    }
+
+    if (!session) {
+      setError("Open a task first to attach clipboard images/files");
+      return;
+    }
+
+    try {
+      const saved: Attachment[] = [];
+      for (const file of fileItems) {
+        const name =
+          file.name && file.name !== "image.png" && file.name !== "blob"
+            ? file.name
+            : `paste-${Date.now()}.png`;
+        const att = await savePastedBlob(file, name);
+        if (att) saved.push(att);
+      }
+      if (saved.length) {
+        addAttachments(saved);
+        return;
+      }
+      // Fallback: OS clipboard image (macOS screenshot often only here).
+      if (looksLikeImage || types.length === 0) {
+        const ok = await attachOsClipboardImage();
+        if (!ok && fileItems.length === 0) {
+          // Last resort: try OS clipboard even if types looked empty.
+          await attachOsClipboardImage();
+        }
+      }
+    } catch (err) {
+      setError(String(err));
+    }
+  };
+
+  /** Global paste while composer focused is covered; also allow paste when dock is focused. */
+  useEffect(() => {
+    const onWindowPaste = (ev: ClipboardEvent) => {
+      const t = ev.target as HTMLElement | null;
+      // If paste is already on our textarea, React handler runs.
+      if (t && (t.tagName === "TEXTAREA" || t.tagName === "INPUT")) return;
+      // Ignore paste in settings forms.
+      if (view !== "workspace") return;
+      if (!session || busy) return;
+      const cd = ev.clipboardData;
+      if (!cd) return;
+      const files = collectPasteFiles(cd);
+      const types = cd.types ? Array.from(cd.types) : [];
+      const looksLikeImage =
+        files.length > 0 ||
+        types.some((x) => x.toLowerCase().startsWith("image/") || x === "Files");
+      if (!looksLikeImage) return;
+      ev.preventDefault();
+      void (async () => {
+        try {
+          if (files.length) {
+            const saved: Attachment[] = [];
+            for (const file of files) {
+              const att = await savePastedBlob(
+                file,
+                file.name || `paste-${Date.now()}.png`,
+              );
+              if (att) saved.push(att);
+            }
+            if (saved.length) {
+              addAttachments(saved);
+              return;
+            }
+          }
+          await attachOsClipboardImage();
+        } catch (err) {
+          setError(String(err));
+        }
+      })();
+    };
+    window.addEventListener("paste", onWindowPaste);
+    return () => window.removeEventListener("paste", onWindowPaste);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [session, busy, view]);
+
   const removeAttachment = (path: string) => {
-    setAttachments((prev) => prev.filter((a) => a.path !== path));
+    setAttachments((prev) => {
+      const target = prev.find((a) => a.path === path);
+      if (target?.previewUrl) {
+        try {
+          URL.revokeObjectURL(target.previewUrl);
+        } catch {
+          /* ignore */
+        }
+      }
+      return prev.filter((a) => a.path !== path);
+    });
   };
 
   const onModelChange = async (id: string) => {
@@ -783,6 +1704,7 @@ export default function App() {
     if (textareaRef.current) {
       textareaRef.current.style.height = "auto";
     }
+    turnStartedAtRef.current = Date.now();
     const display =
       pendingAttachments.length > 0
         ? `${text || "(attachments)"}${text ? "\n\n" : ""}📎 ${pendingAttachments
@@ -791,7 +1713,7 @@ export default function App() {
         : text;
     push({ kind: "user", text: display });
     // Immediate left-side feedback so the UI doesn't look frozen.
-    push({ kind: "waiting", text: "Grokx 正在思考…" });
+    push({ kind: "waiting", text: "Grokx is thinking…" });
     setBusy(true);
     try {
       await invoke("send_prompt_rich", {
@@ -811,6 +1733,7 @@ export default function App() {
       setBusy(false);
       clearWaiting();
       push({ kind: "error", text: String(e) });
+      finishTurnCollapse(true);
     }
   };
 
@@ -822,6 +1745,8 @@ export default function App() {
     } finally {
       setBusy(false);
       setPendingPerm(null);
+      // Still collapse any in-flight process stream.
+      finishTurnCollapse(false);
     }
   };
 
@@ -849,42 +1774,52 @@ export default function App() {
   );
 
   const statusClass = busy ? "busy" : connected ? "ready" : "";
+  const activeTaskTitle =
+    sessions.find((s) => s.session_id === session?.session_id)?.title || null;
   const title =
-    sessions.find((s) => s.session_id === session?.session_id)?.title ||
+    activeTaskTitle ||
+    selectedProject?.name ||
     shortPath(session?.project_root || projectRoot) ||
     "New task";
 
   return (
-    <div className="layout">
+    <div
+      className={`layout${outputsOpen ? "" : " layout-outputs-collapsed"}${
+        view === "settings" ? " layout-settings" : ""
+      }`}
+    >
       <aside className="sidebar">
         <div className="brand-row">
-          <div className="brand">Grokx</div>
           <button
-            className="icon-btn"
+            type="button"
+            className="brand brand-btn"
+            title="Back to workspace"
+            onClick={() => setView("workspace")}
+          >
+            <IconBrand size={20} className="brand-mark" />
+            <span>Grokx</span>
+          </button>
+          <button
+            className={`icon-btn${view === "settings" ? " active" : ""}`}
             title="Settings"
             onClick={() => {
               setView("settings");
               void loadSettings();
             }}
           >
-            ⚙
+            <IconSettings size={16} />
           </button>
         </div>
 
         <nav className="nav">
           <button
-            className={`nav-item${view === "workspace" ? " active" : ""}`}
-            onClick={() => setView("workspace")}
-          >
-            <span className="nav-glyph">⌂</span>
-            Workspace
-          </button>
-          <button
             className="nav-item"
             onClick={() => void onNewTask()}
             disabled={connecting}
           >
-            <span className="nav-glyph">✎</span>
+            <span className="nav-glyph">
+              <IconPen size={16} />
+            </span>
             {connecting ? "Connecting…" : "New task"}
           </button>
           <button
@@ -892,36 +1827,73 @@ export default function App() {
             onClick={() => void onConnect()}
             disabled={connecting}
           >
-            <span className="nav-glyph">↻</span>
+            <span className="nav-glyph">
+              <IconRefresh size={16} />
+            </span>
             {connected ? "Reconnect" : "Connect agent"}
-          </button>
-          <button
-            className={`nav-item${view === "settings" ? " active" : ""}`}
-            onClick={() => {
-              setView("settings");
-              void loadSettings();
-            }}
-          >
-            <span className="nav-glyph">⚙</span>
-            Settings
           </button>
         </nav>
 
+        {/* Project = fixed user-chosen folder */}
         <div className="section-label-row">
-          <span className="section-label">Sessions</span>
+          <span className="section-label">Projects</span>
           <button
             type="button"
             className="session-add-btn"
-            title="新建会话"
+            title="Open project folder (fixed path)"
+            disabled={connecting || busy}
+            onClick={() => void onOpenProject()}
+          >
+            <IconPlus size={16} />
+          </button>
+        </div>
+        <div className="project-list">
+          {projects.length === 0 && (
+            <div className="session-empty">
+              No projects · + opens a folder
+            </div>
+          )}
+          {projects.map((p) => (
+            <div
+              key={p.project_id}
+              className={`project-row${
+                p.project_id === selectedProjectId ? " active" : ""
+              }`}
+              onClick={() => void onSelectProject(p)}
+              title={`Project (fixed path)\n${p.root_path}`}
+            >
+              <div className="project-row-main">
+                <div className="project-title">{p.name}</div>
+                <span className="project-count">{p.session_count}</span>
+              </div>
+              <div className="project-meta">{shortPath(p.root_path)}</div>
+            </div>
+          ))}
+        </div>
+
+        {/* Tasks = temporary ~/.grokx/tasks/<id> only; does not create Projects */}
+        <div className="section-label-row">
+          <span className="section-label">
+            Tasks
+            {selectedProject ? ` · ${selectedProject.name}` : ""}
+          </span>
+          <button
+            type="button"
+            className="session-add-btn"
+            title={
+              selectedProject
+                ? "New task under this project (~/.grokx/tasks/…)"
+                : "New temporary task (Tasks only, no Project entry)"
+            }
             disabled={connecting || busy}
             onClick={() => void onNewSession()}
           >
-            +
+            <IconPlus size={16} />
           </button>
         </div>
         <div className="session-list">
           {sessions.length === 0 && (
-            <div className="session-empty">No sessions yet</div>
+            <div className="session-empty">No tasks · click + to start</div>
           )}
           {sessions.map((s) => (
             <div
@@ -931,7 +1903,7 @@ export default function App() {
               }`}
               onClick={() => void onActivateSession(s)}
               onDoubleClick={(e) => startRename(s, e)}
-              title={`${s.project_root}\n单击激活 · 双击或 ✎ 重命名`}
+              title={`Task workspace (temporary)\n${s.work_path || "~/.grokx/tasks/…"}\nProject: ${s.project_root}\nClick to switch · double-click or ✎ to rename · 🗑 to delete`}
             >
               {renamingId === s.session_id ? (
                 <input
@@ -959,16 +1931,25 @@ export default function App() {
                     </div>
                     <button
                       type="button"
-                      className="session-rename-btn"
-                      title="重命名"
+                      className="session-action-btn"
+                      title="Rename task"
                       onClick={(e) => startRename(s, e)}
                     >
-                      ✎
+                      <IconPen size={12} />
+                    </button>
+                    <button
+                      type="button"
+                      className="session-action-btn session-delete-btn"
+                      title="Delete task"
+                      onClick={(e) => void onDeleteSession(s, e)}
+                    >
+                      <IconTrash size={12} />
                     </button>
                   </div>
                   <div className="session-meta">
-                    {s.project_name} ·{" "}
-                    {new Date(s.updated_at).toLocaleString()}
+                    {s.work_path
+                      ? shortPath(s.work_path)
+                      : new Date(s.created_at || s.updated_at).toLocaleString()}
                   </div>
                 </>
               )}
@@ -987,30 +1968,30 @@ export default function App() {
             <div style={{ minWidth: 0 }}>
               <h1 className="topbar-title">Settings</h1>
               <p className="topbar-sub">
-                系统配置 · 大模型与引擎（不常用，配置一次即可）
+                System · model and engine (set once)
               </p>
             </div>
             <button
               className="btn"
               onClick={() => setView("workspace")}
             >
-              返回工作区
+              Back to workspace
             </button>
           </header>
 
           <div className="settings-page">
             <div className="settings-grid">
               <section className="card settings-card">
-                <h3>大模型配置</h3>
+                <h3>Model</h3>
                 <p className="muted" style={{ marginBottom: 12 }}>
-                  配置 API 地址、Key 与默认模型。日常聊天无需进入此页；保存后
-                  {cfgSyncGrok ? "会同步到引擎配置，" : ""}
-                  重新 Connect 生效。
+                  Configure API endpoint, key, and default model. Daily chat does not need this page; after save
+                  {cfgSyncGrok ? "it syncs to the engine config, " : ""}
+                  reconnect to apply.
                 </p>
                 {settingsMsg && (
                   <div
                     className={
-                      settingsMsg.includes("失败") ||
+                      settingsMsg.toLowerCase().includes("fail") ||
                       settingsMsg.toLowerCase().includes("error")
                         ? "error-banner"
                         : "settings-ok"
@@ -1029,7 +2010,7 @@ export default function App() {
                     />
                   </div>
                   <div className="field">
-                    <label>显示名称</label>
+                    <label>Display name</label>
                     <input
                       value={cfgName}
                       onChange={(e) => setCfgName(e.target.value)}
@@ -1041,14 +2022,14 @@ export default function App() {
                     <input
                       value={cfgBaseUrl}
                       onChange={(e) => setCfgBaseUrl(e.target.value)}
-                      placeholder="https://api.x.ai/v1 或 http://host:port/v1"
+                      placeholder="https://api.x.ai/v1 or http://host:port/v1"
                     />
                   </div>
                   <div className="field field-span-2">
                     <label>
                       API Key
                       {cfgHasKey && cfgKeyHint
-                        ? `（已保存 ${cfgKeyHint}）`
+                        ? ` (saved ${cfgKeyHint})`
                         : ""}
                     </label>
                     <input
@@ -1057,14 +2038,14 @@ export default function App() {
                       onChange={(e) => setCfgApiKey(e.target.value)}
                       placeholder={
                         cfgHasKey
-                          ? "留空则保持原 Key，输入新值可覆盖"
+                          ? "Leave blank to keep current key"
                           : "sk-..."
                       }
                       autoComplete="off"
                     />
                   </div>
                   <div className="field">
-                    <label>Env Key（可选）</label>
+                    <label>Env key (optional)</label>
                     <input
                       value={cfgEnvKey}
                       onChange={(e) => setCfgEnvKey(e.target.value)}
@@ -1094,7 +2075,7 @@ export default function App() {
                     />
                   </div>
                   <div className="field">
-                    <label>默认推理强度</label>
+                    <label>Default effort</label>
                     <select
                       className="settings-select"
                       value={cfgEffort}
@@ -1124,7 +2105,7 @@ export default function App() {
                     checked={cfgSyncGrok}
                     onChange={(e) => setCfgSyncGrok(e.target.checked)}
                   />
-                  同步写入 ~/.grok/config.toml
+                  Also write ~/.grok/config.toml
                 </label>
                 <p className="hint mono" style={{ marginTop: 0 }}>
                   {cfgGrokPath}
@@ -1135,7 +2116,7 @@ export default function App() {
                     onClick={() => void onSaveSettings()}
                     disabled={savingSettings}
                   >
-                    {savingSettings ? "保存中…" : "保存配置"}
+                    {savingSettings ? "Saving…" : "Save settings"}
                   </button>
                   {cfgHasKey && (
                     <button
@@ -1143,7 +2124,7 @@ export default function App() {
                       onClick={() => void onClearApiKey()}
                       disabled={savingSettings}
                     >
-                      清除 Key
+                      Clear key
                     </button>
                   )}
                   <button
@@ -1151,28 +2132,41 @@ export default function App() {
                     onClick={() => void loadSettings()}
                     disabled={savingSettings}
                   >
-                    重新加载
+                    Reload
                   </button>
                 </div>
               </section>
 
               <section className="card settings-card">
-                <h3>项目与引擎</h3>
+                <h3>Project & engine</h3>
                 {error && <div className="error-banner">{error}</div>}
-                <div className="field">
-                  <label>Project path</label>
-                  <input
-                    value={projectRoot}
-                    onChange={(e) => setProjectRoot(e.target.value)}
-                    placeholder="/path/to/project"
-                  />
-                </div>
+                <p className="muted" style={{ marginBottom: 12 }}>
+                  Open a project folder from the sidebar (+). Each task gets a
+                  temporary workspace under <code>~/.grokx/tasks/</code> with a{" "}
+                  <code>project</code> link to your sources.
+                </p>
+                {selectedProject && (
+                  <dl className="kv">
+                    <dt>Project</dt>
+                    <dd className="mono">{selectedProject.root_path}</dd>
+                    {session?.work_path && (
+                      <>
+                        <dt>Task cwd</dt>
+                        <dd className="mono">{session.work_path}</dd>
+                      </>
+                    )}
+                  </dl>
+                )}
                 <div className="btn-row">
-                  <button className="btn" onClick={() => void onSetProject()}>
-                    Set project
-                  </button>
                   <button
                     className="btn btn-primary"
+                    onClick={() => void onOpenProject()}
+                    disabled={connecting}
+                  >
+                    {connecting ? "Opening…" : "Open project…"}
+                  </button>
+                  <button
+                    className="btn"
                     onClick={() => void onConnect()}
                     disabled={connecting}
                   >
@@ -1180,7 +2174,7 @@ export default function App() {
                       ? "Connecting…"
                       : connected
                         ? "Reconnect"
-                        : "Connect"}
+                        : "Connect agent"}
                   </button>
                 </div>
                 <label className="check">
@@ -1192,7 +2186,7 @@ export default function App() {
                   Auto-approve tools on next connect
                 </label>
                 <div className="field">
-                  <label>自定义引擎路径（可选）</label>
+                  <label>Custom engine path (optional)</label>
                   <input
                     value={cfgEnginePath}
                     onChange={(e) => setCfgEnginePath(e.target.value)}
@@ -1211,9 +2205,6 @@ export default function App() {
                 ) : (
                   !error && <p className="muted">Resolving engine…</p>
                 )}
-                <p className="hint">
-                  日常使用请返回工作区；模型与 Key 一般只需配置一次。
-                </p>
               </section>
             </div>
           </div>
@@ -1225,10 +2216,18 @@ export default function App() {
               <div style={{ minWidth: 0 }}>
                 <h1 className="topbar-title">{title}</h1>
                 <p className="topbar-sub">
-                  {shortPath(session?.project_root || projectRoot)}
-                  {session?.session_id
-                    ? ` · ${session.session_id.slice(0, 8)}`
-                    : ""}
+                  {selectedProject
+                    ? `Project ${selectedProject.name} · ${shortPath(selectedProject.root_path)}`
+                    : session?.work_path
+                      ? "Temporary task"
+                      : "No project"}
+                  {session?.work_path
+                    ? ` · ${shortPath(session.work_path)}`
+                    : activeTaskTitle
+                      ? ` · ${activeTaskTitle}`
+                      : session?.session_id
+                        ? ` · ${session.session_id.slice(0, 8)}`
+                        : ""}
                 </p>
               </div>
               <div className="status-pill">
@@ -1242,12 +2241,12 @@ export default function App() {
                 <button
                   type="button"
                   className="user-sticky-bar"
-                  title="点击定位到该条用户消息"
+                  title="Jump to this user message"
                   onClick={() => jumpToUserMessage(stickyUserId)}
                 >
-                  <span className="user-sticky-label">你的输入</span>
+                  <span className="user-sticky-label">Your message</span>
                   <span className="user-sticky-text">{stickyUserText}</span>
-                  <span className="user-sticky-jump">定位 ↓</span>
+                  <span className="user-sticky-jump">Jump ↓</span>
                 </button>
               )}
               <div
@@ -1257,19 +2256,81 @@ export default function App() {
               >
                 {lines.length === 0 && (
                   <div className="empty-state">
-                    <h2>What should we work on?</h2>
+                    <h2>Start a task</h2>
                     <p>
-                      连接 agent 后即可开始对话。大模型地址与 Key 请在左侧{" "}
-                      <strong>Settings</strong> 中配置一次即可。
+                      Click <strong>New task</strong> or <strong>Tasks +</strong> to create
+                      a temporary session under <code>~/.grokx/tasks/</code> and chat.
+                      That does <strong>not</strong> add a Project. Use{" "}
+                      <strong>Projects +</strong> only when you want to open a real code
+                      folder. Model key: <strong>Settings</strong>.
                     </p>
                   </div>
                 )}
 
                 {lines.map((line, i) => {
+                  if (line.kind === "trace") {
+                    return (
+                      <div key={line.id} className="msg msg-trace">
+                        <div className="trace-panel">
+                          <button
+                            type="button"
+                            className="trace-summary"
+                            onClick={() => toggleTrace(line.id)}
+                            aria-expanded={line.expanded}
+                          >
+                            <span className="trace-chevron" aria-hidden>
+                              {line.expanded ? "▾" : "▸"}
+                            </span>
+                            <span className="trace-label">
+                              Worked · {summarizeTrace(line.items)}
+                            </span>
+                            <span className="trace-duration">
+                              {formatDuration(line.durationMs)}
+                            </span>
+                          </button>
+                          {line.expanded && (
+                            <div className="trace-body">
+                              {line.items.map((item) => {
+                                if (item.kind === "thought") {
+                                  return (
+                                    <div
+                                      key={item.id}
+                                      className="msg msg-thought trace-item"
+                                    >
+                                      <div className="msg-body md-body thought-md">
+                                        <ReactMarkdown
+                                          remarkPlugins={[remarkGfm]}
+                                        >
+                                          {item.text}
+                                        </ReactMarkdown>
+                                      </div>
+                                    </div>
+                                  );
+                                }
+                                return (
+                                  <div
+                                    key={item.id}
+                                    className="msg-chip trace-item"
+                                  >
+                                    <span className="chip-icon">
+                                      <ChipIcon kind={item.kind} />
+                                    </span>
+                                    <span>{item.text}</span>
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    );
+                  }
                   if (line.kind === "tool" || line.kind === "system") {
                     return (
                       <div key={line.id} className="msg-chip">
-                        <span className="chip-icon">{chipIcon(line.kind)}</span>
+                        <span className="chip-icon">
+                          <ChipIcon kind={line.kind} />
+                        </span>
                         <span>{line.text}</span>
                       </div>
                     );
@@ -1344,10 +2405,24 @@ export default function App() {
               {attachments.length > 0 && (
                 <div className="attach-row">
                   {attachments.map((a) => (
-                    <div key={a.path} className="attach-chip" title={a.path}>
-                      <span className="attach-icon">
-                        {a.mime?.startsWith("image/") ? "🖼" : "📄"}
-                      </span>
+                    <div
+                      key={a.path}
+                      className={`attach-chip${
+                        a.mime?.startsWith("image/") ? " attach-chip-image" : ""
+                      }`}
+                      title={a.path}
+                    >
+                      {a.mime?.startsWith("image/") && a.previewUrl ? (
+                        <img
+                          className="attach-thumb"
+                          src={a.previewUrl}
+                          alt={a.name}
+                        />
+                      ) : (
+                        <span className="attach-icon">
+                          {a.mime?.startsWith("image/") ? "🖼" : "📄"}
+                        </span>
+                      )}
                       <span className="attach-name">{a.name}</span>
                       {a.size != null && (
                         <span className="attach-size">
@@ -1374,6 +2449,9 @@ export default function App() {
                   setDraft(e.target.value);
                   resizeTextarea();
                 }}
+                onPaste={(e) => {
+                  void onComposerPaste(e);
+                }}
                 onKeyDown={(e) => {
                   if (e.key === "Enter" && !e.shiftKey) {
                     e.preventDefault();
@@ -1383,8 +2461,8 @@ export default function App() {
                 disabled={!session || (busy && !pendingPerm)}
                 placeholder={
                   session
-                    ? "Ask for follow-up changes"
-                    : "Connect agent first…"
+                    ? "Describe what this task should do… (paste text or images)"
+                    : "Click Tasks + to create a task and start chatting…"
                 }
               />
               <div className="composer-bar">
@@ -1392,17 +2470,17 @@ export default function App() {
                   <button
                     type="button"
                     className="composer-plus"
-                    title="Attach files"
+                    title="Attach files (or paste from clipboard)"
                     onClick={() => void onPickAttachments()}
                     disabled={!session || busy}
                   >
-                    +
+                    <IconPaperclip size={16} />
                   </button>
                   <button
                     type="button"
                     className={`access-toggle${autoApprove ? "" : " off"}`}
                     onClick={() => setAutoApprove((v) => !v)}
-                    title="Toggle auto-approve for the next connect"
+                    title="Auto-approve tools on next connect"
                   >
                     {autoApprove ? "Auto-approve" : "Needs approval"}
                   </button>
@@ -1451,7 +2529,7 @@ export default function App() {
                       onClick={() => void onCancel()}
                       title="Stop"
                     >
-                      ■
+                      <IconStop size={14} />
                     </button>
                   ) : (
                     <button
@@ -1464,7 +2542,7 @@ export default function App() {
                       }
                       title="Send"
                     >
-                      ↑
+                      <IconSend size={16} />
                     </button>
                   )}
                 </div>
@@ -1472,92 +2550,113 @@ export default function App() {
             </div>
           </main>
 
-          <aside className="right">
-            <h2>Outputs</h2>
-
-            {pendingPerm && (
-              <div className="card">
-                <div className="perm-title">{pendingPerm.tool_name}</div>
-                <p>{pendingPerm.summary}</p>
-                {pendingPerm.detail && (
-                  <pre className="perm-detail">{pendingPerm.detail}</pre>
-                )}
-                <div className="btn-row" style={{ marginTop: 12 }}>
-                  <button
-                    className="btn btn-accent"
-                    onClick={() => void onPermission("allow_once")}
-                  >
-                    Allow
-                  </button>
-                  <button
-                    className="btn btn-ghost"
-                    onClick={() => void onPermission("deny")}
-                  >
-                    Deny
-                  </button>
-                </div>
-                <p className="hint">
-                  Agent is waiting · {pendingPerm.id.slice(0, 8)}
-                </p>
-              </div>
-            )}
-
-            {!session && (
-              <div className="card">
-                <h3>快速连接</h3>
-                <p className="muted" style={{ marginBottom: 10 }}>
-                  选择项目并连接 agent。模型 Key / 地址请在 Settings 配置。
-                </p>
-                {error && <div className="error-banner">{error}</div>}
-                <div className="field">
-                  <label>Project path</label>
-                  <input
-                    value={projectRoot}
-                    onChange={(e) => setProjectRoot(e.target.value)}
-                    placeholder="/path/to/project"
-                  />
-                </div>
-                <div className="btn-row">
-                  <button className="btn" onClick={() => void onSetProject()}>
-                    Set project
-                  </button>
-                  <button
-                    className="btn btn-primary"
-                    onClick={() => void onConnect()}
-                    disabled={connecting}
-                  >
-                    {connecting ? "Connecting…" : "Connect"}
-                  </button>
-                </div>
+          {outputsOpen ? (
+            <aside className="right">
+              <div className="right-header">
+                <h2>Outputs</h2>
                 <button
-                  className="btn"
-                  style={{ marginTop: 10, width: "100%" }}
-                  onClick={() => {
-                    setView("settings");
-                    void loadSettings();
-                  }}
+                  type="button"
+                  className="icon-btn"
+                  title="Collapse outputs"
+                  onClick={() => setOutputsOpen(false)}
                 >
-                  打开 Settings
+                  <IconChevronRight size={16} />
                 </button>
               </div>
-            )}
 
-            {session && !pendingPerm && (
-              <div className="card">
-                <h3>Approvals</h3>
-                <p className="muted">
-                  关闭 Auto-approve 时，工具权限请求会显示在这里。
-                </p>
-              </div>
-            )}
+              {error && !session && (
+                <div className="error-banner" style={{ marginBottom: 12 }}>
+                  {error}
+                </div>
+              )}
 
-            <div className="card">
-              <h3>Create a file or site</h3>
-              <p className="muted">
-                让 agent 搭建文件、修 bug 或审阅当前项目。
-              </p>
+              {pendingPerm && (
+                <div className="card">
+                  <div className="perm-title">{pendingPerm.tool_name}</div>
+                  <p>{pendingPerm.summary}</p>
+                  {pendingPerm.detail && (
+                    <pre className="perm-detail">{pendingPerm.detail}</pre>
+                  )}
+                  <div className="btn-row" style={{ marginTop: 12 }}>
+                    <button
+                      className="btn btn-accent"
+                      onClick={() => void onPermission("allow_once")}
+                    >
+                      Allow
+                    </button>
+                    <button
+                      className="btn btn-ghost"
+                      onClick={() => void onPermission("deny")}
+                    >
+                      Deny
+                    </button>
+                  </div>
+                  <p className="hint">
+                    Agent waiting · {pendingPerm.id.slice(0, 8)}
+                  </p>
+                </div>
+              )}
+
+              {session && !pendingPerm && (
+                <div className="card">
+                  <h3>Approvals</h3>
+                  <p className="muted">
+                    When auto-approve is off, tool permission requests appear
+                    here.
+                  </p>
+                </div>
+              )}
+
+              {session && (
+                <div className="card">
+                  <h3>Current task</h3>
+                  <dl className="kv">
+                    {session.project_root && (
+                      <>
+                        <dt>Project</dt>
+                        <dd className="mono" title={session.project_root}>
+                          {shortPath(session.project_root)}
+                        </dd>
+                      </>
+                    )}
+                    {session.work_path && (
+                      <>
+                        <dt>Task cwd</dt>
+                        <dd className="mono" title={session.work_path}>
+                          {shortPath(session.work_path)}
+                        </dd>
+                      </>
+                    )}
+                  </dl>
+                  <p className="muted" style={{ marginTop: 8 }}>
+                    Temporary workspace under ~/.grokx/tasks/. Project sources
+                    via ./project.
+                  </p>
+                </div>
+              )}
+
+              {!session && !pendingPerm && (
+                <div className="card">
+                  <h3>Outputs</h3>
+                  <p className="muted">
+                    Permissions and task details show up here after you open a
+                    project from the sidebar.
+                  </p>
+                </div>
+              )}
+            </aside>
+          ) : (
+            <div className="right-collapsed">
+              <button
+                type="button"
+                className="icon-btn right-expand-btn"
+                title="Show outputs"
+                onClick={() => setOutputsOpen(true)}
+              >
+                <IconChevronLeft size={16} />
+              </button>
             </div>
-          </aside>
+          )}
         </>
       )}
     </div>

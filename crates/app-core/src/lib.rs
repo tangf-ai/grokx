@@ -12,7 +12,7 @@ use domain::{
     PromptRequest, ReasoningEffort, SessionId, SessionMeta, TurnState,
 };
 use permissions::{PermissionBroker, Policy};
-use session_store::{SessionListItem, SessionStore};
+use session_store::{ProjectListItem, SessionListItem, SessionStore};
 use thiserror::Error;
 use tokio::sync::{mpsc, Mutex, RwLock};
 use tracing::warn;
@@ -41,7 +41,10 @@ struct LiveAgent {
     /// Dropping this aborts the reader task and kills the child.
     client: AcpClient,
     handle: AcpClientHandle,
+    /// Fixed project path (user-chosen).
     project_root: PathBuf,
+    /// Temporary task cwd (`~/.grokx/tasks/<id>`).
+    work_path: PathBuf,
     app_session_id: SessionId,
 }
 
@@ -68,11 +71,24 @@ impl AppCore {
         let settings = UserSettings::load(&paths.config_file).unwrap_or_else(|_| {
             UserSettings::product_defaults()
         });
+
+        // Restore task/project list from disk so restarts keep history.
+        let mut store = SessionStore::load_from_file(&paths.sessions_index_file())
+            .unwrap_or_else(|e| {
+                warn!(error = %e, "failed to load sessions index; starting empty");
+                SessionStore::new()
+            });
+        let imported = store.import_from_tasks_root(&AppPaths::tasks_root());
+        if imported > 0 {
+            warn!(imported, "recovered tasks from ~/.grokx/tasks");
+            let _ = store.save_to_file(&paths.sessions_index_file());
+        }
+
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         Ok(Arc::new(Self {
             paths,
             settings: RwLock::new(settings),
-            store: Mutex::new(SessionStore::new()),
+            store: Mutex::new(store),
             permissions: Mutex::new(PermissionBroker::new()),
             policy: RwLock::new(Policy::default()),
             engine: RwLock::new(None),
@@ -83,6 +99,16 @@ impl AppCore {
             event_tx,
             event_rx: Mutex::new(Some(event_rx)),
         }))
+    }
+
+    async fn persist_session_meta(&self, session_id: &SessionId) {
+        let store = self.store.lock().await;
+        if let Err(e) = store.write_task_dir_meta(session_id) {
+            warn!(error = %e, "failed to write task meta.json");
+        }
+        if let Err(e) = store.save_to_file(&self.paths.sessions_index_file()) {
+            warn!(error = %e, "failed to save sessions index");
+        }
     }
 
     pub async fn public_settings(&self) -> PublicUserSettings {
@@ -149,6 +175,15 @@ impl AppCore {
         self.selected_project.read().await.clone()
     }
 
+    /// Temporary task workspace of the active session, if any.
+    pub async fn current_work_path(&self) -> Option<PathBuf> {
+        self.live
+            .lock()
+            .await
+            .as_ref()
+            .map(|l| l.work_path.clone())
+    }
+
     /// Remember the project directory chosen in the UI (before connect).
     pub async fn set_project_root(&self, root: impl Into<PathBuf>) -> Result<PathBuf, CoreError> {
         let root = root.into();
@@ -163,8 +198,63 @@ impl AppCore {
         self.selected_project.read().await.clone()
     }
 
+    /// Ensure the default sandbox dir exists (`~/.grokx/workspace`) for tasks
+    /// that are not attached to a user-opened project.
+    ///
+    /// This path is **not** shown in the Projects sidebar — only Tasks +.
+    pub async fn ensure_default_project(&self) -> Result<PathBuf, CoreError> {
+        let root = AppPaths::default_project_root();
+        std::fs::create_dir_all(&root).map_err(|e| {
+            CoreError::Message(format!(
+                "failed to create default workspace {}: {e}",
+                root.display()
+            ))
+        })?;
+        // Internal store row only (FK for tasks). Hidden from Projects list.
+        {
+            let mut store = self.store.lock().await;
+            let root_str = root.display().to_string();
+            if store.find_project_by_root(&root_str).is_none() {
+                store.upsert_project(Project {
+                    id: ProjectId::new(),
+                    root_path: root_str,
+                    name: "Default".into(),
+                    created_at: Utc::now(),
+                });
+            }
+        }
+        self.set_project_root(root).await
+    }
+
+    /// True if this path is the internal default sandbox (not a user Project).
+    pub fn is_default_project_path(path: &Path) -> bool {
+        let default = AppPaths::default_project_root();
+        // Compare canonical when possible so /Users/x vs /Users/x/ are equal.
+        let a = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let b = std::fs::canonicalize(&default).unwrap_or(default);
+        a == b
+    }
+
     pub async fn list_sessions(&self) -> Vec<SessionListItem> {
         self.store.lock().await.list_sessions()
+    }
+
+    /// User-visible projects only (excludes the internal default sandbox).
+    pub async fn list_projects(&self) -> Vec<ProjectListItem> {
+        self.store
+            .lock()
+            .await
+            .list_project_items()
+            .into_iter()
+            .filter(|p| !Self::is_default_project_path(Path::new(&p.root_path)))
+            .collect()
+    }
+
+    pub async fn list_sessions_for_project(&self, project_id: &ProjectId) -> Vec<SessionListItem> {
+        self.store
+            .lock()
+            .await
+            .list_session_items_for_project(project_id)
     }
 
     pub async fn rename_session(
@@ -176,10 +266,169 @@ impl AppCore {
             .lock()
             .await
             .rename_session(session_id, title)
-            .map_err(|e| CoreError::Message(e.to_string()))
+            .map_err(|e| CoreError::Message(e.to_string()))?;
+        self.persist_session_meta(session_id).await;
+        Ok(())
     }
 
-    /// Start (or restart) the agent for a project workspace.
+    /// Delete a task/session: drop from index and remove its work directory.
+    /// If it is the live agent session, disconnect first.
+    pub async fn delete_session(
+        self: &Arc<Self>,
+        session_id: &SessionId,
+    ) -> Result<(), CoreError> {
+        // If this is the active agent, tear it down first.
+        {
+            let mut live = self.live.lock().await;
+            if live
+                .as_ref()
+                .map(|l| &l.app_session_id == session_id)
+                .unwrap_or(false)
+            {
+                if let Some(prev) = live.take() {
+                    prev.client.shutdown().await;
+                }
+                *self.status.write().await = AgentConnectionStatus::Failed;
+                self.emit(AppEvent::AgentStatus {
+                    status: AgentConnectionStatus::Failed,
+                    detail: Some("task deleted".into()),
+                });
+            }
+        }
+
+        let meta = self
+            .store
+            .lock()
+            .await
+            .delete_session(session_id)
+            .map_err(|e| CoreError::Message(e.to_string()))?;
+
+        // Persist updated index (without this session).
+        {
+            let store = self.store.lock().await;
+            if let Err(e) = store.save_to_file(&self.paths.sessions_index_file()) {
+                warn!(error = %e, "failed to save sessions index after delete");
+            }
+        }
+
+        // Remove task workspace on disk (chat history, meta, etc.).
+        if !meta.work_path.is_empty() {
+            let work = PathBuf::from(&meta.work_path);
+            // Only delete under known tasks root for safety.
+            let tasks_root = AppPaths::tasks_root();
+            let under_tasks = work.starts_with(&tasks_root)
+                || std::fs::canonicalize(&work)
+                    .ok()
+                    .zip(std::fs::canonicalize(&tasks_root).ok())
+                    .map(|(w, r)| w.starts_with(r))
+                    .unwrap_or(false);
+            if under_tasks && work.is_dir() {
+                if let Err(e) = std::fs::remove_dir_all(&work) {
+                    warn!(error = %e, path = %work.display(), "failed to remove task dir");
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn chat_history_path(work_path: &Path) -> PathBuf {
+        work_path.join("chat-history.json")
+    }
+
+    /// Persist UI chat transcript for a task (JSON array of chat lines).
+    /// Prefer `work_path` when known so history is not lost if store is mid-update.
+    pub async fn save_chat_history(
+        &self,
+        session_id: &SessionId,
+        json: impl AsRef<str>,
+        work_path: Option<String>,
+    ) -> Result<(), CoreError> {
+        let work = if let Some(w) = work_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            PathBuf::from(w)
+        } else {
+            let store = self.store.lock().await;
+            let meta = store
+                .get_session(session_id)
+                .map_err(|e| CoreError::Message(e.to_string()))?;
+            if meta.work_path.is_empty() {
+                return Err(CoreError::Message(
+                    "session has no work_path for chat history".into(),
+                ));
+            }
+            PathBuf::from(&meta.work_path)
+        };
+        std::fs::create_dir_all(&work).map_err(|e| {
+            CoreError::Message(format!("chat history dir {}: {e}", work.display()))
+        })?;
+        let path = Self::chat_history_path(&work);
+        // Atomic-ish write: write temp then rename.
+        let tmp = work.join("chat-history.json.tmp");
+        std::fs::write(&tmp, json.as_ref()).map_err(|e| {
+            CoreError::Message(format!("write chat history {}: {e}", tmp.display()))
+        })?;
+        std::fs::rename(&tmp, &path).map_err(|e| {
+            CoreError::Message(format!("rename chat history {}: {e}", path.display()))
+        })?;
+        // Do not touch_session here: saving history on activate would reshuffle
+        // the list if anything still sorted by updated_at. Title/meta refresh
+        // can still rewrite meta.json without changing list order.
+        let _ = self.store.lock().await.write_task_dir_meta(session_id);
+        Ok(())
+    }
+
+    /// Load UI chat transcript for a task, if present.
+    pub async fn load_chat_history(
+        &self,
+        session_id: &SessionId,
+        work_path: Option<String>,
+    ) -> Result<Option<String>, CoreError> {
+        let work = if let Some(w) = work_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            PathBuf::from(w)
+        } else {
+            let store = self.store.lock().await;
+            match store.get_session(session_id) {
+                Ok(meta) if !meta.work_path.is_empty() => PathBuf::from(&meta.work_path),
+                Ok(_) => {
+                    // Fall back to conventional task dir from session id.
+                    AppPaths::tasks_root().join(session_id.0.to_string())
+                }
+                Err(_) => AppPaths::tasks_root().join(session_id.0.to_string()),
+            }
+        };
+        let path = Self::chat_history_path(&work);
+        if !path.is_file() {
+            // Also try conventional location if hint differed.
+            let fallback = AppPaths::tasks_root()
+                .join(session_id.0.to_string())
+                .join("chat-history.json");
+            if fallback.is_file() && fallback != path {
+                let raw = std::fs::read_to_string(&fallback).map_err(|e| {
+                    CoreError::Message(format!("read chat history {}: {e}", fallback.display()))
+                })?;
+                return Ok(Some(raw));
+            }
+            return Ok(None);
+        }
+        let raw = std::fs::read_to_string(&path).map_err(|e| {
+            CoreError::Message(format!("read chat history {}: {e}", path.display()))
+        })?;
+        Ok(Some(raw))
+    }
+
+    /// Start a **new** task under a project.
+    ///
+    /// - Project path is fixed (user-chosen directory).
+    /// - Task gets a temporary cwd at `~/.grokx/tasks/<id>/` with a `project`
+    ///   symlink so the agent can still read/write project sources.
     pub async fn connect_workspace(
         self: &Arc<Self>,
         project_root: impl Into<PathBuf>,
@@ -187,9 +436,130 @@ impl AppCore {
         allow_path_fallback: bool,
         auto_approve: bool,
     ) -> Result<SessionId, CoreError> {
-        let project_root = project_root.into();
+        self.spawn_agent_for_project(
+            project_root.into(),
+            resource_dir,
+            allow_path_fallback,
+            auto_approve,
+            None,
+        )
+        .await
+    }
+
+    /// Activate an **existing** task: reuse its id/title/work_path, restart engine only.
+    /// Does **not** create a new session row in the list.
+    pub async fn reconnect_session(
+        self: &Arc<Self>,
+        session_id: &SessionId,
+        resource_dir: Option<PathBuf>,
+        allow_path_fallback: bool,
+        auto_approve: bool,
+    ) -> Result<SessionId, CoreError> {
+        // Already live on this session — no-op.
+        if self
+            .live
+            .lock()
+            .await
+            .as_ref()
+            .map(|l| &l.app_session_id == session_id)
+            .unwrap_or(false)
+        {
+            return Ok(session_id.clone());
+        }
+
+        let root = {
+            let store = self.store.lock().await;
+            let meta = store
+                .get_session(session_id)
+                .map_err(|e| CoreError::Message(e.to_string()))?;
+            let project = store
+                .get_project(&meta.project_id)
+                .map_err(|e| CoreError::Message(e.to_string()))?;
+            PathBuf::from(&project.root_path)
+        };
+        self.spawn_agent_for_project(
+            root,
+            resource_dir,
+            allow_path_fallback,
+            auto_approve,
+            Some(session_id.clone()),
+        )
+        .await
+    }
+
+    /// Ensure `~/.grokx/tasks/<id>` exists and contains a `project` symlink
+    /// pointing at the fixed project root (so the agent can access sources).
+    fn ensure_task_workspace(
+        session_id: &SessionId,
+        project_root: &Path,
+        existing_work_path: Option<&str>,
+    ) -> Result<PathBuf, CoreError> {
+        let work = if let Some(p) = existing_work_path.filter(|s| !s.is_empty()) {
+            PathBuf::from(p)
+        } else {
+            AppPaths::tasks_root().join(session_id.0.to_string())
+        };
+        std::fs::create_dir_all(&work).map_err(|e| {
+            CoreError::Message(format!(
+                "failed to create task workspace {}: {e}",
+                work.display()
+            ))
+        })?;
+
+        let link = work.join("project");
+        // Refresh symlink so it always points at the current project path.
+        if link.symlink_metadata().is_ok() || link.exists() {
+            let _ = std::fs::remove_file(&link);
+            let _ = std::fs::remove_dir_all(&link);
+        }
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(project_root, &link).map_err(|e| {
+                CoreError::Message(format!(
+                    "failed to link project into task workspace: {e}"
+                ))
+            })?;
+        }
+        #[cfg(not(unix))]
+        {
+            // Best-effort: write a pointer file if symlink is unavailable.
+            std::fs::write(&link, project_root.display().to_string()).map_err(|e| {
+                CoreError::Message(format!(
+                    "failed to write project pointer in task workspace: {e}"
+                ))
+            })?;
+        }
+
+        // Small readme so the workspace is self-explanatory.
+        let readme = work.join("README.grokx.txt");
+        if !readme.exists() {
+            let _ = std::fs::write(
+                &readme,
+                format!(
+                    "Grokx temporary task workspace\n\
+                     Project (fixed path): {}\n\
+                     Sources are linked at ./project\n\
+                     Agent cwd is this directory.\n",
+                    project_root.display()
+                ),
+            );
+        }
+
+        Ok(work)
+    }
+
+    /// Shared spawn path.
+    /// - `reuse_session = None` → create a new SessionId + list row + task dir
+    /// - `reuse_session = Some(id)` → keep that id/title/work_path, only refresh engine
+    async fn spawn_agent_for_project(
+        self: &Arc<Self>,
+        project_root: PathBuf,
+        resource_dir: Option<PathBuf>,
+        allow_path_fallback: bool,
+        auto_approve: bool,
+        reuse_session: Option<SessionId>,
+    ) -> Result<SessionId, CoreError> {
         if !project_root.as_os_str().is_empty() && !project_root.is_dir() {
-            // Allow "." and relative paths that exist after canonicalize attempt.
             if project_root != Path::new(".") {
                 return Err(CoreError::InvalidProject(
                     project_root.display().to_string(),
@@ -221,7 +591,6 @@ impl AppCore {
         });
 
         let settings = self.settings.read().await.clone();
-        // Inject API key / base URL for the engine; keep user ~/.grok for auth/skills.
         let env = settings.engine_env();
 
         let model = settings
@@ -250,7 +619,6 @@ impl AppCore {
             },
         )?;
 
-        let app_session_id = SessionId::new();
         let now = Utc::now();
         let root_str = project_root.display().to_string();
         let project_id = {
@@ -271,25 +639,64 @@ impl AppCore {
                 id
             }
         };
-        {
+
+        let (app_session_id, work_path) = if let Some(existing_id) = reuse_session {
+            // Reuse list row — never invent a new session id on activate.
+            // Do NOT bump updated_at / created_at: clicking a task must not
+            // reorder the sidebar (order is by created_at).
+            let mut store = self.store.lock().await;
+            let meta = store
+                .get_session(&existing_id)
+                .map_err(|e| CoreError::Message(e.to_string()))?
+                .clone();
+            let work = Self::ensure_task_workspace(
+                &existing_id,
+                &project_root,
+                Some(meta.work_path.as_str()).filter(|s| !s.is_empty()),
+            )?;
+            let mut meta = meta;
+            meta.engine_session_id = None;
+            meta.work_path = work.display().to_string();
+            if meta.project_id != project_id {
+                meta.project_id = project_id;
+            }
+            store.upsert_session(meta);
+            (existing_id, work)
+        } else {
+            let app_session_id = SessionId::new();
+            let work = Self::ensure_task_workspace(&app_session_id, &project_root, None)?;
             let mut store = self.store.lock().await;
             store.upsert_session(SessionMeta {
                 id: app_session_id.clone(),
                 project_id,
                 engine_session_id: None,
-                title: "New session".into(),
+                title: "New task".into(),
                 model: settings.model.clone(),
+                work_path: work.display().to_string(),
                 created_at: now,
                 updated_at: now,
             });
-        }
+            (app_session_id, work)
+        };
 
+        // Persist index + task meta so restarts restore the task list.
+        self.persist_session_meta(&app_session_id).await;
+
+        // Agent cwd = temporary task workspace (not the project root).
         let options = ConnectOptions {
-            cwd: root_str,
+            cwd: work_path.display().to_string(),
             model: settings.model.clone(),
             auto_approve,
             ..ConnectOptions::default()
         };
+
+        self.emit(AppEvent::AgentStatus {
+            status: AgentConnectionStatus::Starting,
+            detail: Some(format!(
+                "task cwd {} (project via ./project)",
+                work_path.display()
+            )),
+        });
 
         let mut client =
             AcpClient::connect(child.child, app_session_id.clone(), options).await?;
@@ -301,8 +708,11 @@ impl AppCore {
             if let Ok(meta) = store.get_session(&app_session_id).cloned() {
                 let mut meta = meta;
                 meta.engine_session_id = Some(eid.clone());
+                // Keep updated_at unchanged on reconnect so list order stays stable.
                 store.upsert_session(meta);
             }
+            drop(store);
+            self.persist_session_meta(&app_session_id).await;
         }
 
         // Forward bridge events onto the app bus while the client lives.
@@ -334,32 +744,11 @@ impl AppCore {
             client,
             handle,
             project_root,
+            work_path,
             app_session_id: app_session_id.clone(),
         });
 
         Ok(app_session_id)
-    }
-
-    /// Reconnect by starting a new agent session for a known session's project.
-    pub async fn reconnect_session(
-        self: &Arc<Self>,
-        session_id: &SessionId,
-        resource_dir: Option<PathBuf>,
-        allow_path_fallback: bool,
-        auto_approve: bool,
-    ) -> Result<SessionId, CoreError> {
-        let root = {
-            let store = self.store.lock().await;
-            let meta = store
-                .get_session(session_id)
-                .map_err(|e| CoreError::Message(e.to_string()))?;
-            let project = store
-                .get_project(&meta.project_id)
-                .map_err(|e| CoreError::Message(e.to_string()))?;
-            PathBuf::from(&project.root_path)
-        };
-        self.connect_workspace(root, resource_dir, allow_path_fallback, auto_approve)
-            .await
     }
 
     /// Send a user prompt on the active session.
@@ -613,6 +1002,7 @@ mod tests {
             engine_session_id: Some("eng-1".into()),
             title: "test".into(),
             model: None,
+            work_path: "/tmp/tasks/test".into(),
             created_at: now,
             updated_at: now,
         });
@@ -622,6 +1012,28 @@ mod tests {
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].session_id, sid);
         assert_eq!(list[0].project_root, root.display().to_string());
+        assert_eq!(list[0].work_path, "/tmp/tasks/test");
         assert!(list[0].updated_at <= Utc::now());
+    }
+
+    #[test]
+    fn ensure_task_workspace_creates_dir_and_project_link() {
+        let sid = SessionId::new();
+        let project = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let work = AppCore::ensure_task_workspace(&sid, &project, None).unwrap();
+        assert!(work.is_dir());
+        assert!(work.starts_with(AppPaths::tasks_root()) || work.components().count() > 0);
+        let link = work.join("project");
+        #[cfg(unix)]
+        {
+            assert!(link
+                .symlink_metadata()
+                .map(|m| m.file_type().is_symlink())
+                .unwrap_or(false));
+            let target = std::fs::read_link(&link).unwrap();
+            assert_eq!(target, project);
+        }
+        // Cleanup this test task dir
+        let _ = std::fs::remove_dir_all(&work);
     }
 }

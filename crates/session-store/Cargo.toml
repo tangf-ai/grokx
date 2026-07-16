@@ -8,5 +8,9 @@ description = "Local session/project metadata store (SQLite later)"
 [dependencies]
 domain = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 thiserror = { workspace = true }
 chrono = { workspace = true }
+uuid = { workspace = true }
+directories = { workspace = true }
+tracing = { workspace = true }

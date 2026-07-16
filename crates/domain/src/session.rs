@@ -49,6 +49,10 @@ pub struct SessionMeta {
     pub engine_session_id: Option<String>,
     pub title: String,
     pub model: Option<String>,
+    /// Temporary task workspace (`~/.grokx/tasks/<id>`). Agent cwd lives here.
+    /// Project sources are reachable via a `project` symlink inside this dir.
+    #[serde(default)]
+    pub work_path: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
