@@ -53,3 +53,4 @@ tmp/
 
 # Engine local build outputs (source stays tracked)
 engine/grok-build/target/
+/dist/
