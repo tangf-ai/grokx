@@ -1,50 +1,39 @@
 use std::path::PathBuf;
 use std::time::Duration;
-
 use app_core::AppCore;
 
 #[tokio::main]
 async fn main() {
-    eprintln!("bootstrap…");
-    let core = AppCore::bootstrap().expect("bootstrap");
-    let mut rx = core.take_event_receiver().await.expect("events");
+    let shim = PathBuf::from("/Users/tangf/Work/grokx/target/acp-smoke-shim/grok");
+    assert!(shim.is_file(), "missing {}", shim.display());
+    let core = AppCore::bootstrap().unwrap();
+    {
+        let mut s = core.settings.write().await;
+        s.custom_engine_path = Some(shim.display().to_string());
+        s.prefer_bundled_engine = false;
+    }
+    let mut rx = core.take_event_receiver().await.unwrap();
     tokio::spawn(async move {
         while let Some(ev) = rx.recv().await {
             eprintln!("EV {ev:?}");
         }
     });
-
-    eprintln!("resolve…");
-    match core.resolve_runtime(None, true).await {
-        Ok(e) => eprintln!("engine {} ({:?})", e.path.display(), e.source),
-        Err(e) => {
-            eprintln!("resolve failed: {e}");
-            std::process::exit(1);
-        }
-    }
-
-    eprintln!("connect…");
-    let connect =
-        core.connect_workspace(PathBuf::from("/Users/tangf/Work/grokx"), None, true, true);
-    match tokio::time::timeout(Duration::from_secs(25), connect).await {
-        Ok(Ok(sid)) => eprintln!("OK session {}", sid.0),
-        Ok(Err(e)) => {
-            eprintln!("connect err: {e}");
-            std::process::exit(2);
-        }
-        Err(_) => {
-            eprintln!("connect TIMEOUT");
-            std::process::exit(3);
-        }
-    }
-
-    eprintln!("prompt…");
-    if let Err(e) = core.send_prompt("Reply with exactly: pong".into()).await {
-        eprintln!("prompt err: {e}");
-        std::process::exit(4);
-    }
-
-    tokio::time::sleep(Duration::from_secs(40)).await;
+    let eng = core.resolve_runtime(None, false).await.unwrap();
+    eprintln!("engine {} {:?}", eng.path.display(), eng.source);
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    core.set_project_root(root.clone()).await.unwrap();
+    let sid = tokio::time::timeout(
+        Duration::from_secs(12),
+        core.connect_workspace(root, None, false, true),
+    )
+    .await
+    .expect("timeout")
+    .expect("connect");
+    eprintln!("connected {}", sid.0);
+    let list = core.list_sessions().await;
+    eprintln!("sessions={} eng={:?}", list.len(), list[0].engine_session_id);
+    core.send_prompt("hi".into()).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(800)).await;
     core.disconnect().await;
-    eprintln!("done");
+    eprintln!("smoke complete");
 }

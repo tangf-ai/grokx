@@ -18,3 +18,10 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+acp-bridge = { workspace = true }
+agent-process = { workspace = true }
+app-config = { workspace = true }
+domain = { workspace = true }
+tokio = { workspace = true }

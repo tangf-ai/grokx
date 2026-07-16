@@ -240,8 +240,45 @@ fn spawn_event_forwarder(app: AppHandle, core: Arc<AppCore>) {
     });
 }
 
+/// Headless smoke used by verification: same logic as Tauri commands, no window.
+///
+/// Env: `GROKX_HEADLESS_CHECK=1` → print JSON for app_version + resolve_engine and exit.
+pub async fn headless_check() -> Result<(), String> {
+    let version = app_version();
+    let core = AppCore::bootstrap().map_err(|e| e.to_string())?;
+    let resource = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources");
+    let allow_path = true;
+    let engine = core
+        .resolve_runtime(Some(resource.as_path()), allow_path)
+        .await
+        .map_err(|e| e.to_string())?;
+    let source = match engine.source {
+        EngineSource::Bundled => "bundled",
+        EngineSource::Custom => "custom",
+        EngineSource::Path => "path",
+    };
+    let payload = serde_json::json!({
+        "app_version": version,
+        "resolve_engine": {
+            "path": engine.path.display().to_string(),
+            "source": source,
+            "status": format!("{:?}", core.connection_status().await),
+        }
+    });
+    println!("{payload}");
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    if std::env::var("GROKX_HEADLESS_CHECK").ok().as_deref() == Some("1") {
+        if let Err(err) = tauri::async_runtime::block_on(headless_check()) {
+            eprintln!("headless_check failed: {err}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
     let core = AppCore::bootstrap().expect("failed to bootstrap app core");
 
     tauri::Builder::default()
