@@ -13,7 +13,10 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::time::timeout;
 use tracing::{debug, warn};
 
-use crate::map::{map_permission_request, map_session_update, turn_finished};
+use crate::map::{map_permission_request, map_session_update, permission_meta, turn_finished};
+use crate::permission_gate::{
+    permission_outcome_value, ParkedPermission, PermissionGate,
+};
 use crate::BridgeError;
 
 const DEFAULT_RPC_TIMEOUT: Duration = Duration::from_secs(120);
@@ -53,6 +56,8 @@ struct Shared {
     app_session_id: Mutex<SessionId>,
     options: ConnectOptions,
     events: mpsc::UnboundedSender<AppEvent>,
+    /// Permission RPCs waiting for UI when auto_approve is false.
+    permission_gate: Mutex<PermissionGate>,
 }
 
 /// Live ACP connection. Clone-friendly handle for commands; reader task owns the process pipes.
@@ -116,6 +121,7 @@ impl AcpClient {
             app_session_id: Mutex::new(app_session_id),
             options: options.clone(),
             events: events_tx,
+            permission_gate: Mutex::new(PermissionGate::new()),
         });
 
         let reader_shared = Arc::clone(&shared);
@@ -307,6 +313,42 @@ impl AcpClientHandle {
         Ok(())
     }
 
+    /// Whether a permission request is still waiting for a UI decision.
+    pub async fn permission_is_pending(&self, request_id: &str) -> bool {
+        self.shared
+            .permission_gate
+            .lock()
+            .await
+            .is_pending(request_id)
+    }
+
+    pub async fn pending_permission_ids(&self) -> Vec<String> {
+        self.shared.permission_gate.lock().await.pending_ids()
+    }
+
+    /// Apply a UI permission decision to the live ACP session.
+    pub async fn resolve_permission(
+        &self,
+        request_id: &str,
+        decision: PermissionDecision,
+    ) -> Result<(), BridgeError> {
+        let (rpc_id, outcome) = {
+            let mut gate = self.shared.permission_gate.lock().await;
+            gate.resolve(request_id, decision)?
+        };
+        write_response(&self.shared, rpc_id, outcome).await?;
+        let app_session_id = self.app_session_id().await;
+        let _ = self.shared.events.send(AppEvent::TurnState {
+            session_id: app_session_id,
+            state: if matches!(decision, PermissionDecision::Deny) {
+                TurnState::RunningTools
+            } else {
+                TurnState::RunningTools
+            },
+        });
+        Ok(())
+    }
+
     async fn request(&self, method: &str, params: Value) -> Result<Value, BridgeError> {
         let id = self.shared.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
@@ -414,11 +456,31 @@ async fn handle_incoming(shared: Arc<Shared>, value: Value) -> Result<(), Bridge
             }
         }
         "session/request_permission" | "request_permission" => {
-            let event = map_permission_request(app_session_id, &params);
-            let _ = shared.events.send(event);
-            if let Some(req_id) = id {
-                let result = permission_outcome(PermissionDecision::AllowOnce);
-                let _ = write_response(&shared, req_id, result).await;
+            let Some(rpc_id) = id else {
+                return Ok(());
+            };
+            let request_id = uuid::Uuid::new_v4().to_string();
+            let (tool_name, summary) = permission_meta(&params);
+            let event =
+                map_permission_request(app_session_id.clone(), &params, request_id.clone());
+
+            if PermissionGate::should_park(shared.options.auto_approve) {
+                shared.permission_gate.lock().await.park(ParkedPermission {
+                    request_id: request_id.clone(),
+                    rpc_id,
+                    tool_name,
+                    summary,
+                });
+                let _ = shared.events.send(event);
+                let _ = shared.events.send(AppEvent::TurnState {
+                    session_id: app_session_id,
+                    state: TurnState::WaitingPermission,
+                });
+                // Do NOT write a response — agent waits until resolve_permission.
+            } else {
+                let _ = shared.events.send(event);
+                let result = permission_outcome_value(PermissionDecision::AllowOnce);
+                let _ = write_response(&shared, rpc_id, result).await;
             }
         }
         "" => {}
@@ -461,20 +523,6 @@ async fn write_response(
     stdin.write_all(&line).await?;
     stdin.flush().await?;
     Ok(())
-}
-
-fn permission_outcome(decision: PermissionDecision) -> Value {
-    let option_id = match decision {
-        PermissionDecision::AllowOnce => "allow-once",
-        PermissionDecision::AllowSession => "allow-always",
-        PermissionDecision::Deny => "reject-once",
-    };
-    json!({
-        "outcome": {
-            "outcome": "selected",
-            "optionId": option_id
-        }
-    })
 }
 
 fn parse_id(id: Option<&Value>) -> Option<u64> {

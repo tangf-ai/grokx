@@ -1,7 +1,7 @@
 {
   "app_version": "0.1.0",
   "engine_name": "grok-build",
-  "engine_version": "subtree",
+  "engine_version": "path-staged",
   "engine_commit": "8cf69e3",
   "engine_channel": "bundled"
 }

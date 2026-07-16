@@ -108,4 +108,35 @@ impl PermissionBroker {
     pub fn session_allowed(&self, tool_name: &str) -> bool {
         self.session_allows.get(tool_name).copied().unwrap_or(false)
     }
+
+    pub fn is_pending(&self, id: &str) -> bool {
+        self.pending.contains_key(id)
+    }
+
+    pub fn pending_count(&self) -> usize {
+        self.pending.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use domain::PermissionRequest;
+
+    #[test]
+    fn enqueue_stays_pending_until_resolve() {
+        let mut broker = PermissionBroker::new();
+        let id = broker.enqueue(PermissionRequest {
+            id: "p1".into(),
+            tool_call_id: None,
+            tool_name: "Bash".into(),
+            summary: "ls".into(),
+            detail: None,
+            risk: PermissionRisk::Medium,
+        });
+        assert!(broker.is_pending(&id));
+        assert_eq!(broker.pending_count(), 1);
+        broker.resolve(&id, PermissionDecision::Deny).unwrap();
+        assert!(!broker.is_pending(&id));
+    }
 }

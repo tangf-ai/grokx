@@ -101,7 +101,13 @@ pub fn map_session_update(session_id: SessionId, update: &Value) -> Vec<AppEvent
 }
 
 /// Map a `session/request_permission` params object into a UI event.
-pub fn map_permission_request(session_id: SessionId, params: &Value) -> AppEvent {
+///
+/// `request_id` is the app-facing id used to resolve the parked RPC.
+pub fn map_permission_request(
+    session_id: SessionId,
+    params: &Value,
+    request_id: String,
+) -> AppEvent {
     let tool_name = params
         .pointer("/toolCall/title")
         .or_else(|| params.pointer("/toolCall/kind"))
@@ -127,13 +133,6 @@ pub fn map_permission_request(session_id: SessionId, params: &Value) -> AppEvent
                 .map(|s| s.to_string())
         });
 
-    let id = params
-        .get("requestId")
-        .or_else(|| params.get("id"))
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-
     let tool_call_id = params
         .pointer("/toolCall/toolCallId")
         .or_else(|| params.pointer("/toolCall/id"))
@@ -143,7 +142,7 @@ pub fn map_permission_request(session_id: SessionId, params: &Value) -> AppEvent
     AppEvent::PermissionNeeded {
         session_id,
         request: PermissionRequest {
-            id,
+            id: request_id,
             tool_call_id,
             tool_name,
             summary,
@@ -151,6 +150,24 @@ pub fn map_permission_request(session_id: SessionId, params: &Value) -> AppEvent
             risk: PermissionRisk::Medium,
         },
     }
+}
+
+/// Extract display fields without building a full event (for parking metadata).
+pub fn permission_meta(params: &Value) -> (String, String) {
+    let tool_name = params
+        .pointer("/toolCall/title")
+        .or_else(|| params.pointer("/toolCall/kind"))
+        .or_else(|| params.get("toolName"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("tool")
+        .to_string();
+    let summary = params
+        .pointer("/toolCall/title")
+        .and_then(|v| v.as_str())
+        .or_else(|| params.get("summary").and_then(|v| v.as_str()))
+        .unwrap_or("Agent requests permission")
+        .to_string();
+    (tool_name, summary)
 }
 
 pub fn turn_finished(session_id: SessionId, state: TurnState) -> AppEvent {

@@ -115,6 +115,21 @@ mod tests {
         assert_eq!(resolved.path, bin);
     }
 
+    #[test]
+    fn prefers_bundled_over_path_fallback() {
+        let resources = tempfile_dir();
+        let runtime_dir = resources.join("runtime");
+        std::fs::create_dir_all(&runtime_dir).unwrap();
+        let bin = runtime_dir.join(if cfg!(windows) { "grok.exe" } else { "grok" });
+        touch(&bin);
+
+        let settings = UserSettings::product_defaults();
+        // Even with PATH fallback enabled, bundled wins when present.
+        let resolved = resolve_engine(&settings, Some(&resources), true).unwrap();
+        assert_eq!(resolved.source, EngineSource::Bundled);
+        assert_eq!(resolved.path, bin);
+    }
+
     fn tempfile_dir() -> PathBuf {
         let mut dir = std::env::temp_dir();
         dir.push(format!("grokx-test-{}", uuid_like()));

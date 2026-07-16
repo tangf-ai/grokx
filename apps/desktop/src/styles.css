@@ -68,6 +68,93 @@ body,
 
 .sidebar {
   position: relative;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.session-list {
+  flex: 1;
+  overflow: auto;
+  margin-top: 12px;
+  padding-bottom: 40px;
+}
+
+.session-row {
+  display: block;
+  width: 100%;
+  text-align: left;
+  background: #12151c;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text);
+  padding: 8px 10px;
+  margin-bottom: 6px;
+  cursor: pointer;
+}
+
+.session-row:hover {
+  border-color: var(--accent);
+}
+
+.session-title {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.session-meta {
+  font-size: 11px;
+  color: var(--muted);
+  margin-top: 2px;
+}
+
+.small {
+  font-size: 12px;
+}
+
+.project-row {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.project-input {
+  flex: 1;
+  background: #0f1115;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text);
+  padding: 10px 12px;
+}
+
+.check {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--muted);
+  font-size: 13px;
+  margin-top: 8px;
+}
+
+.perm-card {
+  background: #0f1115;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 12px;
+}
+
+.perm-title {
+  font-weight: 700;
+  margin-bottom: 6px;
+}
+
+.perm-detail {
+  font-size: 11px;
+  max-height: 160px;
+  overflow: auto;
+  background: #0a0c10;
+  border-radius: 6px;
+  padding: 8px;
 }
 
 .main {

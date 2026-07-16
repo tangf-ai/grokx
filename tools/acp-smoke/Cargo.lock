@@ -67,6 +67,7 @@ dependencies = [
  "domain",
  "permissions",
  "serde",
+ "serde_json",
  "session-store",
  "thiserror",
  "tokio",

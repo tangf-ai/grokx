@@ -94,6 +94,7 @@ dependencies = [
  "domain",
  "permissions",
  "serde",
+ "serde_json",
  "session-store",
  "thiserror 2.0.18",
  "tokio",
@@ -1237,6 +1238,7 @@ dependencies = [
  "tauri-plugin-shell",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]

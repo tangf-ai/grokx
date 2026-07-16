@@ -5,9 +5,13 @@
 
 mod client;
 mod map;
+mod permission_gate;
 
 pub use client::{AcpClient, AcpClientHandle, ConnectOptions};
-pub use map::{map_session_update, turn_finished};
+pub use map::{map_permission_request, map_session_update, turn_finished};
+pub use permission_gate::{
+    decision_blocks_tool, permission_outcome_value, GateError, ParkedPermission, PermissionGate,
+};
 
 use thiserror::Error;
 
@@ -27,6 +31,8 @@ pub enum BridgeError {
     Json(#[from] serde_json::Error),
     #[error("channel closed")]
     ChannelClosed,
+    #[error(transparent)]
+    Gate(#[from] GateError),
     #[error("{0}")]
     Message(String),
 }

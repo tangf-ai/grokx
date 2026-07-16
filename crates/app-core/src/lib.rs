@@ -8,10 +8,11 @@ use agent_process::{resolve_engine, spawn_agent_stdio, ResolvedEngine, SpawnOpti
 use app_config::{AppPaths, UserSettings};
 use chrono::Utc;
 use domain::{
-    AgentConnectionStatus, AppEvent, Project, ProjectId, SessionId, SessionMeta, TurnState,
+    AgentConnectionStatus, AppEvent, PermissionDecision, Project, ProjectId, SessionId,
+    SessionMeta, TurnState,
 };
 use permissions::{PermissionBroker, Policy};
-use session_store::SessionStore;
+use session_store::{SessionListItem, SessionStore};
 use thiserror::Error;
 use tokio::sync::{mpsc, Mutex, RwLock};
 use tracing::warn;
@@ -30,6 +31,8 @@ pub enum CoreError {
     NotConnected,
     #[error("a turn is already in progress")]
     TurnInProgress,
+    #[error("project root does not exist: {0}")]
+    InvalidProject(String),
     #[error("{0}")]
     Message(String),
 }
@@ -50,6 +53,8 @@ pub struct AppCore {
     pub policy: RwLock<Policy>,
     pub engine: RwLock<Option<ResolvedEngine>>,
     pub status: RwLock<AgentConnectionStatus>,
+    /// Selected project root before connect (UI).
+    selected_project: RwLock<Option<PathBuf>>,
     live: Mutex<Option<LiveAgent>>,
     turn_busy: Mutex<bool>,
     event_tx: mpsc::UnboundedSender<AppEvent>,
@@ -69,6 +74,7 @@ impl AppCore {
             policy: RwLock::new(Policy::default()),
             engine: RwLock::new(None),
             status: RwLock::new(AgentConnectionStatus::MissingBinary),
+            selected_project: RwLock::new(None),
             live: Mutex::new(None),
             turn_busy: Mutex::new(false),
             event_tx,
@@ -115,11 +121,28 @@ impl AppCore {
     }
 
     pub async fn current_project_root(&self) -> Option<PathBuf> {
-        self.live
-            .lock()
-            .await
-            .as_ref()
-            .map(|l| l.project_root.clone())
+        if let Some(live) = self.live.lock().await.as_ref() {
+            return Some(live.project_root.clone());
+        }
+        self.selected_project.read().await.clone()
+    }
+
+    /// Remember the project directory chosen in the UI (before connect).
+    pub async fn set_project_root(&self, root: impl Into<PathBuf>) -> Result<PathBuf, CoreError> {
+        let root = root.into();
+        if !root.is_dir() {
+            return Err(CoreError::InvalidProject(root.display().to_string()));
+        }
+        *self.selected_project.write().await = Some(root.clone());
+        Ok(root)
+    }
+
+    pub async fn selected_project_root(&self) -> Option<PathBuf> {
+        self.selected_project.read().await.clone()
+    }
+
+    pub async fn list_sessions(&self) -> Vec<SessionListItem> {
+        self.store.lock().await.list_sessions()
     }
 
     /// Start (or restart) the agent for a project workspace.
@@ -131,6 +154,16 @@ impl AppCore {
         auto_approve: bool,
     ) -> Result<SessionId, CoreError> {
         let project_root = project_root.into();
+        if !project_root.as_os_str().is_empty() && !project_root.is_dir() {
+            // Allow "." and relative paths that exist after canonicalize attempt.
+            if project_root != Path::new(".") {
+                return Err(CoreError::InvalidProject(
+                    project_root.display().to_string(),
+                ));
+            }
+        }
+        *self.selected_project.write().await = Some(project_root.clone());
+
         let engine = match self.engine.read().await.clone() {
             Some(e) => e,
             None => {
@@ -172,19 +205,28 @@ impl AppCore {
         )?;
 
         let app_session_id = SessionId::new();
-        let project_id = ProjectId::new();
         let now = Utc::now();
+        let root_str = project_root.display().to_string();
+        let project_id = {
+            let mut store = self.store.lock().await;
+            if let Some(existing) = store.find_project_by_root(&root_str) {
+                existing.id.clone()
+            } else {
+                let id = ProjectId::new();
+                store.upsert_project(Project {
+                    id: id.clone(),
+                    root_path: root_str.clone(),
+                    name: project_root
+                        .file_name()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| root_str.clone()),
+                    created_at: now,
+                });
+                id
+            }
+        };
         {
             let mut store = self.store.lock().await;
-            store.upsert_project(Project {
-                id: project_id.clone(),
-                root_path: project_root.display().to_string(),
-                name: project_root
-                    .file_name()
-                    .map(|s| s.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| project_root.display().to_string()),
-                created_at: now,
-            });
             store.upsert_session(SessionMeta {
                 id: app_session_id.clone(),
                 project_id,
@@ -197,7 +239,7 @@ impl AppCore {
         }
 
         let options = ConnectOptions {
-            cwd: project_root.display().to_string(),
+            cwd: root_str,
             model: settings.model.clone(),
             auto_approve,
             ..ConnectOptions::default()
@@ -226,6 +268,10 @@ impl AppCore {
                 if let AppEvent::AgentStatus { status, .. } = &event {
                     *status_slot.status.write().await = *status;
                 }
+                if let AppEvent::PermissionNeeded { request, .. } = &event {
+                    let mut broker = status_slot.permissions.lock().await;
+                    broker.enqueue(request.clone());
+                }
                 if bus.send(event).is_err() {
                     break;
                 }
@@ -246,6 +292,28 @@ impl AppCore {
         });
 
         Ok(app_session_id)
+    }
+
+    /// Reconnect by starting a new agent session for a known session's project.
+    pub async fn reconnect_session(
+        self: &Arc<Self>,
+        session_id: &SessionId,
+        resource_dir: Option<PathBuf>,
+        allow_path_fallback: bool,
+        auto_approve: bool,
+    ) -> Result<SessionId, CoreError> {
+        let root = {
+            let store = self.store.lock().await;
+            let meta = store
+                .get_session(session_id)
+                .map_err(|e| CoreError::Message(e.to_string()))?;
+            let project = store
+                .get_project(&meta.project_id)
+                .map_err(|e| CoreError::Message(e.to_string()))?;
+            PathBuf::from(&project.root_path)
+        };
+        self.connect_workspace(root, resource_dir, allow_path_fallback, auto_approve)
+            .await
     }
 
     /// Send a user prompt on the active session.
@@ -310,6 +378,50 @@ impl AppCore {
         Ok(())
     }
 
+    /// Resolve a parked permission request on the live ACP session.
+    pub async fn resolve_permission(
+        &self,
+        request_id: String,
+        decision: PermissionDecision,
+    ) -> Result<(), CoreError> {
+        let handle = {
+            let live = self.live.lock().await;
+            live.as_ref()
+                .map(|l| l.handle.clone())
+                .ok_or(CoreError::NotConnected)?
+        };
+
+        // Ensure still pending on the bridge before answering.
+        if !handle.permission_is_pending(&request_id).await {
+            // Broker may still have it for UI bookkeeping.
+            let mut broker = self.permissions.lock().await;
+            let _ = broker.resolve(&request_id, decision);
+            return Err(CoreError::Message(format!(
+                "permission request not pending: {request_id}"
+            )));
+        }
+
+        handle.resolve_permission(&request_id, decision).await?;
+        let mut broker = self.permissions.lock().await;
+        let _ = broker.resolve(&request_id, decision);
+
+        self.emit(AppEvent::AgentStatus {
+            status: AgentConnectionStatus::Ready,
+            detail: Some(format!(
+                "permission {request_id} → {decision:?}"
+            )),
+        });
+        Ok(())
+    }
+
+    pub async fn permission_is_pending(&self, request_id: &str) -> bool {
+        let live = self.live.lock().await;
+        match live.as_ref() {
+            Some(l) => l.handle.permission_is_pending(request_id).await,
+            None => false,
+        }
+    }
+
     pub async fn disconnect(&self) {
         if let Some(prev) = self.live.lock().await.take() {
             prev.client.shutdown().await;
@@ -320,5 +432,71 @@ impl AppCore {
             status: AgentConnectionStatus::MissingBinary,
             detail: Some("disconnected".into()),
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use acp_bridge::{decision_blocks_tool, PermissionGate, ParkedPermission};
+    use domain::PermissionDecision;
+    use serde_json::json;
+
+    /// Drive the same gate used by the bridge: pending until resolve; deny blocks.
+    #[tokio::test]
+    async fn permission_pending_until_resolved_via_gate() {
+        let mut gate = PermissionGate::new();
+        assert!(PermissionGate::should_park(false));
+        gate.park(ParkedPermission {
+            request_id: "ui-req".into(),
+            rpc_id: json!(7),
+            tool_name: "Bash".into(),
+            summary: "echo hi".into(),
+        });
+        assert!(gate.is_pending("ui-req"));
+
+        // Deny path
+        let (_rpc, outcome) = gate.resolve("ui-req", PermissionDecision::Deny).unwrap();
+        assert_eq!(outcome["outcome"]["optionId"], "reject-once");
+        assert!(decision_blocks_tool(PermissionDecision::Deny));
+        assert!(!gate.is_pending("ui-req"));
+    }
+
+    #[tokio::test]
+    async fn set_project_and_list_sessions_after_store() {
+        let core = AppCore::bootstrap().unwrap();
+        // Use crate dir as a real directory
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let set = core.set_project_root(root.clone()).await.unwrap();
+        assert_eq!(set, root);
+        assert_eq!(core.selected_project_root().await, Some(root.clone()));
+
+        // Simulate session metadata as connect would
+        let mut store = core.store.lock().await;
+        let pid = ProjectId::new();
+        let sid = SessionId::new();
+        let now = Utc::now();
+        store.upsert_project(Project {
+            id: pid.clone(),
+            root_path: root.display().to_string(),
+            name: "app-core".into(),
+            created_at: now,
+        });
+        store.upsert_session(SessionMeta {
+            id: sid.clone(),
+            project_id: pid,
+            engine_session_id: Some("eng-1".into()),
+            title: "test".into(),
+            model: None,
+            created_at: now,
+            updated_at: now,
+        });
+        drop(store);
+
+        let list = core.list_sessions().await;
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].session_id, sid);
+        assert_eq!(list[0].project_root, root.display().to_string());
+        assert!(list[0].updated_at <= Utc::now());
     }
 }

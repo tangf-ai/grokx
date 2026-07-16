@@ -33,15 +33,31 @@ Desktop UI, ACP wiring, and release packaging come next.
 ## Quick start (after Rust is installed)
 
 ```bash
-# Resolve runtime path logic / unit tests for product crates
-cargo test -p domain -p app-config -p agent-process
+source "$HOME/.cargo/env"
+export PATH="$HOME/.grok/bin:$PATH"   # or use bundled runtime after packaging
 
-# Build bundled engine binary (from subtree)
-./tools/build-engine.sh
+# Product crate tests
+cargo test -p domain -p acp-bridge -p agent-process -p app-core \
+  -p app-config -p permissions -p session-store
 
-# Desktop app (once UI deps are installed)
+# Headless ACP smoke (connect → prompt stream)
+cargo run --manifest-path tools/acp-smoke/Cargo.toml
+
+# Stage / bundle a runtime binary into Tauri resources
+# Prefer building from subtree when time allows:
+#   ./tools/build-engine.sh && ./packaging/bundle_runtime.sh
+# Or copy an existing grok into runtime-dist/ then:
+./packaging/bundle_runtime.sh
+
+# Desktop app
 cd apps/desktop && pnpm install && pnpm tauri dev
 ```
+
+### Desktop flow
+
+1. Enter a **project path** and click **Set project** (or paste path and Connect).
+2. Optionally uncheck **Auto-approve tools** so permission requests park until Allow/Deny.
+3. **Connect agent** → send a prompt; sessions appear in the left list for reconnect.
 
 ## Engine strategy
 
