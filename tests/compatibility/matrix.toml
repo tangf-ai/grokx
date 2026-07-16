@@ -2,6 +2,6 @@
 
 [[entry]]
 app = "0.1.0"
-engine_commit = "pending-subtree"
+engine_commit = "8cf69e3"
 status = "scaffold"
-notes = "Initial monorepo; ACP loop not wired yet."
+notes = "Initial monorepo with subtree import of xai-org/grok-build; ACP loop not wired yet."

@@ -19,20 +19,20 @@ fi
 echo ">> building engine in $ENGINE_DIR"
 cd "$ENGINE_DIR"
 
-# Prefer a binary target named grok if present; fall back to --release workspace default.
-if cargo metadata --no-deps --format-version 1 2>/dev/null | grep -q '"name":"grok"'; then
-  cargo build --release -p grok
-else
-  cargo build --release
-fi
+# Upstream ships the CLI as package `xai-grok-pager-bin` / binary `xai-grok-pager`.
+# Official installers rename the artifact to `grok`; we do the same for bundling.
+PKG="${ENGINE_PACKAGE:-xai-grok-pager-bin}"
+BIN_NAME="${ENGINE_BIN_NAME:-xai-grok-pager}"
+
+cargo build --release -p "$PKG"
 
 mkdir -p "$OUT_DIR"
 BIN=""
 for candidate in \
+  "$ENGINE_DIR/target/release/$BIN_NAME" \
+  "$ENGINE_DIR/target/release/${BIN_NAME}.exe" \
   "$ENGINE_DIR/target/release/grok" \
-  "$ENGINE_DIR/target/release/grok.exe" \
-  "$ENGINE_DIR/target/release/grok-build" \
-  "$ENGINE_DIR/target/release/grok-build.exe"
+  "$ENGINE_DIR/target/release/grok.exe"
 do
   if [[ -f "$candidate" ]]; then
     BIN="$candidate"
@@ -46,15 +46,12 @@ if [[ -z "$BIN" ]]; then
   exit 1
 fi
 
-BASE="$(basename "$BIN")"
-cp "$BIN" "$OUT_DIR/$BASE"
-if [[ "$BASE" != "grok" && "$BASE" != "grok.exe" ]]; then
-  # Normalize name expected by the desktop resolver.
-  if [[ "$BASE" == *.exe ]]; then
-    cp "$BIN" "$OUT_DIR/grok.exe"
-  else
-    cp "$BIN" "$OUT_DIR/grok"
-  fi
+# Normalize to the name expected by agent-process / desktop resolver.
+if [[ "$BIN" == *.exe ]]; then
+  cp "$BIN" "$OUT_DIR/grok.exe"
+else
+  cp "$BIN" "$OUT_DIR/grok"
+  chmod +x "$OUT_DIR/grok"
 fi
 
 COMMIT="$(git -C "$ROOT" log -1 --format=%h -- engine/grok-build 2>/dev/null || echo unknown)"

@@ -8,5 +8,7 @@ This product includes software developed as a thin fork / redistribution of:
   Copyright of the respective upstream authors
   Licensed under the Apache License, Version 2.0
 
-See engine/grok-build/LICENSE and any NOTICE files under engine/grok-build/
-for upstream attribution details.
+See engine/grok-build/LICENSE, engine/grok-build/THIRD-PARTY-NOTICES, and
+any NOTICE files under engine/grok-build/ for upstream attribution details.
+
+Upstream copyright: Copyright 2023-2026 SpaceXAI (see engine/grok-build/LICENSE).
