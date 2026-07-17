@@ -124,7 +124,7 @@ impl Default for ModelEndpointSettings {
 pub struct UserSettings {
     /// Optional override for the grok binary (debug / power users).
     pub custom_engine_path: Option<String>,
-    /// Prefer bundled runtime when no custom path is set.
+    /// Prefer a manually provided bundled runtime when no custom path is set.
     pub prefer_bundled_engine: bool,
     /// Last selected model id (composer).
     pub model: Option<String>,
@@ -152,7 +152,7 @@ impl UserSettings {
     pub fn product_defaults() -> Self {
         Self {
             custom_engine_path: None,
-            prefer_bundled_engine: true,
+            prefer_bundled_engine: false,
             model: Some("grok-4.5".into()),
             effort: Some("medium".into()),
             endpoint: ModelEndpointSettings::default(),

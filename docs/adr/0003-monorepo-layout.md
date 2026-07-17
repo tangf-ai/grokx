@@ -6,14 +6,15 @@ Accepted
 
 ## Context
 
-Desktop app, Rust core, and engine pin must version together for releases.
+Desktop app, Rust core, and engine integration sources live in one repository.
 
 ## Decision
 
 Use one monorepo: `apps/`, `crates/`, `engine/`, `packaging/`, `tools/`, `docs/`.
-Exclude engine from the primary Cargo workspace; build it independently and bundle the binary.
+Exclude engine from the primary Cargo workspace. Grokx release builds do not
+compile or bundle the engine binary.
 
 ## Consequences
 
 - Faster product crate iteration
-- Explicit packaging step to copy runtime into Tauri resources
+- Grok CLI installation and updates are independent from Grokx releases

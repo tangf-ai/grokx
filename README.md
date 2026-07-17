@@ -6,7 +6,7 @@
 
 <p align="center">
   <strong>Open-source desktop AI coding app</strong><br />
-  Codex-style light UI · bundled Grok Build engine · Tauri + React
+  Codex-style light UI · Grok Build integration · Tauri + React
 </p>
 
 <p align="center">
@@ -17,7 +17,7 @@
 
 ---
 
-**Grokx** wraps a fully bundled, thin-forked [Grok Build](https://github.com/xai-org/grok-build) engine behind a clean desktop shell.
+**Grokx** connects a separately installed [Grok Build](https://github.com/xai-org/grok-build) CLI to a clean desktop shell.
 
 | Layer | Stack |
 |-------|--------|
@@ -54,7 +54,7 @@ User prompt, collapsible thinking trace with duration, final assistant reply.
 - Settings for API base URL, key, model, and engine path
 - Task rename / delete; list order stays by creation time
 - Chat + task list persistence across app restarts
-- Bundled runtime resolution (prefer `resources/runtime/grok` over PATH)
+- Automatic `grok` discovery on `PATH`, with a custom executable override
 
 ## Repository layout
 
@@ -62,7 +62,7 @@ User prompt, collapsible thinking trace with duration, final assistant reply.
 apps/desktop          # Tauri desktop shell + UI
 crates/               # Product Rust libraries (domain, ACP, process, permissions…)
 engine/grok-build     # Thin fork of xai-org/grok-build (subtree)
-packaging/            # Bundle / sign / notarize helpers
+packaging/            # Package / sign / notarize helpers
 tools/                # Dev + upstream sync scripts
 docs/                 # Architecture, images, contribution policy
 ```
@@ -74,7 +74,7 @@ See [docs/repo-structure.md](docs/repo-structure.md) and [docs/engine-policy.md]
 - Rust stable (`rustup`)
 - Node.js 20+ and pnpm (for the desktop UI)
 - Platform build tools for Tauri (see [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/))
-- Optional: a working `grok` CLI for PATH fallback during development
+- A working `grok` CLI on `PATH`, or its executable path configured in Settings
 
 ## Quick start
 
@@ -100,26 +100,14 @@ pnpm tauri dev
 4. Paste text/images into the composer, pick model / effort, approve tools when needed.
 5. Rename (✎) or delete (🗑) tasks from the sidebar; reopen the app to resume history.
 
-### Bundle engine runtime (optional)
-
-```bash
-# From repo root — build from subtree when possible:
-./tools/build-engine.sh && ./packaging/bundle_runtime.sh
-
-# Or place a grok binary into runtime-dist/ then:
-./packaging/bundle_runtime.sh
-```
-
-The packaged binary is **not** committed; local builds write to `apps/desktop/src-tauri/resources/runtime/grok` (gitignored).
-
 ## Engine strategy
 
 | Item | Choice |
 |------|--------|
-| Bundle | Installers can ship a pinned Grok Build runtime |
+| Distribution | Installers do not build or bundle the Grok CLI |
 | Source | `engine/grok-build` via **git subtree** |
 | Coupling | App talks to engine over ACP stdio |
-| Overrides | Settings may point at a custom `grok` binary |
+| Resolution | Settings override first, then the installed `grok` on `PATH` |
 | Upstream | Periodic merge from `https://github.com/xai-org/grok-build` |
 
 ```bash

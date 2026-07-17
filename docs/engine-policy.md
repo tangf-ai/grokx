@@ -2,7 +2,7 @@
 
 ## Goals
 
-- Ship a **fully bundled** Grok Build runtime with every app release.
+- Keep Grokx releases independent from Grok CLI builds.
 - Track upstream with periodic merges.
 - Avoid a hard permanent fork that cannot reabsorb upstream.
 
@@ -10,7 +10,7 @@
 
 Change `engine/grok-build/**` only when:
 
-1. Build/packaging fix required for bundling
+1. Compatibility fix required for Grokx integration
 2. Critical bug with no acceptable app-layer workaround
 3. ACP gap that blocks a desktop MVP feature
 4. Crash/diagnostics hooks needed for support
@@ -31,19 +31,17 @@ Every engine patch must document:
 | Extra tools | MCP / skills / hooks (engine config) |
 | Branding | App only |
 
-## Release pin
+## Distribution boundary
 
-Each app release records:
+Grokx release jobs build only the desktop application. They do not compile or
+bundle a Grok executable. Users install `grok` separately or configure its
+executable path in Settings.
 
-- `app_version`
-- `engine_version`
-- `engine_commit`
-- channel = `bundled`
-
-See `packaging/version_manifest.json` and `resources/runtime/version.json`.
+The runtime manifest and bundled-runtime resolver remain available for
+backward compatibility and local development only.
 
 ## Sync cadence
 
 - Absorb upstream on a release cadence (not every upstream commit).
-- Run product crate tests + engine build + smoke ACP after merge.
+- Run product crate tests + smoke ACP after merge.
 - Prefer merging upstream **tags** or known-good `main` SHAs.
