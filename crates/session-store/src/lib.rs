@@ -258,6 +258,31 @@ impl SessionStore {
             .ok_or_else(|| StoreError::SessionNotFound(id.clone()))
     }
 
+    /// Remove a project and all of its sessions. Returns removed session metas
+    /// (for task workspace cleanup) and the project record.
+    pub fn delete_project(
+        &mut self,
+        id: &ProjectId,
+    ) -> Result<(Project, Vec<SessionMeta>), StoreError> {
+        let project = self
+            .projects
+            .remove(id)
+            .ok_or_else(|| StoreError::ProjectNotFound(id.clone()))?;
+        let session_ids: Vec<SessionId> = self
+            .sessions
+            .values()
+            .filter(|s| &s.project_id == id)
+            .map(|s| s.id.clone())
+            .collect();
+        let mut removed = Vec::with_capacity(session_ids.len());
+        for sid in session_ids {
+            if let Some(meta) = self.sessions.remove(&sid) {
+                removed.push(meta);
+            }
+        }
+        Ok((project, removed))
+    }
+
     /// Load projects + sessions from the app data index file.
     pub fn load_from_file(path: &Path) -> Result<Self, StoreError> {
         if !path.is_file() {

@@ -1,6 +1,11 @@
 //! Application orchestration: process supervision, ACP session, turns.
+//!
+//! Multiple tasks can each keep a live agent process so switching tasks does
+//! not cancel work in progress on another session.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use acp_bridge::{AcpClient, AcpClientHandle, BridgeError, ConnectOptions};
@@ -45,7 +50,11 @@ struct LiveAgent {
     project_root: PathBuf,
     /// Temporary task cwd (`~/.grokx/tasks/<id>`).
     work_path: PathBuf,
+    /// App-level session id this agent belongs to (same as map key).
+    #[allow(dead_code)]
     app_session_id: SessionId,
+    /// True while a prompt/turn is in flight for this agent only.
+    turn_busy: AtomicBool,
 }
 
 pub struct AppCore {
@@ -58,8 +67,10 @@ pub struct AppCore {
     pub status: RwLock<AgentConnectionStatus>,
     /// Selected project root before connect (UI).
     selected_project: RwLock<Option<PathBuf>>,
-    live: Mutex<Option<LiveAgent>>,
-    turn_busy: Mutex<bool>,
+    /// All live agents keyed by app session id (parallel tasks).
+    live: Mutex<HashMap<SessionId, LiveAgent>>,
+    /// Session the UI is currently focused on (prompt/cancel target).
+    active_session: RwLock<Option<SessionId>>,
     event_tx: mpsc::UnboundedSender<AppEvent>,
     event_rx: Mutex<Option<mpsc::UnboundedReceiver<AppEvent>>>,
 }
@@ -94,8 +105,8 @@ impl AppCore {
             engine: RwLock::new(None),
             status: RwLock::new(AgentConnectionStatus::MissingBinary),
             selected_project: RwLock::new(None),
-            live: Mutex::new(None),
-            turn_busy: Mutex::new(false),
+            live: Mutex::new(HashMap::new()),
+            active_session: RwLock::new(None),
             event_tx,
             event_rx: Mutex::new(Some(event_rx)),
         }))
@@ -118,12 +129,19 @@ impl AppCore {
     pub async fn update_settings(&self, update: SettingsUpdate) -> Result<PublicUserSettings, CoreError> {
         let public = {
             let mut settings = self.settings.write().await;
+            let prev_mode = settings.permission_mode_normalized().to_string();
             settings.apply_update(update);
             settings
                 .save(&self.paths.config_file)
                 .map_err(CoreError::Config)?;
             if let Err(err) = settings.sync_endpoint_to_grok_toml() {
                 warn!(error = %err, "failed to sync endpoint to ~/.grok/config.toml");
+            }
+            // Keep engine permission mode aligned when the UI mode changes.
+            if settings.permission_mode_normalized() != prev_mode {
+                if let Err(err) = settings.sync_permission_mode_to_grok_toml() {
+                    warn!(error = %err, "failed to sync permission mode to ~/.grok/config.toml");
+                }
             }
             settings.public_view()
         };
@@ -161,27 +179,52 @@ impl AppCore {
     }
 
     pub async fn current_session_id(&self) -> Option<SessionId> {
-        self.live
-            .lock()
-            .await
-            .as_ref()
-            .map(|l| l.app_session_id.clone())
+        if let Some(id) = self.active_session.read().await.clone() {
+            return Some(id);
+        }
+        // Fallback: any live agent (single-session UX).
+        self.live.lock().await.keys().next().cloned()
     }
 
     pub async fn current_project_root(&self) -> Option<PathBuf> {
-        if let Some(live) = self.live.lock().await.as_ref() {
-            return Some(live.project_root.clone());
+        if let Some(id) = self.active_session.read().await.clone() {
+            let live = self.live.lock().await;
+            if let Some(agent) = live.get(&id) {
+                return Some(agent.project_root.clone());
+            }
         }
         self.selected_project.read().await.clone()
     }
 
     /// Temporary task workspace of the active session, if any.
     pub async fn current_work_path(&self) -> Option<PathBuf> {
+        if let Some(id) = self.active_session.read().await.clone() {
+            let live = self.live.lock().await;
+            if let Some(agent) = live.get(&id) {
+                return Some(agent.work_path.clone());
+            }
+        }
+        None
+    }
+
+    /// Whether a given session currently has a live agent process.
+    pub async fn is_session_live(&self, session_id: &SessionId) -> bool {
+        self.live.lock().await.contains_key(session_id)
+    }
+
+    /// Whether a given session has a turn in progress.
+    pub async fn is_session_busy(&self, session_id: &SessionId) -> bool {
         self.live
             .lock()
             .await
-            .as_ref()
-            .map(|l| l.work_path.clone())
+            .get(session_id)
+            .map(|a| a.turn_busy.load(Ordering::SeqCst))
+            .unwrap_or(false)
+    }
+
+    /// Session ids with a live agent (for UI multi-task indicators).
+    pub async fn live_session_ids(&self) -> Vec<SessionId> {
+        self.live.lock().await.keys().cloned().collect()
     }
 
     /// Remember the project directory chosen in the UI (before connect).
@@ -272,23 +315,28 @@ impl AppCore {
     }
 
     /// Delete a task/session: drop from index and remove its work directory.
-    /// If it is the live agent session, disconnect first.
+    /// If it has a live agent, disconnect that agent only (others keep running).
     pub async fn delete_session(
         self: &Arc<Self>,
         session_id: &SessionId,
     ) -> Result<(), CoreError> {
-        // If this is the active agent, tear it down first.
+        // Tear down only this session's agent; parallel tasks stay alive.
         {
             let mut live = self.live.lock().await;
-            if live
-                .as_ref()
-                .map(|l| &l.app_session_id == session_id)
-                .unwrap_or(false)
-            {
-                if let Some(prev) = live.take() {
-                    prev.client.shutdown().await;
-                }
-                *self.status.write().await = AgentConnectionStatus::Failed;
+            if let Some(prev) = live.remove(session_id) {
+                prev.client.shutdown().await;
+            }
+            let mut active = self.active_session.write().await;
+            if active.as_ref() == Some(session_id) {
+                *active = live.keys().next().cloned();
+            }
+            let still_live = !live.is_empty();
+            *self.status.write().await = if still_live {
+                AgentConnectionStatus::Ready
+            } else {
+                AgentConnectionStatus::Failed
+            };
+            if !still_live {
                 self.emit(AppEvent::AgentStatus {
                     status: AgentConnectionStatus::Failed,
                     detail: Some("task deleted".into()),
@@ -316,6 +364,95 @@ impl AppCore {
             let work = PathBuf::from(&meta.work_path);
             // Only delete under known tasks root for safety.
             let tasks_root = AppPaths::tasks_root();
+            let under_tasks = work.starts_with(&tasks_root)
+                || std::fs::canonicalize(&work)
+                    .ok()
+                    .zip(std::fs::canonicalize(&tasks_root).ok())
+                    .map(|(w, r)| w.starts_with(r))
+                    .unwrap_or(false);
+            if under_tasks && work.is_dir() {
+                if let Err(e) = std::fs::remove_dir_all(&work) {
+                    warn!(error = %e, path = %work.display(), "failed to remove task dir");
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Remove a user project from the sidebar and delete all of its tasks.
+    /// Does not delete the on-disk source folder — only Grokx index + task workspaces.
+    pub async fn delete_project(
+        self: &Arc<Self>,
+        project_id: &ProjectId,
+    ) -> Result<(), CoreError> {
+        // Shut down any live agents that belong to this project (others keep running).
+        {
+            let sids: Vec<SessionId> = self.live.lock().await.keys().cloned().collect();
+            let mut to_kill = Vec::new();
+            {
+                let store = self.store.lock().await;
+                for sid in sids {
+                    if store
+                        .get_session(&sid)
+                        .ok()
+                        .map(|m| &m.project_id == project_id)
+                        .unwrap_or(false)
+                    {
+                        to_kill.push(sid);
+                    }
+                }
+            }
+            if !to_kill.is_empty() {
+                let mut live = self.live.lock().await;
+                for sid in &to_kill {
+                    if let Some(prev) = live.remove(sid) {
+                        prev.client.shutdown().await;
+                    }
+                }
+                let mut active = self.active_session.write().await;
+                if active
+                    .as_ref()
+                    .map(|id| to_kill.contains(id))
+                    .unwrap_or(false)
+                {
+                    *active = live.keys().next().cloned();
+                }
+                let still_live = !live.is_empty();
+                *self.status.write().await = if still_live {
+                    AgentConnectionStatus::Ready
+                } else {
+                    AgentConnectionStatus::Failed
+                };
+                if !still_live {
+                    self.emit(AppEvent::AgentStatus {
+                        status: AgentConnectionStatus::Failed,
+                        detail: Some("project deleted".into()),
+                    });
+                }
+            }
+        }
+
+        let (_project, sessions) = self
+            .store
+            .lock()
+            .await
+            .delete_project(project_id)
+            .map_err(|e| CoreError::Message(e.to_string()))?;
+
+        {
+            let store = self.store.lock().await;
+            if let Err(e) = store.save_to_file(&self.paths.sessions_index_file()) {
+                warn!(error = %e, "failed to save sessions index after project delete");
+            }
+        }
+
+        let tasks_root = AppPaths::tasks_root();
+        for meta in sessions {
+            if meta.work_path.is_empty() {
+                continue;
+            }
+            let work = PathBuf::from(&meta.work_path);
             let under_tasks = work.starts_with(&tasks_root)
                 || std::fs::canonicalize(&work)
                     .ok()
@@ -436,11 +573,17 @@ impl AppCore {
         allow_path_fallback: bool,
         auto_approve: bool,
     ) -> Result<SessionId, CoreError> {
+        // Prefer saved permission_mode; `auto_approve` still means full trust when true.
+        let mode = if auto_approve {
+            app_config::permission_modes::ALWAYS_APPROVE.to_string()
+        } else {
+            self.settings.read().await.permission_mode_normalized().to_string()
+        };
         self.spawn_agent_for_project(
             project_root.into(),
             resource_dir,
             allow_path_fallback,
-            auto_approve,
+            &mode,
             None,
         )
         .await
@@ -455,15 +598,10 @@ impl AppCore {
         allow_path_fallback: bool,
         auto_approve: bool,
     ) -> Result<SessionId, CoreError> {
-        // Already live on this session — no-op.
-        if self
-            .live
-            .lock()
-            .await
-            .as_ref()
-            .map(|l| &l.app_session_id == session_id)
-            .unwrap_or(false)
-        {
+        // Already live on this session — just focus it (do not restart).
+        if self.live.lock().await.contains_key(session_id) {
+            *self.active_session.write().await = Some(session_id.clone());
+            *self.status.write().await = AgentConnectionStatus::Ready;
             return Ok(session_id.clone());
         }
 
@@ -477,11 +615,16 @@ impl AppCore {
                 .map_err(|e| CoreError::Message(e.to_string()))?;
             PathBuf::from(&project.root_path)
         };
+        let mode = if auto_approve {
+            app_config::permission_modes::ALWAYS_APPROVE.to_string()
+        } else {
+            self.settings.read().await.permission_mode_normalized().to_string()
+        };
         self.spawn_agent_for_project(
             root,
             resource_dir,
             allow_path_fallback,
-            auto_approve,
+            &mode,
             Some(session_id.clone()),
         )
         .await
@@ -556,7 +699,7 @@ impl AppCore {
         project_root: PathBuf,
         resource_dir: Option<PathBuf>,
         allow_path_fallback: bool,
-        auto_approve: bool,
+        permission_mode: &str,
         reuse_session: Option<SessionId>,
     ) -> Result<SessionId, CoreError> {
         if !project_root.as_os_str().is_empty() && !project_root.is_dir() {
@@ -576,10 +719,10 @@ impl AppCore {
             }
         };
 
-        // Tear down previous agent if any.
-        {
-            let mut live = self.live.lock().await;
-            if let Some(prev) = live.take() {
+        // Multi-agent: keep other sessions running. Only replace an agent for
+        // the same session id if we are reusing/restarting that task.
+        if let Some(ref sid) = reuse_session {
+            if let Some(prev) = self.live.lock().await.remove(sid) {
                 prev.client.shutdown().await;
             }
         }
@@ -606,12 +749,19 @@ impl AppCore {
                 }
             });
 
+        let mode = app_config::permission_modes::normalize(permission_mode);
+        // Bundled `grok agent` has no --permission-mode flag; write config.toml
+        // and pass --always-approve only for full trust.
+        if let Err(e) = settings.apply_engine_permission_mode(mode) {
+            warn!(error = %e, mode, "failed to set engine permission_mode");
+        }
+
         let child = spawn_agent_stdio(
             engine,
             SpawnOptions {
                 model,
                 env,
-                agent_args: if auto_approve {
+                agent_args: if mode == app_config::permission_modes::ALWAYS_APPROVE {
                     vec!["--always-approve".into()]
                 } else {
                     vec![]
@@ -683,10 +833,11 @@ impl AppCore {
         self.persist_session_meta(&app_session_id).await;
 
         // Agent cwd = temporary task workspace (not the project root).
+        // `auto_approve` here means full trust (skip ACP permission gate).
         let options = ConnectOptions {
             cwd: work_path.display().to_string(),
             model: settings.model.clone(),
-            auto_approve,
+            auto_approve: mode == app_config::permission_modes::ALWAYS_APPROVE,
             ..ConnectOptions::default()
         };
 
@@ -715,23 +866,63 @@ impl AppCore {
             self.persist_session_meta(&app_session_id).await;
         }
 
-        // Forward bridge events onto the app bus while the client lives.
+        // Forward bridge events onto the app bus while this client lives.
         let bus = self.event_tx.clone();
         let status_slot = Arc::clone(self);
+        let sid_for_loop = app_session_id.clone();
         let mut bridge_events = client.take_events();
         tokio::spawn(async move {
             while let Some(event) = bridge_events.recv().await {
-                if let AppEvent::AgentStatus { status, .. } = &event {
-                    *status_slot.status.write().await = *status;
-                }
-                if let AppEvent::PermissionNeeded { request, .. } = &event {
-                    let mut broker = status_slot.permissions.lock().await;
-                    broker.enqueue(request.clone());
+                // Track per-session turn busy from turn lifecycle events.
+                match &event {
+                    AppEvent::TurnState {
+                        session_id, state, ..
+                    } => {
+                        let busy = matches!(
+                            state,
+                            TurnState::Streaming
+                                | TurnState::RunningTools
+                                | TurnState::WaitingPermission
+                        );
+                        if let Some(agent) =
+                            status_slot.live.lock().await.get(session_id)
+                        {
+                            agent.turn_busy.store(busy, Ordering::SeqCst);
+                        }
+                    }
+                    AppEvent::TurnFinished { session_id, .. } => {
+                        if let Some(agent) =
+                            status_slot.live.lock().await.get(session_id)
+                        {
+                            agent.turn_busy.store(false, Ordering::SeqCst);
+                        }
+                    }
+                    AppEvent::AgentStatus { status, .. } => {
+                        // Only update global status if this is the focused session.
+                        let focused = status_slot
+                            .active_session
+                            .read()
+                            .await
+                            .as_ref()
+                            .map(|id| id == &sid_for_loop)
+                            .unwrap_or(true);
+                        if focused {
+                            *status_slot.status.write().await = *status;
+                        }
+                    }
+                    AppEvent::PermissionNeeded { request, .. } => {
+                        let mut broker = status_slot.permissions.lock().await;
+                        broker.enqueue(request.clone());
+                    }
+                    _ => {}
                 }
                 if bus.send(event).is_err() {
                     break;
                 }
             }
+            // Agent process ended — drop from live map.
+            let mut live = status_slot.live.lock().await;
+            live.remove(&sid_for_loop);
         });
 
         *self.status.write().await = AgentConnectionStatus::Ready;
@@ -740,13 +931,18 @@ impl AppCore {
             engine_session_id,
         });
 
-        *self.live.lock().await = Some(LiveAgent {
-            client,
-            handle,
-            project_root,
-            work_path,
-            app_session_id: app_session_id.clone(),
-        });
+        self.live.lock().await.insert(
+            app_session_id.clone(),
+            LiveAgent {
+                client,
+                handle,
+                project_root,
+                work_path,
+                app_session_id: app_session_id.clone(),
+                turn_busy: AtomicBool::new(false),
+            },
+        );
+        *self.active_session.write().await = Some(app_session_id.clone());
 
         Ok(app_session_id)
     }
@@ -771,25 +967,27 @@ impl AppCore {
             return Err(CoreError::Message("empty prompt".into()));
         }
 
-        {
-            let mut busy = self.turn_busy.lock().await;
-            if *busy {
+        let (handle, session_id) = {
+            let live = self.live.lock().await;
+            let sid = self
+                .active_session
+                .read()
+                .await
+                .clone()
+                .ok_or(CoreError::NotConnected)?;
+            let agent = live.get(&sid).ok_or(CoreError::NotConnected)?;
+            if agent.turn_busy.load(Ordering::SeqCst) {
                 return Err(CoreError::TurnInProgress);
             }
-            *busy = true;
-        }
+            agent.turn_busy.store(true, Ordering::SeqCst);
+            (agent.handle.clone(), sid)
+        };
 
         // Persist preferred model in settings.
         if let Some(model) = req.model.clone() {
             let mut settings = self.settings.write().await;
             settings.model = Some(model);
         }
-
-        let (handle, session_id) = {
-            let live = self.live.lock().await;
-            let live = live.as_ref().ok_or(CoreError::NotConnected)?;
-            (live.handle.clone(), live.app_session_id.clone())
-        };
 
         let mut display = req.text.clone();
         if !req.attachments.is_empty() {
@@ -813,17 +1011,36 @@ impl AppCore {
         let core = Arc::clone(self);
         tokio::spawn(async move {
             let result = handle.prompt_request(req).await;
-            if let Err(err) = result {
-                warn!(error = %err, "prompt failed");
-                core.emit(AppEvent::AgentError {
-                    message: err.to_string(),
-                });
-                core.emit(AppEvent::TurnFinished {
-                    session_id: session_id.clone(),
-                    state: TurnState::Error,
-                });
+            match result {
+                Ok(()) => {
+                    // Bridge already emitted TurnFinished (or left turn open
+                    // if still waiting on permissions).
+                    if let Some(agent) = core.live.lock().await.get(&session_id) {
+                        // Only clear if bridge did not leave waiting/running.
+                        // TurnFinished handler also clears; this is a safety net.
+                        let _ = agent;
+                    }
+                }
+                Err(err) => {
+                    let msg = err.to_string();
+                    let is_timeout = msg.to_ascii_lowercase().contains("timeout");
+                    warn!(error = %err, "prompt failed");
+                    // Timeout / long-run: bridge keeps turn open; do not mark finished.
+                    if !is_timeout {
+                        core.emit(AppEvent::AgentError {
+                            message: msg,
+                        });
+                        core.emit(AppEvent::TurnFinished {
+                            session_id: session_id.clone(),
+                            state: TurnState::Error,
+                        });
+                        if let Some(agent) = core.live.lock().await.get(&session_id) {
+                            agent.turn_busy.store(false, Ordering::SeqCst);
+                        }
+                    }
+                    // On timeout leave turn_busy true until a later TurnFinished.
+                }
             }
-            *core.turn_busy.lock().await = false;
             let _ = core.store.lock().await.touch_session(&session_id);
         });
 
@@ -832,16 +1049,24 @@ impl AppCore {
 
     pub async fn available_models(&self) -> Vec<ModelInfo> {
         let live = self.live.lock().await;
-        match live.as_ref() {
-            Some(l) => l.handle.available_models().await,
-            None => default_models(),
+        if let Some(id) = self.active_session.read().await.as_ref() {
+            if let Some(l) = live.get(id) {
+                return l.handle.available_models().await;
+            }
         }
+        if let Some((_, l)) = live.iter().next() {
+            return l.handle.available_models().await;
+        }
+        default_models()
     }
 
     pub async fn current_model(&self) -> Option<String> {
-        if let Some(live) = self.live.lock().await.as_ref() {
-            if let Some(m) = live.handle.current_model().await {
-                return Some(m);
+        if let Some(id) = self.active_session.read().await.clone() {
+            let live = self.live.lock().await;
+            if let Some(agent) = live.get(&id) {
+                if let Some(m) = agent.handle.current_model().await {
+                    return Some(m);
+                }
             }
         }
         self.settings.read().await.model.clone()
@@ -852,9 +1077,12 @@ impl AppCore {
             let mut settings = self.settings.write().await;
             settings.model = Some(model_id.clone());
         }
-        let live = self.live.lock().await;
-        if let Some(l) = live.as_ref() {
-            l.handle.set_model(&model_id).await?;
+        // Apply to active agent; others pick it up on next prompt via settings.
+        if let Some(id) = self.active_session.read().await.clone() {
+            let live = self.live.lock().await;
+            if let Some(l) = live.get(&id) {
+                l.handle.set_model(&model_id).await?;
+            }
         }
         Ok(())
     }
@@ -866,39 +1094,50 @@ impl AppCore {
     }
 
     pub async fn cancel_turn(&self) -> Result<(), CoreError> {
-        let handle = {
+        let (handle, sid) = {
             let live = self.live.lock().await;
-            live.as_ref()
-                .map(|l| l.handle.clone())
-                .ok_or(CoreError::NotConnected)?
+            let sid = self
+                .active_session
+                .read()
+                .await
+                .clone()
+                .ok_or(CoreError::NotConnected)?;
+            let agent = live.get(&sid).ok_or(CoreError::NotConnected)?;
+            (agent.handle.clone(), sid)
         };
         handle.cancel().await?;
-        *self.turn_busy.lock().await = false;
+        if let Some(agent) = self.live.lock().await.get(&sid) {
+            agent.turn_busy.store(false, Ordering::SeqCst);
+        }
         Ok(())
     }
 
-    /// Resolve a parked permission request on the live ACP session.
+    /// Resolve a parked permission request on any live ACP session.
     pub async fn resolve_permission(
         &self,
         request_id: String,
         decision: PermissionDecision,
     ) -> Result<(), CoreError> {
+        // Find which live agent owns this pending permission.
         let handle = {
             let live = self.live.lock().await;
-            live.as_ref()
-                .map(|l| l.handle.clone())
-                .ok_or(CoreError::NotConnected)?
+            let mut found = None;
+            for agent in live.values() {
+                if agent.handle.permission_is_pending(&request_id).await {
+                    found = Some(agent.handle.clone());
+                    break;
+                }
+            }
+            found
         };
 
-        // Ensure still pending on the bridge before answering.
-        if !handle.permission_is_pending(&request_id).await {
-            // Broker may still have it for UI bookkeeping.
+        let Some(handle) = handle else {
             let mut broker = self.permissions.lock().await;
             let _ = broker.resolve(&request_id, decision);
             return Err(CoreError::Message(format!(
                 "permission request not pending: {request_id}"
             )));
-        }
+        };
 
         handle.resolve_permission(&request_id, decision).await?;
         let mut broker = self.permissions.lock().await;
@@ -915,22 +1154,43 @@ impl AppCore {
 
     pub async fn permission_is_pending(&self, request_id: &str) -> bool {
         let live = self.live.lock().await;
-        match live.as_ref() {
-            Some(l) => l.handle.permission_is_pending(request_id).await,
-            None => false,
+        for agent in live.values() {
+            if agent.handle.permission_is_pending(request_id).await {
+                return true;
+            }
         }
+        false
     }
 
+    /// Disconnect only the active session's agent (others keep running).
     pub async fn disconnect(&self) {
-        if let Some(prev) = self.live.lock().await.take() {
+        let sid = self.active_session.write().await.take();
+        if let Some(sid) = sid {
+            if let Some(prev) = self.live.lock().await.remove(&sid) {
+                prev.client.shutdown().await;
+            }
+        }
+        let still_live = !self.live.lock().await.is_empty();
+        *self.status.write().await = if still_live {
+            AgentConnectionStatus::Ready
+        } else {
+            AgentConnectionStatus::MissingBinary
+        };
+        self.emit(AppEvent::AgentStatus {
+            status: *self.status.read().await,
+            detail: Some("disconnected active session".into()),
+        });
+    }
+
+    /// Shut down a specific session's agent (e.g. on task delete).
+    pub async fn disconnect_session(&self, session_id: &SessionId) {
+        if let Some(prev) = self.live.lock().await.remove(session_id) {
             prev.client.shutdown().await;
         }
-        *self.status.write().await = AgentConnectionStatus::MissingBinary;
-        *self.turn_busy.lock().await = false;
-        self.emit(AppEvent::AgentStatus {
-            status: AgentConnectionStatus::MissingBinary,
-            detail: Some("disconnected".into()),
-        });
+        let mut active = self.active_session.write().await;
+        if active.as_ref() == Some(session_id) {
+            *active = self.live.lock().await.keys().next().cloned();
+        }
     }
 }
 

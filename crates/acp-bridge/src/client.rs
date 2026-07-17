@@ -23,7 +23,10 @@ use crate::permission_gate::{
 };
 use crate::BridgeError;
 
+/// Default timeout for short ACP RPCs (initialize, set_model, cancel, …).
 const DEFAULT_RPC_TIMEOUT: Duration = Duration::from_secs(120);
+/// `session/prompt` can run tools for a long time; do not treat that as a failed turn.
+const PROMPT_RPC_TIMEOUT: Duration = Duration::from_secs(60 * 60 * 6);
 
 /// Options when connecting to a spawned agent process.
 #[derive(Debug, Clone)]
@@ -388,15 +391,49 @@ impl AcpClientHandle {
             state: TurnState::Streaming,
         });
 
-        let result = self.request("session/prompt", params).await;
+        // Long-running tools must not hit the short RPC timeout or the UI
+        // will show Ready while the engine is still working.
+        let result = self
+            .request_with_timeout("session/prompt", params, PROMPT_RPC_TIMEOUT)
+            .await;
 
         match result {
             Ok(_) => {
-                let _ = self
+                // If a permission is still parked, the prompt did not truly end.
+                let still_waiting = !self
                     .shared
-                    .events
-                    .send(turn_finished(app_session_id, TurnState::Completed));
+                    .permission_gate
+                    .lock()
+                    .await
+                    .pending_ids()
+                    .is_empty();
+                if still_waiting {
+                    let _ = self.shared.events.send(AppEvent::TurnState {
+                        session_id: app_session_id,
+                        state: TurnState::WaitingPermission,
+                    });
+                } else {
+                    let _ = self
+                        .shared
+                        .events
+                        .send(turn_finished(app_session_id, TurnState::Completed));
+                }
                 Ok(())
+            }
+            Err(err @ BridgeError::Timeout) => {
+                // Keep the turn open: the agent may still be running tools.
+                // Surface a warning but do not mark the turn finished.
+                let _ = self.shared.events.send(AppEvent::AgentError {
+                    message: format!(
+                        "prompt RPC wait timed out after {}s — agent may still be working; status stays busy until a later update",
+                        PROMPT_RPC_TIMEOUT.as_secs()
+                    ),
+                });
+                let _ = self.shared.events.send(AppEvent::TurnState {
+                    session_id: app_session_id,
+                    state: TurnState::RunningTools,
+                });
+                Err(err)
             }
             Err(err) => {
                 let _ = self.shared.events.send(AppEvent::AgentError {
@@ -467,6 +504,16 @@ impl AcpClientHandle {
     }
 
     async fn request(&self, method: &str, params: Value) -> Result<Value, BridgeError> {
+        self.request_with_timeout(method, params, self.shared.options.rpc_timeout)
+            .await
+    }
+
+    async fn request_with_timeout(
+        &self,
+        method: &str,
+        params: Value,
+        wait: Duration,
+    ) -> Result<Value, BridgeError> {
         let id = self.shared.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         self.shared
@@ -483,10 +530,12 @@ impl AcpClientHandle {
         });
         self.write_message(&msg).await?;
 
-        match timeout(self.shared.options.rpc_timeout, rx).await {
+        match timeout(wait, rx).await {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err(BridgeError::ChannelClosed),
             Err(_) => {
+                // Leave the pending entry in place if the agent answers later —
+                // only remove if still there so we don't double-complete.
                 self.shared.pending.lock().await.remove(&id);
                 Err(BridgeError::Timeout)
             }
@@ -568,7 +617,7 @@ async fn handle_incoming(shared: Arc<Shared>, value: Value) -> Result<(), Bridge
                 .get("update")
                 .cloned()
                 .unwrap_or(params.clone());
-            for event in map_session_update(app_session_id, &update) {
+            for event in map_session_update(app_session_id, &update, Some(&params)) {
                 let _ = shared.events.send(event);
             }
         }

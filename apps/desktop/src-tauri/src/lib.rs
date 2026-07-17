@@ -271,6 +271,20 @@ async fn delete_session(
         .map_err(|e| e.to_string())
 }
 
+/// Remove a project from the sidebar (and all of its tasks). Does not delete
+/// the source folder on disk.
+#[tauri::command]
+async fn delete_project(
+    core: State<'_, CoreState>,
+    project_id: String,
+) -> Result<(), String> {
+    let pid = parse_project_id(&project_id)?;
+    core.0
+        .delete_project(&pid)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 /// Persist chat transcript JSON for a task (under its work_path).
 #[tauri::command]
 async fn save_chat_history(
@@ -731,6 +745,38 @@ async fn session_info(core: State<'_, CoreState>) -> Result<SessionInfo, String>
     })
 }
 
+/// Whether a task still has a live agent process (can receive prompts without respawn).
+#[tauri::command]
+async fn is_session_live(
+    core: State<'_, CoreState>,
+    session_id: String,
+) -> Result<bool, String> {
+    let sid = parse_session_id(&session_id)?;
+    Ok(core.0.is_session_live(&sid).await)
+}
+
+/// Whether a task currently has a turn in progress (sidebar Working indicator).
+#[tauri::command]
+async fn is_session_busy(
+    core: State<'_, CoreState>,
+    session_id: String,
+) -> Result<bool, String> {
+    let sid = parse_session_id(&session_id)?;
+    Ok(core.0.is_session_busy(&sid).await)
+}
+
+/// All session ids with a live agent (parallel multi-task).
+#[tauri::command]
+async fn list_live_sessions(core: State<'_, CoreState>) -> Result<Vec<String>, String> {
+    Ok(core
+        .0
+        .live_session_ids()
+        .await
+        .into_iter()
+        .map(|s| s.0.to_string())
+        .collect())
+}
+
 fn spawn_event_forwarder(app: AppHandle, core: Arc<AppCore>) {
     tauri::async_runtime::spawn(async move {
         let Some(mut rx) = core.take_event_receiver().await else {
@@ -806,6 +852,7 @@ pub fn run() {
             list_sessions_for_project,
             rename_session,
             delete_session,
+            delete_project,
             save_chat_history,
             load_chat_history,
             connect_workspace,
@@ -825,6 +872,9 @@ pub fn run() {
             resolve_permission,
             permission_is_pending,
             session_info,
+            is_session_live,
+            is_session_busy,
+            list_live_sessions,
         ])
         .run(tauri::generate_context!())
         .expect("error while running grokx desktop");

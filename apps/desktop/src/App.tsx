@@ -1,25 +1,30 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { open as openUrl } from "@tauri-apps/plugin-shell";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import {
   IconAlert,
+  IconCheck,
+  IconChevronDown,
   IconChevronLeft,
   IconChevronRight,
+  IconCopy,
+  IconFolder,
   IconGithub,
   IconInfo,
   IconPaperclip,
   IconPen,
   IconPlus,
-  IconRefresh,
   IconSend,
   IconSettings,
   IconStop,
+  IconTask,
   IconTool,
   IconTrash,
 } from "./icons";
+import { onTitlebarMouseDown } from "./windowDrag";
 
 /** Public open-source repository (opens in the system browser). */
 const GROKX_GITHUB_URL = "https://github.com/tangf-ai/grokx";
@@ -141,12 +146,18 @@ type Attachment = {
 type ModelOption = { id: string; name: string };
 type EffortOption = { id: string; label: string };
 
+type PermissionMode = "ask" | "auto" | "always-approve";
+
 type PublicSettings = {
   custom_engine_path?: string | null;
   prefer_bundled_engine: boolean;
   model?: string | null;
   effort?: string | null;
   sync_to_grok_config: boolean;
+  /** `ask` | `auto` | `always-approve` (full trust) */
+  permission_mode?: string | null;
+  /** Legacy mirror of full trust */
+  auto_approve?: boolean;
   endpoint: {
     model_id: string;
     name?: string | null;
@@ -159,6 +170,43 @@ type PublicSettings = {
     default_effort?: string | null;
   };
   grok_config_path: string;
+};
+
+function normalizePermissionMode(raw?: string | null, legacyAuto?: boolean): PermissionMode {
+  const v = (raw || "").trim().toLowerCase();
+  if (v === "auto") return "auto";
+  if (
+    v === "always-approve" ||
+    v === "always_approve" ||
+    v === "yolo" ||
+    v === "full-trust" ||
+    v === "full_trust" ||
+    v === "trusted"
+  ) {
+    return "always-approve";
+  }
+  if (!v && legacyAuto) return "always-approve";
+  return "ask";
+}
+
+function permissionModeLabel(mode: PermissionMode): string {
+  switch (mode) {
+    case "auto":
+      return "Auto";
+    case "always-approve":
+      return "Full trust";
+    default:
+      return "Needs approval";
+  }
+}
+
+type ChatAttachment = {
+  path: string;
+  name: string;
+  mime?: string | null;
+  size?: number | null;
+  /** asset:// URL for image preview in chat history */
+  previewSrc?: string | null;
 };
 
 function formatBytes(n?: number | null): string {
@@ -175,6 +223,97 @@ function formatDuration(ms: number): string {
   const m = Math.floor(sec / 60);
   const s = Math.round(sec % 60);
   return `${m}m ${s.toString().padStart(2, "0")}s`;
+}
+
+/** Compact clock for user bubbles, e.g. 14:32 or 昨天 09:05. */
+function formatMessageTime(iso?: string | null): string | null {
+  if (!iso) return null;
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return null;
+  const now = new Date();
+  const pad = (n: number) => n.toString().padStart(2, "0");
+  const hm = `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  const sameDay =
+    d.getFullYear() === now.getFullYear() &&
+    d.getMonth() === now.getMonth() &&
+    d.getDate() === now.getDate();
+  if (sameDay) return hm;
+  const yesterday = new Date(now);
+  yesterday.setDate(now.getDate() - 1);
+  const isYesterday =
+    d.getFullYear() === yesterday.getFullYear() &&
+    d.getMonth() === yesterday.getMonth() &&
+    d.getDate() === yesterday.getDate();
+  if (isYesterday) return `昨天 ${hm}`;
+  if (d.getFullYear() === now.getFullYear()) {
+    return `${d.getMonth() + 1}/${d.getDate()} ${hm}`;
+  }
+  return `${d.getFullYear()}/${d.getMonth() + 1}/${d.getDate()} ${hm}`;
+}
+
+/**
+ * Rough token estimate for display (not API-reported usage).
+ * CJK ideographs ≈ 1 token; other non-space chars ≈ 4 chars / token.
+ */
+function estimateTokens(text: string): number {
+  let cjk = 0;
+  let other = 0;
+  for (const ch of text) {
+    const code = ch.codePointAt(0) ?? 0;
+    if (
+      (code >= 0x4e00 && code <= 0x9fff) ||
+      (code >= 0x3400 && code <= 0x4dbf) ||
+      (code >= 0x3040 && code <= 0x30ff) ||
+      (code >= 0xac00 && code <= 0xd7af)
+    ) {
+      cjk += 1;
+    } else if (/\s/u.test(ch)) {
+      // ignore whitespace
+    } else {
+      other += 1;
+    }
+  }
+  return Math.max(1, Math.round(cjk + other / 4));
+}
+
+function formatTokensPerSec(tps: number): string {
+  if (!Number.isFinite(tps) || tps <= 0) return "—";
+  if (tps >= 100) return `${Math.round(tps)}`;
+  if (tps >= 10) return tps.toFixed(0);
+  return tps.toFixed(1);
+}
+
+/** Compact token count for the context meter (e.g. 1.2k, 128k). */
+function formatTokenCount(n: number): string {
+  if (!Number.isFinite(n) || n < 0) return "0";
+  if (n < 1000) return `${Math.round(n)}`;
+  if (n < 10_000) return `${(n / 1000).toFixed(1)}k`;
+  if (n < 1_000_000) return `${Math.round(n / 1000)}k`;
+  return `${(n / 1_000_000).toFixed(1)}M`;
+}
+
+/** Estimate session context from visible chat (fallback when engine omits totalTokens). */
+function estimateSessionTokens(chat: ChatLine[], draftText: string): number {
+  let total = 0;
+  for (const line of chat) {
+    if (
+      line.kind === "user" ||
+      line.kind === "assistant" ||
+      line.kind === "thought" ||
+      line.kind === "system" ||
+      line.kind === "error"
+    ) {
+      total += estimateTokens(line.text);
+    } else if (line.kind === "tool") {
+      total += estimateTokens(line.text);
+    } else if (line.kind === "trace") {
+      for (const item of line.items) {
+        total += estimateTokens(item.text);
+      }
+    }
+  }
+  if (draftText.trim()) total += estimateTokens(draftText);
+  return total;
 }
 
 /** Short sidebar title from first user message + optional first assistant reply. */
@@ -218,8 +357,26 @@ type TraceItem = {
 };
 
 type ChatLine =
-  | { id: string; kind: "user"; text: string }
-  | { id: string; kind: "assistant"; text: string }
+  | {
+      id: string;
+      kind: "user";
+      text: string;
+      /** ISO timestamp when the user sent this message. */
+      at?: string;
+      /** Optional image/file attachments shown as thumbnails in the bubble. */
+      attachments?: ChatAttachment[];
+    }
+  | {
+      id: string;
+      kind: "assistant";
+      text: string;
+      /** Estimated output tokens (not API usage). */
+      tokens?: number;
+      /** Wall-clock stream duration for this reply (ms). */
+      streamMs?: number;
+      /** Estimated tokens / second over the stream window. */
+      tokensPerSec?: number;
+    }
   | { id: string; kind: "thought"; text: string }
   | { id: string; kind: "tool"; text: string }
   | { id: string; kind: "system"; text: string }
@@ -312,6 +469,8 @@ type AgentEvent = {
   message?: string;
   state?: string;
   steps?: string[];
+  /** Engine `_meta.totalTokens` when present (context_usage events). */
+  used_tokens?: number;
   tool?: {
     title?: string;
     kind?: string;
@@ -373,10 +532,34 @@ export default function App() {
   const [appVersion, setAppVersion] = useState<string>("0.1.0");
   const [lines, setLines] = useState<ChatLine[]>([]);
   const [draft, setDraft] = useState("");
+  /** Edit a past user bubble, then re-send from that point. */
+  const [editingUserId, setEditingUserId] = useState<string | null>(null);
+  const [editDraft, setEditDraft] = useState("");
+  const editTextareaRef = useRef<HTMLTextAreaElement | null>(null);
+  /** Busy for the *focused* task (composer / status pill). */
   const [busy, setBusy] = useState(false);
+  /**
+   * Per-task busy map so sidebar shows Working on background agents.
+   * Multiple tasks can stream in parallel; only the active one's chat is shown.
+   */
+  const [sessionBusyMap, setSessionBusyMap] = useState<Record<string, boolean>>(
+    {},
+  );
   const [connecting, setConnecting] = useState(false);
   const [agentStatus, setAgentStatus] = useState<string>("disconnected");
-  const [autoApprove, setAutoApprove] = useState(false);
+  /** Tool permission: ask | auto | always-approve (full trust). */
+  const [permissionMode, setPermissionMode] =
+    useState<PermissionMode>("ask");
+  /** Engine-reported session tokens (`_meta.totalTokens`); null → estimate from chat. */
+  const [engineContextTokens, setEngineContextTokens] = useState<number | null>(
+    null,
+  );
+  /** Per-task engine token totals so switching restores correctly; new tasks start empty. */
+  const sessionContextTokensRef = useRef<Map<string, number>>(new Map());
+  /** In-memory transcript for background tasks still receiving events. */
+  const sessionLinesCacheRef = useRef<Map<string, ChatLine[]>>(new Map());
+  const busyRef = useRef(false);
+  const sessionBusyMapRef = useRef<Map<string, boolean>>(new Map());
   const [pendingPerm, setPendingPerm] = useState<PendingPermission | null>(null);
   /** Main view: workspace chat vs full settings page. */
   const [view, setView] = useState<"workspace" | "settings">("workspace");
@@ -390,6 +573,14 @@ export default function App() {
   /** Sticky user prompt while reading replies (id of last scrolled-past user msg). */
   const [stickyUserId, setStickyUserId] = useState<string | null>(null);
   const [highlightUserId, setHighlightUserId] = useState<string | null>(null);
+  /** Floating control when chat is scrolled up and more content is below. */
+  const [showScrollToBottom, setShowScrollToBottom] = useState(false);
+  /** Assistant message just copied: which id + format (brief "Copied" feedback). */
+  const [copiedMsg, setCopiedMsg] = useState<{
+    id: string;
+    format: "md" | "plain";
+  } | null>(null);
+  const copiedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [settingsMsg, setSettingsMsg] = useState<string | null>(null);
   const [savingSettings, setSavingSettings] = useState(false);
   // Form fields for system LLM config
@@ -412,6 +603,10 @@ export default function App() {
   const userMsgEls = useRef<Map<string, HTMLDivElement>>(new Map());
   /** Wall-clock start of the in-flight agent turn (for duration on collapse). */
   const turnStartedAtRef = useRef<number | null>(null);
+  /** First assistant delta for the in-flight reply (for tok/s). */
+  const assistantStreamStartedAtRef = useRef<number | null>(null);
+  /** Last assistant delta timestamp for the in-flight reply. */
+  const assistantStreamLastAtRef = useRef<number | null>(null);
   /** Keep latest lines for flush-to-disk without stale closures. */
   const linesRef = useRef<ChatLine[]>([]);
   const sessionIdRef = useRef<string | null>(null);
@@ -461,9 +656,35 @@ export default function App() {
   }, [sessions]);
 
   useEffect(() => {
+    busyRef.current = busy;
+  }, [busy]);
+
+  useEffect(() => {
     sessionIdRef.current = session?.session_id ?? null;
     workPathRef.current = session?.work_path ?? null;
   }, [session?.session_id, session?.work_path]);
+
+  /** Update busy for one task; sync focused `busy` when that task is active. */
+  const setSessionBusyState = useCallback((sid: string, nextBusy: boolean) => {
+    if (!sid) return;
+    sessionBusyMapRef.current.set(sid, nextBusy);
+    setSessionBusyMap((prev) => {
+      if (prev[sid] === nextBusy) return prev;
+      return { ...prev, [sid]: nextBusy };
+    });
+    if (sessionIdRef.current === sid) {
+      busyRef.current = nextBusy;
+      setBusy(nextBusy);
+    }
+  }, []);
+
+  /** Work path for a task id (active or from list). */
+  const workPathForSession = useCallback((sid: string): string | null => {
+    if (sessionIdRef.current === sid) return workPathRef.current;
+    return (
+      sessionsRef.current.find((s) => s.session_id === sid)?.work_path || null
+    );
+  }, []);
 
   /** Connection / reconnect noise — never persist or restore these alone. */
   const isConnectionNoise = useCallback((line: ChatLine): boolean => {
@@ -550,6 +771,24 @@ export default function App() {
     await persistChatHistory(sid, linesRef.current, work);
   }, [persistChatHistory]);
 
+  /**
+   * Mutate transcript for a session that is not currently focused.
+   * Keeps background tasks streaming while the user looks at another chat.
+   */
+  const mutateBackgroundLines = useCallback(
+    (sid: string, mutator: (prev: ChatLine[]) => ChatLine[]) => {
+      if (!sid) return;
+      const prev = sessionLinesCacheRef.current.get(sid) ?? [];
+      const next = mutator(prev);
+      sessionLinesCacheRef.current.set(sid, next);
+      const wp = workPathForSession(sid);
+      if (hasRealChatContent(next)) {
+        void persistChatHistory(sid, next, wp);
+      }
+    },
+    [workPathForSession, persistChatHistory, hasRealChatContent],
+  );
+
   const loadChatHistory = useCallback(
     async (sessionId: string, workPath?: string | null) => {
       try {
@@ -580,41 +819,33 @@ export default function App() {
     }
   }, []);
 
-  const refreshSessions = useCallback(
-    async (projectId?: string | null) => {
-      const pid = projectId === undefined ? selectedProjectId : projectId;
-      try {
-        let rows: SessionListRow[];
-        if (pid) {
-          // Tasks under a user-selected Project.
-          rows = await invoke<SessionListRow[]>("list_sessions_for_project", {
-            projectId: pid,
-          });
-        } else {
-          // No project selected: show all tasks (including default-sandbox ones).
-          rows = await invoke<SessionListRow[]>("list_sessions");
-        }
-        // Stable UI order: newest-created first. Clicking a task must not reorder.
-        rows = [...rows].sort((a, b) => {
-          const ca = Date.parse(a.created_at || a.updated_at);
-          const cb = Date.parse(b.created_at || b.updated_at);
-          return (Number.isFinite(cb) ? cb : 0) - (Number.isFinite(ca) ? ca : 0);
-        });
-        setSessions(rows);
-        return rows;
-      } catch {
-        return [] as SessionListRow[];
-      }
-    },
-    [selectedProjectId],
-  );
+  /**
+   * Always load the full task list. UI splits them:
+   * - under Projects → tasks whose project_id is a user project
+   * - under Tasks → temporary / default-sandbox only
+   */
+  const refreshSessions = useCallback(async () => {
+    try {
+      let rows = await invoke<SessionListRow[]>("list_sessions");
+      // Stable UI order: newest-created first. Clicking a task must not reorder.
+      rows = [...rows].sort((a, b) => {
+        const ca = Date.parse(a.created_at || a.updated_at);
+        const cb = Date.parse(b.created_at || b.updated_at);
+        return (Number.isFinite(cb) ? cb : 0) - (Number.isFinite(ca) ? ca : 0);
+      });
+      setSessions(rows);
+      return rows;
+    } catch {
+      return [] as SessionListRow[];
+    }
+  }, []);
 
   /** After connect / activate: sync projects + tasks. */
   const refreshHierarchy = useCallback(
     async (opts?: {
       projectId?: string | null;
       projectRoot?: string | null;
-      /** When true, keep Tasks unbound to Projects list (New task default). */
+      /** When true, keep Tasks unbound to Projects list (temporary task). */
       standaloneTask?: boolean;
     }) => {
       const projRows = await refreshProjects();
@@ -634,19 +865,23 @@ export default function App() {
         setSelectedProjectId(pid);
         const hit = projRows.find((p) => p.project_id === pid);
         if (hit?.root_path) setProjectRoot(hit.root_path);
-        await refreshSessions(pid);
-      } else {
-        // Standalone / default-sandbox tasks: clear project highlight, list all tasks.
+      } else if (opts?.standaloneTask) {
         setSelectedProjectId(null);
-        await refreshSessions(null);
       }
+      await refreshSessions();
       return pid;
     },
     [refreshProjects, refreshSessions, selectedProjectId],
   );
 
   type PushLine =
-    | { kind: "user"; text: string; id?: string }
+    | {
+        kind: "user";
+        text: string;
+        id?: string;
+        at?: string;
+        attachments?: ChatAttachment[];
+      }
     | { kind: "assistant"; text: string; id?: string }
     | { kind: "thought"; text: string; id?: string }
     | { kind: "tool"; text: string; id?: string }
@@ -659,6 +894,9 @@ export default function App() {
       const full = {
         ...line,
         id: line.id ?? nextLineId(line.kind),
+        ...(line.kind === "user" && !line.at
+          ? { at: new Date().toISOString() }
+          : {}),
       } as ChatLine;
       setLines((prev) => {
         const next = [...prev, full];
@@ -673,6 +911,7 @@ export default function App() {
 
   const appendAssistant = useCallback(
     (text: string) => {
+      const now = Date.now();
       setLines((prev) => {
         // Drop waiting placeholder once real content starts.
         let base = prev;
@@ -685,12 +924,17 @@ export default function App() {
           const copy = base.slice(0, -1);
           copy.push({ ...last, text: last.text + text });
           next = copy;
+          if (assistantStreamStartedAtRef.current == null) {
+            assistantStreamStartedAtRef.current = now;
+          }
         } else {
           next = [
             ...base,
             { id: nextLineId("assistant"), kind: "assistant", text },
           ];
+          assistantStreamStartedAtRef.current = now;
         }
+        assistantStreamLastAtRef.current = now;
         linesRef.current = next;
         return next;
       });
@@ -745,8 +989,53 @@ export default function App() {
       const started = turnStartedAtRef.current;
       turnStartedAtRef.current = null;
       const durationMs = started != null ? Date.now() - started : 0;
+
+      // Stamp generation speed on the last assistant reply in this turn.
+      const streamStart = assistantStreamStartedAtRef.current;
+      const streamEnd = assistantStreamLastAtRef.current ?? Date.now();
+      assistantStreamStartedAtRef.current = null;
+      assistantStreamLastAtRef.current = null;
+
       setLines((prev) => {
         let next = collapseTurnProcess(prev, durationMs);
+
+        // Attach ~tokens / tok/s to the latest assistant message (after last user).
+        let lastUser = -1;
+        for (let i = next.length - 1; i >= 0; i--) {
+          if (next[i].kind === "user") {
+            lastUser = i;
+            break;
+          }
+        }
+        let lastAsst = -1;
+        for (let i = next.length - 1; i > lastUser; i--) {
+          if (next[i].kind === "assistant") {
+            lastAsst = i;
+            break;
+          }
+        }
+        if (lastAsst >= 0) {
+          const asst = next[lastAsst];
+          if (asst.kind === "assistant" && asst.text.trim()) {
+            const tokens = estimateTokens(asst.text);
+            const streamMs =
+              streamStart != null
+                ? Math.max(1, streamEnd - streamStart)
+                : undefined;
+            const tokensPerSec =
+              streamMs != null && streamMs >= 50
+                ? tokens / (streamMs / 1000)
+                : undefined;
+            next = next.slice();
+            next[lastAsst] = {
+              ...asst,
+              tokens,
+              streamMs,
+              tokensPerSec,
+            };
+          }
+        }
+
         if (error) {
           const hasError = next.some((l) => l.kind === "error");
           if (!hasError) {
@@ -943,6 +1232,18 @@ export default function App() {
     }
   }, []);
 
+  const updateScrollToBottomVisible = useCallback(() => {
+    const el = chatScrollRef.current;
+    if (!el) {
+      setShowScrollToBottom(false);
+      return;
+    }
+    // Enough content below the fold that a jump-to-bottom control is useful.
+    const overflow = el.scrollHeight - el.clientHeight > 80;
+    const away = distanceFromBottom(el) > 120;
+    setShowScrollToBottom(overflow && away);
+  }, [distanceFromBottom]);
+
   const applyStickyUserId = useCallback((next: string | null) => {
     if (stickyUserIdRef.current === next) return;
     stickyUserIdRef.current = next;
@@ -985,15 +1286,42 @@ export default function App() {
     });
   }, [updateStickyUser]);
 
+  const jumpToBottom = useCallback(() => {
+    const el = chatScrollRef.current;
+    if (!el) return;
+    lastProgrammaticScrollRef.current = performance.now() + 500;
+    el.scrollTo({
+      top: Math.max(0, el.scrollHeight - el.clientHeight),
+      behavior: "smooth",
+    });
+    // Resume live follow after manual jump to the edge.
+    autoScrollEnabledRef.current = true;
+    userScrollIntentRef.current = false;
+    setShowScrollToBottom(false);
+    window.setTimeout(() => {
+      updateScrollToBottomVisible();
+      scheduleStickyUser();
+    }, 400);
+  }, [scheduleStickyUser, updateScrollToBottomVisible]);
+
   // When chat content grows, ease toward bottom only if auto-follow is on.
   useEffect(() => {
     if (!autoScrollEnabledRef.current) {
       scheduleStickyUser();
+      updateScrollToBottomVisible();
       return;
     }
     ensureSmoothAutoScroll();
     scheduleStickyUser();
-  }, [lines, busy, pendingPerm, ensureSmoothAutoScroll, scheduleStickyUser]);
+    requestAnimationFrame(() => updateScrollToBottomVisible());
+  }, [
+    lines,
+    busy,
+    pendingPerm,
+    ensureSmoothAutoScroll,
+    scheduleStickyUser,
+    updateScrollToBottomVisible,
+  ]);
 
   // Detect user-driven scroll vs programmatic ease.
   useEffect(() => {
@@ -1039,6 +1367,7 @@ export default function App() {
 
     const onScroll = () => {
       scheduleStickyUser();
+      updateScrollToBottomVisible();
       // Ignore scroll events we just caused programmatically.
       if (performance.now() < lastProgrammaticScrollRef.current) {
         return;
@@ -1077,13 +1406,19 @@ export default function App() {
       endTimer = setTimeout(onScrollEndCheck, 220);
     };
 
+    const onResize = () => {
+      scheduleStickyUser();
+      updateScrollToBottomVisible();
+    };
+
     scroller.addEventListener("wheel", onWheel, { passive: true });
     scroller.addEventListener("touchstart", onTouchStart, { passive: true });
     scroller.addEventListener("pointerdown", onPointerDown, { passive: true });
     scroller.addEventListener("scroll", onScrollWithEnd, { passive: true });
     window.addEventListener("keydown", onKeyDown);
-    window.addEventListener("resize", scheduleStickyUser);
+    window.addEventListener("resize", onResize);
     scheduleStickyUser();
+    updateScrollToBottomVisible();
 
     return () => {
       if (endTimer) clearTimeout(endTimer);
@@ -1100,9 +1435,16 @@ export default function App() {
       scroller.removeEventListener("pointerdown", onPointerDown);
       scroller.removeEventListener("scroll", onScrollWithEnd);
       window.removeEventListener("keydown", onKeyDown);
-      window.removeEventListener("resize", scheduleStickyUser);
+      window.removeEventListener("resize", onResize);
     };
-  }, [scheduleStickyUser, view, disableAutoScroll, enableAutoScroll, isNearBottom]);
+  }, [
+    scheduleStickyUser,
+    updateScrollToBottomVisible,
+    view,
+    disableAutoScroll,
+    enableAutoScroll,
+    isNearBottom,
+  ]);
 
   const jumpToUserMessage = useCallback(
     (id: string) => {
@@ -1110,43 +1452,42 @@ export default function App() {
       const el = userMsgEls.current.get(id);
       if (!el || !scroller) return;
 
-      // Manual navigation — pause auto-follow.
+      // Manual navigation — pause auto-follow so we don't race back to bottom.
       disableAutoScroll();
-      // Hide sticky immediately so the jump target isn't covered.
+      // Sticky is an absolute overlay (not in scroll flow). Hide it and scroll
+      // immediately — waiting for reflow made the first click feel like a no-op.
       stickyUserIdRef.current = null;
       setStickyUserId(null);
       setHighlightUserId(id);
 
-      const scrollToTarget = () => {
+      const topPad = 20;
+      const alignToUser = () => {
         const target = userMsgEls.current.get(id);
         const root = chatScrollRef.current;
         if (!target || !root) return;
-
         const rootRect = root.getBoundingClientRect();
         const targetRect = target.getBoundingClientRect();
-        // Match .chat-scroll top padding so the bubble isn't clipped.
-        const topPad = 28;
-        const nextTop = root.scrollTop + (targetRect.top - rootRect.top) - topPad;
-        // Cover the whole smooth-scroll duration so scroll listeners
-        // don't treat this as a competing user gesture.
-        lastProgrammaticScrollRef.current = performance.now() + 700;
-        root.scrollTo({
-          top: Math.max(0, nextTop),
-          behavior: "smooth",
-        });
+        const nextTop =
+          root.scrollTop + (targetRect.top - rootRect.top) - topPad;
+        // Instant jump — one click must land correctly (smooth was easy to cancel).
+        lastProgrammaticScrollRef.current = performance.now() + 500;
+        root.scrollTop = Math.max(0, nextTop);
       };
 
-      // Wait for sticky unmount reflow before measuring positions.
-      requestAnimationFrame(() => {
-        requestAnimationFrame(scrollToTarget);
-      });
+      // Scroll immediately on click (sticky is overlay — no layout shift).
+      alignToUser();
+      // One correction after highlight paint if needed.
+      requestAnimationFrame(() => alignToUser());
 
       window.setTimeout(() => {
         setHighlightUserId((cur) => (cur === id ? null : cur));
       }, 1600);
-      window.setTimeout(() => updateStickyUser(), 550);
+      window.setTimeout(() => {
+        updateStickyUser();
+        updateScrollToBottomVisible();
+      }, 200);
     },
-    [updateStickyUser, disableAutoScroll],
+    [updateStickyUser, updateScrollToBottomVisible, disableAutoScroll],
   );
 
   const stickyUserText = useMemo(() => {
@@ -1154,6 +1495,122 @@ export default function App() {
     const line = lines.find((l) => l.id === stickyUserId && l.kind === "user");
     return line && line.kind === "user" ? line.text : null;
   }, [stickyUserId, lines]);
+
+  /** Context window size from Settings (default 500k for Grok 4.5-class models). */
+  const contextWindow = useMemo(() => {
+    const n = Number(cfgContext);
+    if (Number.isFinite(n) && n > 0) return Math.floor(n);
+    return 500_000;
+  }, [cfgContext]);
+
+  const estimatedContextTokens = useMemo(
+    () => estimateSessionTokens(lines, draft),
+    [lines, draft],
+  );
+
+  // Prefer engine total only when it is for the active non-empty context;
+  // empty new tasks should show ~0, not a stale process total.
+  const contextUsed =
+    engineContextTokens != null &&
+    (estimatedContextTokens > 0 || engineContextTokens < 200)
+      ? engineContextTokens
+      : estimatedContextTokens;
+  const contextFromEngine =
+    engineContextTokens != null &&
+    (estimatedContextTokens > 0 || engineContextTokens < 200);
+  const contextPct = Math.min(
+    100,
+    Math.max(0, (contextUsed / contextWindow) * 100),
+  );
+  const contextMeterClass =
+    contextPct >= 90
+      ? "context-meter high"
+      : contextPct >= 70
+        ? "context-meter mid"
+        : "context-meter";
+
+  /**
+   * Strip common Markdown so clipboard plain-text is readable outside MD editors.
+   * Keeps link URLs and code content; drops fences / emphasis / headings markup.
+   */
+  const markdownToPlainText = useCallback((md: string): string => {
+    let s = md.replace(/\r\n/g, "\n");
+    // Fenced code blocks → inner code only
+    s = s.replace(/```[\w-]*\n?([\s\S]*?)```/g, (_m, code: string) =>
+      String(code).replace(/\n$/, ""),
+    );
+    // Inline code
+    s = s.replace(/`([^`]+)`/g, "$1");
+    // Images ![alt](url) → alt (url)
+    s = s.replace(/!\[([^\]]*)\]\(([^)]+)\)/g, (_m, alt: string, url: string) =>
+      alt ? `${alt} (${url})` : url,
+    );
+    // Links [text](url) → text (url)
+    s = s.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_m, label: string, url: string) =>
+      label === url ? url : `${label} (${url})`,
+    );
+    // Autolinks <https://...>
+    s = s.replace(/<(https?:\/\/[^>]+)>/g, "$1");
+    // Headings
+    s = s.replace(/^#{1,6}\s+/gm, "");
+    // Blockquotes
+    s = s.replace(/^>\s?/gm, "");
+    // List markers
+    s = s.replace(/^\s*[-*+]\s+/gm, "• ");
+    s = s.replace(/^\s*\d+\.\s+/gm, (m) => m.replace(/^\s*/, ""));
+    // Bold / italic / strike (order matters: longer delimiters first)
+    s = s.replace(/\*\*\*([^*]+)\*\*\*/g, "$1");
+    s = s.replace(/___([^_]+)___/g, "$1");
+    s = s.replace(/\*\*([^*]+)\*\*/g, "$1");
+    s = s.replace(/__([^_]+)__/g, "$1");
+    s = s.replace(/\*([^*\n]+)\*/g, "$1");
+    s = s.replace(/_([^_\n]+)_/g, "$1");
+    s = s.replace(/~~([^~]+)~~/g, "$1");
+    // Horizontal rules
+    s = s.replace(/^\s*([-*_]){3,}\s*$/gm, "");
+    // Collapse 3+ blank lines
+    s = s.replace(/\n{3,}/g, "\n\n");
+    return s.trim();
+  }, []);
+
+  const writeClipboardText = useCallback(async (body: string) => {
+    try {
+      await navigator.clipboard.writeText(body);
+    } catch {
+      // Fallback for environments where Clipboard API is blocked.
+      const ta = document.createElement("textarea");
+      ta.value = body;
+      ta.setAttribute("readonly", "");
+      ta.style.position = "fixed";
+      ta.style.left = "-9999px";
+      document.body.appendChild(ta);
+      ta.select();
+      try {
+        document.execCommand("copy");
+      } finally {
+        document.body.removeChild(ta);
+      }
+    }
+  }, []);
+
+  const copyAssistantText = useCallback(
+    async (id: string, text: string, format: "md" | "plain") => {
+      const raw = text.trim();
+      if (!raw) return;
+      const body = format === "plain" ? markdownToPlainText(raw) : raw;
+      if (!body) return;
+      await writeClipboardText(body);
+      if (copiedTimerRef.current) clearTimeout(copiedTimerRef.current);
+      setCopiedMsg({ id, format });
+      copiedTimerRef.current = setTimeout(() => {
+        setCopiedMsg((cur) =>
+          cur && cur.id === id && cur.format === format ? null : cur,
+        );
+        copiedTimerRef.current = null;
+      }, 1600);
+    },
+    [markdownToPlainText, writeClipboardText],
+  );
 
   const refreshModels = useCallback(async () => {
     try {
@@ -1185,11 +1642,42 @@ export default function App() {
     setCfgKeyHint(s.endpoint.api_key_hint || null);
     setCfgGrokPath(s.grok_config_path);
     setCfgApiKey("");
+    setPermissionMode(
+      normalizePermissionMode(s.permission_mode, s.auto_approve),
+    );
     if (s.model) setModelId(s.model);
     if (s.effort || s.endpoint.default_effort) {
       setEffortId(s.effort || s.endpoint.default_effort || "medium");
     }
   }, []);
+
+  /** Persist permission mode and sync engine ~/.grok/config.toml. */
+  const setPermissionModeAndSave = useCallback(
+    async (next: PermissionMode) => {
+      setPermissionMode(next);
+      try {
+        const s = await invoke<PublicSettings>("save_settings", {
+          update: {
+            permission_mode: next,
+            // Keep legacy field for older code paths.
+            auto_approve: next === "always-approve",
+          },
+        });
+        applyPublicSettings(s);
+      } catch (e) {
+        console.warn("save permission_mode failed", e);
+      }
+    },
+    [applyPublicSettings],
+  );
+
+  /** Cycle ask → auto → full trust → ask. */
+  const cyclePermissionMode = useCallback(() => {
+    const order: PermissionMode[] = ["ask", "auto", "always-approve"];
+    const i = order.indexOf(permissionMode);
+    const next = order[(i + 1) % order.length];
+    void setPermissionModeAndSave(next);
+  }, [permissionMode, setPermissionModeAndSave]);
 
   const loadSettings = useCallback(async () => {
     try {
@@ -1297,89 +1785,265 @@ export default function App() {
     (async () => {
       unlisten = await listen<AgentEvent>("agent-event", (event) => {
         const ev = event.payload;
+        const evSid = sessionIdOf(ev);
+        const activeSid = sessionIdRef.current;
+        // Events with a session id that is not focused go to background cache.
+        // agent_status / agent_error may lack session id — treat as focused.
+        const isBackground =
+          Boolean(evSid) && Boolean(activeSid) && evSid !== activeSid;
+
+        const markBusy = (sid: string | null | undefined, next: boolean) => {
+          if (sid) setSessionBusyState(sid, next);
+          else if (!isBackground) {
+            busyRef.current = next;
+            setBusy(next);
+          }
+        };
+
+        /** Append a simple line to background transcript. */
+        const bgPush = (
+          sid: string,
+          kind: ChatLine["kind"],
+          text: string,
+        ) => {
+          mutateBackgroundLines(sid, (prev) => {
+            let base = prev;
+            if (base.length && base[base.length - 1].kind === "waiting") {
+              base = base.slice(0, -1);
+            }
+            return [
+              ...base,
+              { id: nextLineId(kind), kind, text } as ChatLine,
+            ];
+          });
+        };
+
+        const bgAppendStream = (
+          sid: string,
+          kind: "assistant" | "thought",
+          text: string,
+        ) => {
+          if (!text) return;
+          mutateBackgroundLines(sid, (prev) => {
+            let base = prev;
+            if (base.length && base[base.length - 1].kind === "waiting") {
+              base = base.slice(0, -1);
+            }
+            const last = base[base.length - 1];
+            if (last && last.kind === kind) {
+              const copy = base.slice(0, -1);
+              copy.push({ ...last, text: last.text + text } as ChatLine);
+              return copy;
+            }
+            return [
+              ...base,
+              { id: nextLineId(kind), kind, text } as ChatLine,
+            ];
+          });
+        };
+
         switch (ev.type) {
           case "agent_status":
-            setAgentStatus(ev.status ?? "unknown");
-            // Connection lifecycle stays in the status pill — not the chat transcript.
+            // Global connection pill only for the focused agent lifecycle.
+            if (!isBackground) {
+              setAgentStatus(ev.status ?? "unknown");
+            }
             break;
           case "session_ready":
-            setAgentStatus("ready");
-            // Don't push "Task ready" into chat (pollutes history on reconnect).
-            void refreshHierarchy();
-            void refreshModels();
+            if (!isBackground) {
+              setAgentStatus("ready");
+              void refreshHierarchy();
+              void refreshModels();
+            } else {
+              void refreshSessions();
+            }
             break;
           case "user_message":
             break;
           case "message_delta":
-            if (ev.text) appendAssistant(ev.text);
+            markBusy(evSid || activeSid, true);
+            if (isBackground && evSid) {
+              if (ev.text) bgAppendStream(evSid, "assistant", ev.text);
+            } else if (ev.text) {
+              appendAssistant(ev.text);
+            }
             break;
           case "thought_delta":
-            if (ev.text) appendThought(ev.text);
+            markBusy(evSid || activeSid, true);
+            if (isBackground && evSid) {
+              if (ev.text) bgAppendStream(evSid, "thought", ev.text);
+            } else if (ev.text) {
+              appendThought(ev.text);
+            }
             break;
           case "tool_started":
-            clearWaiting();
-            push({
-              kind: "tool",
-              text: ev.tool?.title ?? "Running tool",
-            });
+            markBusy(evSid || activeSid, true);
+            if (isBackground && evSid) {
+              bgPush(evSid, "tool", ev.tool?.title ?? "Running tool");
+            } else {
+              clearWaiting();
+              push({
+                kind: "tool",
+                text: ev.tool?.title ?? "Running tool",
+              });
+            }
             break;
           case "tool_updated":
-            clearWaiting();
-            push({
-              kind: "tool",
-              text: `${ev.tool?.title ?? "Tool"} → ${ev.tool?.status ?? "updated"}`,
-            });
+            markBusy(evSid || activeSid, true);
+            if (isBackground && evSid) {
+              bgPush(
+                evSid,
+                "tool",
+                `${ev.tool?.title ?? "Tool"} → ${ev.tool?.status ?? "updated"}`,
+              );
+            } else {
+              clearWaiting();
+              push({
+                kind: "tool",
+                text: `${ev.tool?.title ?? "Tool"} → ${ev.tool?.status ?? "updated"}`,
+              });
+            }
             break;
           case "permission_needed":
-            clearWaiting();
-            if (ev.request?.id) {
-              setPendingPerm({
-                id: ev.request.id,
-                summary: ev.request.summary ?? "Permission required",
-                tool_name: ev.request.tool_name ?? "tool",
-                detail: ev.request.detail,
+            markBusy(evSid || activeSid, true);
+            if (isBackground && evSid) {
+              bgPush(
+                evSid,
+                "system",
+                `Waiting for approval · ${ev.request?.summary ?? ev.request?.tool_name ?? "tool"}`,
+              );
+              // Permission for background task: still surface so user can act.
+              if (ev.request?.id) {
+                setPendingPerm({
+                  id: ev.request.id,
+                  summary: ev.request.summary ?? "Permission required",
+                  tool_name: ev.request.tool_name ?? "tool",
+                  detail: ev.request.detail,
+                });
+              }
+            } else {
+              clearWaiting();
+              if (ev.request?.id) {
+                setPendingPerm({
+                  id: ev.request.id,
+                  summary: ev.request.summary ?? "Permission required",
+                  tool_name: ev.request.tool_name ?? "tool",
+                  detail: ev.request.detail,
+                });
+              }
+              push({
+                kind: "system",
+                text: `Waiting for approval · ${ev.request?.summary ?? ev.request?.tool_name ?? "tool"}`,
               });
-              setBusy(true);
             }
-            push({
-              kind: "system",
-              text: `Waiting for approval · ${ev.request?.summary ?? ev.request?.tool_name ?? "tool"}`,
-            });
             break;
           case "plan_updated":
             if (ev.steps?.length) {
-              push({ kind: "system", text: `Plan: ${ev.steps.join(" → ")}` });
+              if (isBackground && evSid) {
+                bgPush(evSid, "system", `Plan: ${ev.steps.join(" → ")}`);
+              } else {
+                push({
+                  kind: "system",
+                  text: `Plan: ${ev.steps.join(" → ")}`,
+                });
+              }
             }
             break;
-          case "turn_state":
-            setBusy(
+          case "turn_state": {
+            const nextBusy =
               ev.state === "streaming" ||
-                ev.state === "running_tools" ||
-                ev.state === "waiting_permission",
-            );
+              ev.state === "running_tools" ||
+              ev.state === "waiting_permission";
+            markBusy(evSid || activeSid, nextBusy);
             break;
+          }
           case "turn_finished":
-            setBusy(false);
-            setPendingPerm(null);
-            clearWaiting();
-            if (ev.state === "error") {
-              push({ kind: "error", text: "Turn ended with error" });
-              finishTurnCollapse(true);
+            markBusy(evSid || activeSid, false);
+            if (isBackground && evSid) {
+              mutateBackgroundLines(evSid, (prev) => {
+                let next = prev;
+                if (next.length && next[next.length - 1].kind === "waiting") {
+                  next = next.slice(0, -1);
+                }
+                if (ev.state === "error") {
+                  next = [
+                    ...next,
+                    {
+                      id: nextLineId("error"),
+                      kind: "error",
+                      text: "Turn ended with error",
+                    },
+                  ];
+                } else if (ev.state === "cancelled") {
+                  next = [
+                    ...next,
+                    {
+                      id: nextLineId("system"),
+                      kind: "system",
+                      text: "Turn cancelled",
+                    },
+                  ];
+                }
+                // Collapse thinking/tools for background transcript too.
+                return collapseTurnProcess(next, 0);
+              });
+              void refreshSessions();
             } else {
-              // Collapse thinking / tools; keep final assistant answer below.
-              finishTurnCollapse(false);
+              setPendingPerm(null);
+              clearWaiting();
+              if (ev.state === "error") {
+                push({ kind: "error", text: "Turn ended with error" });
+                finishTurnCollapse(true);
+              } else if (ev.state === "cancelled") {
+                push({ kind: "system", text: "Turn cancelled" });
+                finishTurnCollapse(false);
+              } else {
+                finishTurnCollapse(false);
+              }
+              void refreshSessions();
             }
-            // Refresh titles/metadata only — list order is stable (created_at).
-            void refreshSessions(selectedProjectId);
             break;
-          case "agent_error":
-            setBusy(false);
-            clearWaiting();
-            push({ kind: "error", text: ev.message ?? "Agent error" });
-            finishTurnCollapse(true);
+          case "context_usage": {
+            if (
+              typeof ev.used_tokens !== "number" ||
+              !Number.isFinite(ev.used_tokens)
+            ) {
+              break;
+            }
+            const usageSid = evSid || activeSid;
+            if (!usageSid) break;
+            // Empty new task: ignore large engine totals (process residue).
+            const chatForCheck =
+              usageSid === activeSid
+                ? linesRef.current
+                : (sessionLinesCacheRef.current.get(usageSid) ?? []);
+            if (!hasRealChatContent(chatForCheck) && ev.used_tokens > 200) {
+              break;
+            }
+            sessionContextTokensRef.current.set(usageSid, ev.used_tokens);
+            if (usageSid === activeSid) {
+              setEngineContextTokens(ev.used_tokens);
+            }
             break;
+          }
+          case "agent_error": {
+            const msg = ev.message ?? "Agent error";
+            const soft =
+              /timed out|still be working|still working/i.test(msg);
+            if (isBackground && evSid) {
+              bgPush(evSid, soft ? "system" : "error", msg);
+              if (!soft) markBusy(evSid, false);
+            } else {
+              push({ kind: soft ? "system" : "error", text: msg });
+              if (!soft) {
+                markBusy(activeSid, false);
+                clearWaiting();
+                finishTurnCollapse(true);
+              }
+            }
+            break;
+          }
           default:
-            void sessionIdOf(ev);
             break;
         }
       });
@@ -1398,8 +2062,10 @@ export default function App() {
     refreshHierarchy,
     refreshModels,
     refreshSessions,
-    selectedProjectId,
     finishTurnCollapse,
+    setSessionBusyState,
+    mutateBackgroundLines,
+    hasRealChatContent,
   ]);
 
   const resizeTextarea = () => {
@@ -1414,20 +2080,120 @@ export default function App() {
     [projects, selectedProjectId],
   );
 
-  /** Select a project (stable path). Loads its tasks; does not start an agent. */
+  /** User project ids — tasks under these nest in Projects; others are temporary. */
+  const userProjectIds = useMemo(
+    () => new Set(projects.map((p) => p.project_id)),
+    [projects],
+  );
+
+  const temporarySessions = useMemo(
+    () => sessions.filter((s) => !userProjectIds.has(s.project_id)),
+    [sessions, userProjectIds],
+  );
+
+  const sessionsByProjectId = useMemo(() => {
+    const map = new Map<string, SessionListRow[]>();
+    for (const s of sessions) {
+      if (!userProjectIds.has(s.project_id)) continue;
+      const list = map.get(s.project_id);
+      if (list) list.push(s);
+      else map.set(s.project_id, [s]);
+    }
+    return map;
+  }, [sessions, userProjectIds]);
+
+  /**
+   * Select a project (stable path). Expands nested tasks under it.
+   * Clicking the already-selected project again clears the selection.
+   */
   const onSelectProject = async (p: ProjectListRow) => {
+    setView("workspace");
+    // Toggle off: second click on the active project deselects it.
+    if (selectedProjectId === p.project_id) {
+      setSelectedProjectId(null);
+      return;
+    }
     setSelectedProjectId(p.project_id);
     setProjectRoot(p.root_path);
-    setView("workspace");
     try {
       await invoke<string>("set_project_root", { projectRoot: p.root_path });
     } catch {
       /* ignore path errors; still show tasks */
     }
-    await refreshSessions(p.project_id);
   };
 
-  /** Reconnect agent on the current task (or create one if none). */
+  /** Remove project from sidebar (+ all its tasks). Source folder is kept. */
+  const onDeleteProject = async (p: ProjectListRow, e?: React.MouseEvent) => {
+    e?.stopPropagation();
+    if (connecting) return;
+    const n = p.session_count;
+    const ok = window.confirm(
+      `Remove project “${p.name}” from Grokx?\n\n` +
+        `This removes the project entry and ${n} task${n === 1 ? "" : "s"} ` +
+        `(chat history under ~/.grokx/tasks/).\n\n` +
+        `Your source folder is NOT deleted:\n${p.root_path}`,
+    );
+    if (!ok) return;
+
+    const wasSelected = selectedProjectId === p.project_id;
+    const activeBelongs =
+      Boolean(session?.session_id) &&
+      sessions.some(
+        (s) =>
+          s.session_id === session?.session_id && s.project_id === p.project_id,
+      );
+
+    if (activeBelongs) {
+      await flushPersistHistory();
+      historyEpochRef.current += 1;
+    }
+
+    try {
+      await invoke("delete_project", { projectId: p.project_id });
+      setProjects((prev) => prev.filter((row) => row.project_id !== p.project_id));
+      // Drop task rows that belonged to this project.
+      setSessions((prev) => {
+        const kept = prev.filter((row) => row.project_id !== p.project_id);
+        for (const gone of prev) {
+          if (gone.project_id === p.project_id) {
+            autoTitledSessionRef.current.delete(gone.session_id);
+            sessionScrollRef.current.delete(gone.session_id);
+            sessionContextTokensRef.current.delete(gone.session_id);
+            sessionLinesCacheRef.current.delete(gone.session_id);
+            sessionBusyMapRef.current.delete(gone.session_id);
+          }
+        }
+        return kept;
+      });
+
+      if (wasSelected) {
+        setSelectedProjectId(null);
+      }
+      if (activeBelongs) {
+        setSession(null);
+        sessionIdRef.current = null;
+        workPathRef.current = null;
+        setLines([]);
+        linesRef.current = [];
+        setPendingPerm(null);
+        setAttachments([]);
+        setDraft("");
+        setBusy(false);
+        setEngineContextTokens(null);
+        setAgentStatus("disconnected");
+      }
+      await refreshSessions();
+      void refreshProjects();
+    } catch (err) {
+      setError(String(err));
+    }
+  };
+
+  /**
+   * Force reconnect on the current task (or create one if none).
+   * Rarely needed: New task / switching Tasks already connect. Kept for
+   * recovery when the agent drops while you stay on the same task.
+   */
   const onConnect = async () => {
     if (session?.session_id) {
       await onActivateSession(
@@ -1441,17 +2207,18 @@ export default function App() {
           created_at: new Date().toISOString(),
           updated_at: new Date().toISOString(),
         },
+        { forceReconnect: true },
       );
       return;
     }
     await onNewSession();
   };
 
-  /** New task under current project. */
+  /** Sidebar top "New task" → always a temporary (Tasks) session. */
   const onNewTask = async () => {
     setPendingPerm(null);
     setView("workspace");
-    await onNewSession();
+    await onNewStandaloneTask();
   };
 
   /**
@@ -1459,19 +2226,25 @@ export default function App() {
    * the first temporary task under ~/.grokx/tasks/<id>.
    */
   const onOpenProject = async () => {
-    if (connecting || busy) return;
+    // Allow while another task is busy — multi-agent keeps it running.
+    if (connecting) return;
     setView("workspace");
     setError(null);
     try {
       const picked = await invoke<string | null>("pick_project_dir");
       if (!picked) return;
-      saveSessionScroll(sessionIdRef.current);
+      const leavingId = sessionIdRef.current;
+      saveSessionScroll(leavingId);
+      if (leavingId) {
+        sessionLinesCacheRef.current.set(leavingId, linesRef.current);
+      }
       await flushPersistHistory();
       setLines([]);
       linesRef.current = [];
       setPendingPerm(null);
       setAttachments([]);
       setDraft("");
+      setBusy(false);
       setConnecting(true);
       autoScrollEnabledRef.current = true;
       userScrollIntentRef.current = false;
@@ -1480,7 +2253,7 @@ export default function App() {
       await invoke<string>("set_project_root", { projectRoot: root });
       const info = await invoke<SessionInfo>("connect_workspace", {
         projectRoot: root,
-        autoApprove,
+        autoApprove: permissionMode === "always-approve",
       });
       setSession(info);
       if (info.project_root) setProjectRoot(info.project_root);
@@ -1505,17 +2278,23 @@ export default function App() {
   };
 
   /**
-   * New temporary task in Tasks only.
-   * - If a user Project is selected: attach to that project.
-   * - Otherwise: use internal default sandbox (~/.grokx/workspace) — NOT
-     shown under Projects.
-   * Task cwd: ~/.grokx/tasks/<id>.
+   * Create a new task.
+   * - `underProject`: attach to that user project (nested under Projects).
+   * - otherwise: temporary task under default sandbox (Tasks section only).
+   * Task cwd is always ~/.grokx/tasks/<id>.
    */
-  const onNewSession = async () => {
-    if (connecting || busy) return;
+  const onNewSession = async (opts?: {
+    underProject?: ProjectListRow | null;
+  }) => {
+    // Allow while another task is busy — prior agent keeps working in parallel.
+    if (connecting) return;
     setView("workspace");
     // Remember where we were reading so returning to this task restores it.
-    saveSessionScroll(sessionIdRef.current);
+    const leavingId = sessionIdRef.current;
+    saveSessionScroll(leavingId);
+    if (leavingId) {
+      sessionLinesCacheRef.current.set(leavingId, linesRef.current);
+    }
     // Save current task transcript before leaving.
     await flushPersistHistory();
     historyEpochRef.current += 1;
@@ -1524,8 +2303,12 @@ export default function App() {
     setPendingPerm(null);
     setAttachments([]);
     setDraft("");
+    setEditingUserId(null);
+    setEditDraft("");
     setError(null);
     setBusy(false);
+    // New task = new context window; drop previous engine total immediately.
+    setEngineContextTokens(null);
     turnStartedAtRef.current = null;
     setConnecting(true);
     // Fresh task starts at bottom with auto-follow on.
@@ -1533,8 +2316,11 @@ export default function App() {
     userScrollIntentRef.current = false;
     stickyUserIdRef.current = null;
     setStickyUserId(null);
-    // Only treat an explicitly selected sidebar Project as a real project.
-    const userProject = selectedProject;
+
+    const userProject =
+      opts?.underProject === undefined
+        ? selectedProject
+        : opts.underProject;
     const standalone = !userProject;
     try {
       let root = userProject?.root_path?.trim() || "";
@@ -1548,10 +2334,13 @@ export default function App() {
       }
       const info = await invoke<SessionInfo>("connect_workspace", {
         projectRoot: root,
-        autoApprove,
+        autoApprove: permissionMode === "always-approve",
       });
       setSession(info);
       sessionIdRef.current = info.session_id;
+      // Ensure this id has no inherited engine total.
+      sessionContextTokensRef.current.delete(info.session_id);
+      setEngineContextTokens(null);
       workPathRef.current = info.work_path ?? null;
       if (info.project_root && !standalone) {
         setProjectRoot(info.project_root);
@@ -1573,8 +2362,26 @@ export default function App() {
     }
   };
 
-  /** Activate an existing task (click) — restore history, never creates a new row. */
-  const onActivateSession = async (s: SessionListRow) => {
+  /** New temporary task only (Tasks section +). */
+  const onNewStandaloneTask = async () => {
+    setSelectedProjectId(null);
+    await onNewSession({ underProject: null });
+  };
+
+  /** New task nested under a user project. */
+  const onNewProjectTask = async (p: ProjectListRow, e?: React.MouseEvent) => {
+    e?.stopPropagation();
+    setSelectedProjectId(p.project_id);
+    setProjectRoot(p.root_path);
+    await onNewSession({ underProject: p });
+  };
+
+  /** Activate an existing task (click) — restore history, never creates a new row.
+   *  Other tasks keep running in the background (multi-agent). */
+  const onActivateSession = async (
+    s: SessionListRow,
+    opts?: { forceReconnect?: boolean },
+  ) => {
     if (renamingId === s.session_id || connecting) return;
     setView("workspace");
 
@@ -1586,13 +2393,18 @@ export default function App() {
       setSelectedProjectId(null);
     }
 
-    // Already the active task — just focus workspace, no engine restart.
-    // Do not refresh/reorder the list on click.
-    if (session?.session_id === s.session_id) {
+    // Already the active task and agent is healthy — no engine restart.
+    // If disconnected (or force), fall through and reconnect the same task.
+    const agentReady = agentStatus.toLowerCase().includes("ready");
+    if (
+      session?.session_id === s.session_id &&
+      !opts?.forceReconnect &&
+      agentReady
+    ) {
       return;
     }
 
-    // Persist the task we're leaving so we can resume it later.
+    // Persist + cache the task we're leaving so background work continues cleanly.
     const leavingId = sessionIdRef.current;
     const leavingWork = workPathRef.current;
     const leavingLines = linesRef.current;
@@ -1602,8 +2414,12 @@ export default function App() {
       clearTimeout(historySaveTimer.current);
       historySaveTimer.current = null;
     }
-    if (leavingId && hasRealChatContent(leavingLines)) {
-      await persistChatHistory(leavingId, leavingLines, leavingWork);
+    if (leavingId) {
+      // Keep live transcript in memory while agent keeps working off-screen.
+      sessionLinesCacheRef.current.set(leavingId, leavingLines);
+      if (hasRealChatContent(leavingLines)) {
+        await persistChatHistory(leavingId, leavingLines, leavingWork);
+      }
     }
 
     // Invalidate any pending saves from the previous task.
@@ -1615,8 +2431,13 @@ export default function App() {
     setPendingPerm(null);
     setAttachments([]);
     setDraft("");
-    setBusy(false);
-    turnStartedAtRef.current = null;
+    setEditingUserId(null);
+    setEditDraft("");
+    // Restore busy for the task we're entering (may still be streaming).
+    const enteringBusy = sessionBusyMapRef.current.get(s.session_id) ?? false;
+    busyRef.current = enteringBusy;
+    setBusy(enteringBusy);
+    turnStartedAtRef.current = enteringBusy ? Date.now() : null;
     stickyUserIdRef.current = null;
     setStickyUserId(null);
 
@@ -1628,11 +2449,28 @@ export default function App() {
       status: "Starting",
     });
     sessionIdRef.current = s.session_id;
+    // Restore this task's last engine total (if any); otherwise estimate from chat.
+    setEngineContextTokens(
+      sessionContextTokensRef.current.get(s.session_id) ?? null,
+    );
     workPathRef.current = s.work_path || null;
     if (s.project_root) setProjectRoot(s.project_root);
 
-    // Restore transcript ASAP (by work_path) so chat is visible during reconnect.
-    const history = await loadChatHistory(s.session_id, s.work_path);
+    // Prefer in-memory cache (includes live stream while we were away).
+    // Clear previous task's lines immediately so background→active events
+    // for the new task don't append onto the old transcript during await.
+    const cached = sessionLinesCacheRef.current.get(s.session_id);
+    if (cached && cached.length > 0) {
+      setLines(cached);
+      linesRef.current = cached;
+    } else {
+      setLines([]);
+      linesRef.current = [];
+    }
+    let history =
+      cached && cached.length > 0
+        ? cached
+        : await loadChatHistory(s.session_id, s.work_path);
     if (historyEpochRef.current !== epoch) return;
     // Apply scroll policy *before* setLines so the lines-effect auto-follow
     // does not race and yank the viewport to the bottom.
@@ -1659,10 +2497,11 @@ export default function App() {
           /* path may still work via reconnect metadata */
         }
       }
-      // reconnect_session reuses this session_id — does not append a new list item.
+      // reconnect_session focuses an already-live agent or spawns one —
+      // does not kill other parallel agents.
       const info = await invoke<SessionInfo>("reconnect_session", {
         sessionId: s.session_id,
-        autoApprove,
+        autoApprove: permissionMode === "always-approve",
       });
       if (historyEpochRef.current !== epoch) return;
       if (info.session_id !== s.session_id) {
@@ -1684,33 +2523,56 @@ export default function App() {
       if (info.project_root) setProjectRoot(info.project_root);
       setAgentStatus(info.status);
 
-      // Re-load history after reconnect in case first load raced; never clear real chat.
-      const history2 = await loadChatHistory(
-        s.session_id,
-        info.work_path ?? s.work_path,
-      );
-      if (historyEpochRef.current !== epoch) return;
-      let historyChanged = false;
-      if (history2.length > 0) {
-        // Only replace if content actually differs — avoid resetting scroll.
+      // Prefer freshest in-memory cache (background events may have updated it).
+      const cached2 = sessionLinesCacheRef.current.get(s.session_id);
+      if (cached2 && cached2.length > 0) {
         const prev = linesRef.current;
-        historyChanged =
-          history2.length !== prev.length ||
-          history2.some((l, i) => l.id !== prev[i]?.id || l.kind !== prev[i]?.kind);
+        const historyChanged =
+          cached2.length !== prev.length ||
+          cached2.some(
+            (l, i) => l.id !== prev[i]?.id || l.kind !== prev[i]?.kind,
+          );
         if (historyChanged) {
-          setLines(history2);
-          linesRef.current = history2;
+          setLines(cached2);
+          linesRef.current = cached2;
+          restoreSessionScroll(s.session_id);
         }
-      } else if (hasRealChatContent(linesRef.current)) {
-        // Keep what we already showed.
+      } else {
+        // Re-load history after reconnect in case first load raced.
+        const history2 = await loadChatHistory(
+          s.session_id,
+          info.work_path ?? s.work_path,
+        );
+        if (historyEpochRef.current !== epoch) return;
+        if (history2.length > 0) {
+          const prev = linesRef.current;
+          const historyChanged =
+            history2.length !== prev.length ||
+            history2.some(
+              (l, i) => l.id !== prev[i]?.id || l.kind !== prev[i]?.kind,
+            );
+          if (historyChanged) {
+            setLines(history2);
+            linesRef.current = history2;
+            restoreSessionScroll(s.session_id);
+          }
+        }
       }
 
-      if (historyChanged) {
-        restoreSessionScroll(s.session_id);
+      // Sync busy from backend in case we missed events while away.
+      try {
+        const stillBusy = await invoke<boolean>("is_session_busy", {
+          sessionId: s.session_id,
+        });
+        if (historyEpochRef.current === epoch) {
+          setSessionBusyState(s.session_id, stillBusy);
+        }
+      } catch {
+        /* keep map value */
       }
 
-      // Keep list order stable: only refresh session metadata/titles, no full hierarchy reshuffle.
-      await refreshSessions(visibleProject ? s.project_id : null);
+      // Keep list order stable: only refresh session metadata/titles.
+      await refreshSessions();
       await refreshModels();
     } catch (e) {
       setError(String(e));
@@ -1757,7 +2619,7 @@ export default function App() {
 
   const onDeleteSession = async (s: SessionListRow, e?: React.MouseEvent) => {
     e?.stopPropagation();
-    if (connecting || busy) return;
+    if (connecting) return;
     const label = s.title || s.session_id.slice(0, 8);
     const ok = window.confirm(
       `Delete task “${label}”?\n\nThis removes the task and its chat history from disk.`,
@@ -1776,6 +2638,15 @@ export default function App() {
       setSessions((prev) => prev.filter((row) => row.session_id !== s.session_id));
       autoTitledSessionRef.current.delete(s.session_id);
       sessionScrollRef.current.delete(s.session_id);
+      sessionContextTokensRef.current.delete(s.session_id);
+      sessionLinesCacheRef.current.delete(s.session_id);
+      sessionBusyMapRef.current.delete(s.session_id);
+      setSessionBusyMap((prev) => {
+        if (!(s.session_id in prev)) return prev;
+        const next = { ...prev };
+        delete next[s.session_id];
+        return next;
+      });
 
       if (wasActive) {
         setSession(null);
@@ -2081,7 +2952,125 @@ export default function App() {
     }
   };
 
+  const cancelEditUser = useCallback(() => {
+    setEditingUserId(null);
+    setEditDraft("");
+  }, []);
+
+  const beginEditUser = useCallback(
+    (line: Extract<ChatLine, { kind: "user" }>) => {
+      if (busy || connecting) return;
+      setEditingUserId(line.id);
+      setEditDraft(line.text ?? "");
+      // Focus after paint so the textarea exists.
+      requestAnimationFrame(() => {
+        const el = editTextareaRef.current;
+        if (!el) return;
+        el.focus();
+        el.style.height = "auto";
+        el.style.height = `${Math.min(el.scrollHeight, 200)}px`;
+        // Place caret at end.
+        const len = el.value.length;
+        el.setSelectionRange(len, len);
+      });
+    },
+    [busy, connecting],
+  );
+
+  /**
+   * Re-send from an edited user bubble: keep history up to that message,
+   * replace its text, drop everything after, and start a new turn.
+   */
+  const onResendEditedUser = async () => {
+    if (!editingUserId || busy || connecting) return;
+    const text = editDraft.trim();
+    const idx = linesRef.current.findIndex(
+      (l) => l.kind === "user" && l.id === editingUserId,
+    );
+    if (idx < 0) {
+      cancelEditUser();
+      return;
+    }
+    const original = linesRef.current[idx];
+    if (original.kind !== "user") {
+      cancelEditUser();
+      return;
+    }
+    const keepAtts = original.attachments ?? [];
+    if (!text && keepAtts.length === 0) return;
+
+    // Truncate transcript: keep messages before this user bubble, then the
+    // edited user message (attachments preserved; text updated).
+    const kept = linesRef.current.slice(0, idx);
+    const updatedUser: ChatLine = {
+      ...original,
+      text: text || original.text,
+      at: new Date().toISOString(),
+    };
+    const next: ChatLine[] = [
+      ...kept,
+      updatedUser,
+      {
+        id: nextLineId("waiting"),
+        kind: "waiting",
+        text: "Grokx is thinking…",
+      },
+    ];
+    setLines(next);
+    linesRef.current = next;
+    if (sessionIdRef.current) {
+      sessionLinesCacheRef.current.set(sessionIdRef.current, next);
+    }
+    setEditingUserId(null);
+    setEditDraft("");
+    // Persist truncated + edited history immediately (don't wait for debounce).
+    if (sessionIdRef.current) {
+      void persistChatHistory(
+        sessionIdRef.current,
+        next,
+        workPathRef.current,
+      );
+    }
+
+    turnStartedAtRef.current = Date.now();
+    const sid = sessionIdRef.current;
+    if (sid) setSessionBusyState(sid, true);
+    else setBusy(true);
+    enableAutoScroll();
+
+    // Prompt text: edited text, or empty if image-only (engine gets attachments).
+    const promptText = text;
+    const attPayload = keepAtts.map((a) => ({
+      path: a.path,
+      name: a.name,
+      mime: a.mime ?? null,
+      size: a.size ?? null,
+    }));
+
+    try {
+      await invoke("send_prompt_rich", {
+        payload: {
+          text: promptText,
+          attachments: attPayload,
+          model: modelId || null,
+          effort: effortId || null,
+        },
+      });
+    } catch (e) {
+      if (sid) setSessionBusyState(sid, false);
+      else setBusy(false);
+      clearWaiting();
+      push({ kind: "error", text: String(e) });
+      finishTurnCollapse(true);
+    }
+  };
+
   const onSend = async () => {
+    // If editing a past message, that flow owns send.
+    if (editingUserId) {
+      await onResendEditedUser();
+      return;
+    }
     const text = draft.trim();
     if ((!text && attachments.length === 0) || busy) return;
     const pendingAttachments = attachments;
@@ -2091,18 +3080,44 @@ export default function App() {
       textareaRef.current.style.height = "auto";
     }
     turnStartedAtRef.current = Date.now();
+    const sid = sessionIdRef.current;
+    if (sid) setSessionBusyState(sid, true);
+    else setBusy(true);
     // New user turn: resume gentle auto-follow from the bottom.
     enableAutoScroll();
+    const chatAtts: ChatAttachment[] = pendingAttachments.map((a) => {
+      let previewSrc: string | null = a.previewUrl ?? null;
+      if (!previewSrc && a.path && a.mime?.startsWith("image/")) {
+        try {
+          previewSrc = convertFileSrc(a.path);
+        } catch {
+          previewSrc = null;
+        }
+      }
+      return {
+        path: a.path,
+        name: a.name,
+        mime: a.mime ?? null,
+        size: a.size ?? null,
+        previewSrc,
+      };
+    });
+    // Text for history/search; images render as thumbnails via attachments.
     const display =
-      pendingAttachments.length > 0
-        ? `${text || "(attachments)"}${text ? "\n\n" : ""}📎 ${pendingAttachments
-            .map((a) => a.name)
-            .join(", ")}`
-        : text;
-    push({ kind: "user", text: display });
+      text ||
+      (chatAtts.length
+        ? chatAtts.every((a) => a.mime?.startsWith("image/"))
+          ? ""
+          : chatAtts.map((a) => a.name).join(", ")
+        : "");
+    push({
+      kind: "user",
+      text: display,
+      at: new Date().toISOString(),
+      attachments: chatAtts.length ? chatAtts : undefined,
+    });
     // Immediate left-side feedback so the UI doesn't look frozen.
     push({ kind: "waiting", text: "Grokx is thinking…" });
-    setBusy(true);
     try {
       await invoke("send_prompt_rich", {
         payload: {
@@ -2118,7 +3133,8 @@ export default function App() {
         },
       });
     } catch (e) {
-      setBusy(false);
+      if (sid) setSessionBusyState(sid, false);
+      else setBusy(false);
       clearWaiting();
       push({ kind: "error", text: String(e) });
       finishTurnCollapse(true);
@@ -2126,12 +3142,14 @@ export default function App() {
   };
 
   const onCancel = async () => {
+    const sid = sessionIdRef.current;
     try {
       await invoke("cancel_turn");
     } catch (e) {
       push({ kind: "error", text: String(e) });
     } finally {
-      setBusy(false);
+      if (sid) setSessionBusyState(sid, false);
+      else setBusy(false);
       setPendingPerm(null);
       // Still collapse any in-flight process stream.
       finishTurnCollapse(false);
@@ -2151,6 +3169,10 @@ export default function App() {
             : `Allowed · ${pendingPerm.summary}`,
       });
       setPendingPerm(null);
+      // After allow, tools continue — keep Working until turn_finished.
+      if (decision !== "deny") {
+        setBusy(true);
+      }
     } catch (e) {
       push({ kind: "error", text: String(e) });
     }
@@ -2177,15 +3199,21 @@ export default function App() {
       }`}
     >
       <aside className="sidebar">
-        <div className="brand-row" data-tauri-drag-region>
-          <button
-            type="button"
-            className="brand brand-btn"
-            title="Back to workspace"
-            onClick={() => setView("workspace")}
-          >
-            Grokx
-          </button>
+        {/* Full sidebar chrome under traffic lights — drag to move the window. */}
+        <div
+          className="sidebar-titlebar"
+          onMouseDown={onTitlebarMouseDown}
+        >
+          <div className="brand-row">
+            <button
+              type="button"
+              className="brand brand-btn"
+              title="Back to workspace"
+              onClick={() => setView("workspace")}
+            >
+              Grokx
+            </button>
+          </div>
         </div>
 
         <nav className="nav">
@@ -2199,26 +3227,19 @@ export default function App() {
             </span>
             {connecting ? "Connecting…" : "New task"}
           </button>
-          <button
-            className="nav-item"
-            onClick={() => void onConnect()}
-            disabled={connecting}
-          >
-            <span className="nav-glyph">
-              <IconRefresh size={16} />
-            </span>
-            {connected ? "Reconnect" : "Connect agent"}
-          </button>
         </nav>
 
-        {/* Project = fixed user-chosen folder */}
+        {/*
+          Projects = fixed folders; tasks nest under the selected project.
+          Tasks = temporary sessions (default sandbox) only.
+        */}
         <div className="section-label-row">
           <span className="section-label">Projects</span>
           <button
             type="button"
             className="session-add-btn"
             title="Open project folder (fixed path)"
-            disabled={connecting || busy}
+            disabled={connecting}
             onClick={() => void onOpenProject()}
           >
             <IconPlus size={16} />
@@ -2230,108 +3251,231 @@ export default function App() {
               No projects · + opens a folder
             </div>
           )}
-          {projects.map((p) => (
-            <div
-              key={p.project_id}
-              className={`project-row${
-                p.project_id === selectedProjectId ? " active" : ""
-              }`}
-              onClick={() => void onSelectProject(p)}
-              title={`Project (fixed path)\n${p.root_path}`}
-            >
-              <div className="project-row-main">
-                <div className="project-title">{p.name}</div>
-                <span className="project-count">{p.session_count}</span>
+          {projects.map((p) => {
+            const isSelected = p.project_id === selectedProjectId;
+            const nested = sessionsByProjectId.get(p.project_id) ?? [];
+            return (
+              <div key={p.project_id} className="project-block">
+                <div
+                  className={`project-row${isSelected ? " active" : ""}`}
+                  onClick={() => void onSelectProject(p)}
+                  title={
+                    isSelected
+                      ? `Selected · click again to deselect\n${p.root_path}`
+                      : `Project (fixed path)\n${p.root_path}\nClick to select · nested tasks appear below`
+                  }
+                >
+                  <div className="project-row-main">
+                    <span className="project-icon" aria-hidden>
+                      <IconFolder size={15} />
+                    </span>
+                    <div className="project-title">{p.name}</div>
+                    <span className="project-count">{nested.length}</span>
+                    <button
+                      type="button"
+                      className="session-action-btn project-add-task-btn"
+                      title="New task under this project"
+                      disabled={connecting}
+                      onClick={(e) => void onNewProjectTask(p, e)}
+                    >
+                      <IconPlus size={12} />
+                    </button>
+                    <button
+                      type="button"
+                      className="session-action-btn session-delete-btn project-delete-btn"
+                      title="Remove project from Grokx (keeps source folder)"
+                      onClick={(e) => void onDeleteProject(p, e)}
+                    >
+                      <IconTrash size={12} />
+                    </button>
+                  </div>
+                </div>
+                {isSelected && (
+                  <div className="project-tasks">
+                    {nested.length === 0 && (
+                      <div className="session-empty session-empty-nested">
+                        No tasks · + under project
+                      </div>
+                    )}
+                    {nested.map((s) => {
+                      const isActive = s.session_id === session?.session_id;
+                      const isWorking = Boolean(
+                        sessionBusyMap[s.session_id] ||
+                          (isActive && busy),
+                      );
+                      return (
+                        <div
+                          key={s.session_id}
+                          className={`session-row nested task-row${
+                            isActive ? " active" : ""
+                          }${isWorking ? " working" : ""}`}
+                          onClick={() => void onActivateSession(s)}
+                          onDoubleClick={(e) => startRename(s, e)}
+                          title={
+                            isWorking
+                              ? `Working…\n${s.work_path || "~/.grokx/tasks/…"}`
+                              : `Task under ${p.name}\n${s.work_path || "~/.grokx/tasks/…"}`
+                          }
+                        >
+                          {renamingId === s.session_id ? (
+                            <input
+                              ref={renameInputRef}
+                              className="session-rename-input"
+                              value={renameDraft}
+                              onChange={(e) => setRenameDraft(e.target.value)}
+                              onClick={(e) => e.stopPropagation()}
+                              onKeyDown={(e) => {
+                                if (e.key === "Enter") {
+                                  e.preventDefault();
+                                  void commitRename();
+                                } else if (e.key === "Escape") {
+                                  e.preventDefault();
+                                  cancelRename();
+                                }
+                              }}
+                              onBlur={() => void commitRename()}
+                            />
+                          ) : (
+                            <>
+                              <div className="session-row-main">
+                                {isWorking ? (
+                                  <span
+                                    className="session-working-spin"
+                                    title="Working"
+                                    aria-label="Working"
+                                  />
+                                ) : (
+                                  <span className="task-icon" aria-hidden>
+                                    <IconTask size={13} />
+                                  </span>
+                                )}
+                                <div className="session-title">
+                                  {s.title || s.session_id.slice(0, 8)}
+                                </div>
+                                <button
+                                  type="button"
+                                  className="session-action-btn"
+                                  title="Rename task"
+                                  onClick={(e) => startRename(s, e)}
+                                >
+                                  <IconPen size={12} />
+                                </button>
+                                <button
+                                  type="button"
+                                  className="session-action-btn session-delete-btn"
+                                  title="Delete task"
+                                  onClick={(e) => void onDeleteSession(s, e)}
+                                >
+                                  <IconTrash size={12} />
+                                </button>
+                              </div>
+                            </>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
               </div>
-              <div className="project-meta">{shortPath(p.root_path)}</div>
-            </div>
-          ))}
+            );
+          })}
         </div>
 
-        {/* Tasks = temporary ~/.grokx/tasks/<id> only; does not create Projects */}
+        {/* Temporary tasks only (not bound to a user Project) */}
         <div className="section-label-row">
-          <span className="section-label">
-            Tasks
-            {selectedProject ? ` · ${selectedProject.name}` : ""}
-          </span>
+          <span className="section-label">Tasks</span>
           <button
             type="button"
             className="session-add-btn"
-            title={
-              selectedProject
-                ? "New task under this project (~/.grokx/tasks/…)"
-                : "New temporary task (Tasks only, no Project entry)"
-            }
-            disabled={connecting || busy}
-            onClick={() => void onNewSession()}
+            title="New temporary task (not under a Project)"
+            disabled={connecting}
+            onClick={() => void onNewStandaloneTask()}
           >
             <IconPlus size={16} />
           </button>
         </div>
         <div className="session-list">
-          {sessions.length === 0 && (
-            <div className="session-empty">No tasks · click + to start</div>
-          )}
-          {sessions.map((s) => (
-            <div
-              key={s.session_id}
-              className={`session-row${
-                s.session_id === session?.session_id ? " active" : ""
-              }`}
-              onClick={() => void onActivateSession(s)}
-              onDoubleClick={(e) => startRename(s, e)}
-              title={`Task workspace (temporary)\n${s.work_path || "~/.grokx/tasks/…"}\nProject: ${s.project_root}\nClick to switch · double-click or ✎ to rename · 🗑 to delete`}
-            >
-              {renamingId === s.session_id ? (
-                <input
-                  ref={renameInputRef}
-                  className="session-rename-input"
-                  value={renameDraft}
-                  onChange={(e) => setRenameDraft(e.target.value)}
-                  onClick={(e) => e.stopPropagation()}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter") {
-                      e.preventDefault();
-                      void commitRename();
-                    } else if (e.key === "Escape") {
-                      e.preventDefault();
-                      cancelRename();
-                    }
-                  }}
-                  onBlur={() => void commitRename()}
-                />
-              ) : (
-                <>
-                  <div className="session-row-main">
-                    <div className="session-title">
-                      {s.title || s.session_id.slice(0, 8)}
-                    </div>
-                    <button
-                      type="button"
-                      className="session-action-btn"
-                      title="Rename task"
-                      onClick={(e) => startRename(s, e)}
-                    >
-                      <IconPen size={12} />
-                    </button>
-                    <button
-                      type="button"
-                      className="session-action-btn session-delete-btn"
-                      title="Delete task"
-                      onClick={(e) => void onDeleteSession(s, e)}
-                    >
-                      <IconTrash size={12} />
-                    </button>
-                  </div>
-                  <div className="session-meta">
-                    {s.work_path
-                      ? shortPath(s.work_path)
-                      : new Date(s.created_at || s.updated_at).toLocaleString()}
-                  </div>
-                </>
-              )}
+          {temporarySessions.length === 0 && (
+            <div className="session-empty">
+              No temporary tasks · + to start
             </div>
-          ))}
+          )}
+          {temporarySessions.map((s) => {
+            const isActive = s.session_id === session?.session_id;
+            const isWorking = Boolean(
+              sessionBusyMap[s.session_id] || (isActive && busy),
+            );
+            return (
+              <div
+                key={s.session_id}
+                className={`session-row task-row${isActive ? " active" : ""}${
+                  isWorking ? " working" : ""
+                }`}
+                onClick={() => void onActivateSession(s)}
+                onDoubleClick={(e) => startRename(s, e)}
+                title={
+                  isWorking
+                    ? `Working…\nTemporary task\n${s.work_path || "~/.grokx/tasks/…"}`
+                    : `Temporary task\n${s.work_path || "~/.grokx/tasks/…"}\nClick to switch · double-click or ✎ to rename`
+                }
+              >
+                {renamingId === s.session_id ? (
+                  <input
+                    ref={renameInputRef}
+                    className="session-rename-input"
+                    value={renameDraft}
+                    onChange={(e) => setRenameDraft(e.target.value)}
+                    onClick={(e) => e.stopPropagation()}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") {
+                        e.preventDefault();
+                        void commitRename();
+                      } else if (e.key === "Escape") {
+                        e.preventDefault();
+                        cancelRename();
+                      }
+                    }}
+                    onBlur={() => void commitRename()}
+                  />
+                ) : (
+                  <>
+                    <div className="session-row-main">
+                      {isWorking ? (
+                        <span
+                          className="session-working-spin"
+                          title="Working"
+                          aria-label="Working"
+                        />
+                      ) : (
+                        <span className="task-icon" aria-hidden>
+                          <IconTask size={13} />
+                        </span>
+                      )}
+                      <div className="session-title">
+                        {s.title || s.session_id.slice(0, 8)}
+                      </div>
+                      <button
+                        type="button"
+                        className="session-action-btn"
+                        title="Rename task"
+                        onClick={(e) => startRename(s, e)}
+                      >
+                        <IconPen size={12} />
+                      </button>
+                      <button
+                        type="button"
+                        className="session-action-btn session-delete-btn"
+                        title="Delete task"
+                        onClick={(e) => void onDeleteSession(s, e)}
+                      >
+                        <IconTrash size={12} />
+                      </button>
+                    </div>
+                  </>
+                )}
+              </div>
+            );
+          })}
         </div>
 
         <div className="sidebar-bottom">
@@ -2372,8 +3516,8 @@ export default function App() {
 
       {view === "settings" ? (
         <main className="main settings-main">
-          <header className="topbar" data-tauri-drag-region>
-            <div style={{ minWidth: 0 }}>
+          <header className="topbar" onMouseDown={onTitlebarMouseDown}>
+            <div className="topbar-main">
               <h1 className="topbar-title">Settings</h1>
               <p className="topbar-sub">
                 System · model and engine (set once)
@@ -2578,24 +3722,32 @@ export default function App() {
                   </button>
                   <button
                     className="btn"
-                    onClick={() => void onConnect()}
+                    onClick={() => void onNewTask()}
                     disabled={connecting}
                   >
-                    {connecting
-                      ? "Connecting…"
-                      : connected
-                        ? "Reconnect"
-                        : "Connect agent"}
+                    {connecting ? "Connecting…" : "New task"}
                   </button>
                 </div>
-                <label className="check">
-                  <input
-                    type="checkbox"
-                    checked={autoApprove}
-                    onChange={(e) => setAutoApprove(e.target.checked)}
-                  />
-                  Auto-approve tools on next connect
-                </label>
+                <div className="field">
+                  <label>Tool permission (next connect)</label>
+                  <select
+                    className="settings-select"
+                    value={permissionMode}
+                    onChange={(e) =>
+                      void setPermissionModeAndSave(
+                        normalizePermissionMode(e.target.value),
+                      )
+                    }
+                  >
+                    <option value="ask">Needs approval — confirm each tool</option>
+                    <option value="auto">
+                      Auto — engine classifier (fewer prompts)
+                    </option>
+                    <option value="always-approve">
+                      Full trust — always approve all tools
+                    </option>
+                  </select>
+                </div>
                 <div className="field">
                   <label>Custom engine path (optional)</label>
                   <input
@@ -2623,8 +3775,8 @@ export default function App() {
       ) : (
         <>
           <main className="main">
-            <header className="topbar" data-tauri-drag-region>
-              <div style={{ minWidth: 0 }}>
+            <header className="topbar" onMouseDown={onTitlebarMouseDown}>
+              <div className="topbar-main">
                 <h1 className="topbar-title">{title}</h1>
                 <p className="topbar-sub">
                   {selectedProject
@@ -2642,10 +3794,33 @@ export default function App() {
                 </p>
               </div>
               <div className="topbar-actions">
-                <div className="status-pill">
+                {/* Status is non-interactive — whole top strip moves the window. */}
+                <button
+                  type="button"
+                  className={`status-pill${connected || busy ? "" : " status-pill-action"}`}
+                  title={
+                    connected || busy
+                      ? busy
+                        ? "Agent is working"
+                        : "Agent ready"
+                      : "Click to reconnect agent"
+                  }
+                  onClick={() => {
+                    if (!connected && !busy && !connecting) {
+                      void onConnect();
+                    }
+                  }}
+                  disabled={connecting || busy || connected}
+                >
                   <span className={`status-dot ${statusClass}`} />
-                  {busy ? "Working" : connected ? "Ready" : agentStatus}
-                </div>
+                  {connecting
+                    ? "Connecting…"
+                    : busy
+                      ? "Working"
+                      : connected
+                        ? "Ready"
+                        : agentStatus}
+                </button>
                 <button
                   type="button"
                   className="icon-btn topbar-outputs-toggle"
@@ -2667,12 +3842,12 @@ export default function App() {
                 <button
                   type="button"
                   className="user-sticky-bar"
-                  title="Jump to this user message"
+                  title="Jump to your message above"
                   onClick={() => jumpToUserMessage(stickyUserId)}
                 >
                   <span className="user-sticky-label">Your message</span>
                   <span className="user-sticky-text">{stickyUserText}</span>
-                  <span className="user-sticky-jump">Jump ↓</span>
+                  <span className="user-sticky-jump">Jump ↑</span>
                 </button>
               )}
               <div className="chat-scroll" ref={chatScrollRef}>
@@ -2769,12 +3944,113 @@ export default function App() {
                     );
                   }
                   if (line.kind === "assistant") {
+                    const streaming =
+                      busy && i === lines.length - 1;
+                    const canCopy = Boolean(line.text.trim()) && !streaming;
+                    const copiedMd =
+                      copiedMsg?.id === line.id && copiedMsg.format === "md";
+                    const copiedPlain =
+                      copiedMsg?.id === line.id &&
+                      copiedMsg.format === "plain";
                     return (
                       <div key={line.id} className="msg msg-assistant">
-                        <div className="msg-body md-body">
-                          <ChatMarkdown>{line.text}</ChatMarkdown>
-                          {busy && i === lines.length - 1 && (
-                            <span className="stream-caret" aria-hidden />
+                        <div className="msg-assistant-wrap">
+                          <div className="msg-body md-body">
+                            <ChatMarkdown>{line.text}</ChatMarkdown>
+                            {streaming && (
+                              <span className="stream-caret" aria-hidden />
+                            )}
+                          </div>
+                          {canCopy && (
+                            <div className="msg-actions">
+                              <button
+                                type="button"
+                                className={`msg-copy-btn${
+                                  copiedMd ? " msg-copy-btn-done" : ""
+                                }`}
+                                title={
+                                  copiedMd
+                                    ? "Copied as Markdown"
+                                    : "Copy as Markdown"
+                                }
+                                aria-label={
+                                  copiedMd
+                                    ? "Copied as Markdown"
+                                    : "Copy reply as Markdown"
+                                }
+                                onClick={() =>
+                                  void copyAssistantText(
+                                    line.id,
+                                    line.text,
+                                    "md",
+                                  )
+                                }
+                              >
+                                {copiedMd ? (
+                                  <IconCheck size={14} />
+                                ) : (
+                                  <IconCopy size={14} />
+                                )}
+                                <span>
+                                  {copiedMd ? "Copied" : "Markdown"}
+                                </span>
+                              </button>
+                              <button
+                                type="button"
+                                className={`msg-copy-btn${
+                                  copiedPlain ? " msg-copy-btn-done" : ""
+                                }`}
+                                title={
+                                  copiedPlain
+                                    ? "Copied as plain text"
+                                    : "Copy as plain text"
+                                }
+                                aria-label={
+                                  copiedPlain
+                                    ? "Copied as plain text"
+                                    : "Copy reply as plain text"
+                                }
+                                onClick={() =>
+                                  void copyAssistantText(
+                                    line.id,
+                                    line.text,
+                                    "plain",
+                                  )
+                                }
+                              >
+                                {copiedPlain ? (
+                                  <IconCheck size={14} />
+                                ) : (
+                                  <IconCopy size={14} />
+                                )}
+                                <span>
+                                  {copiedPlain ? "Copied" : "Text"}
+                                </span>
+                              </button>
+                              {(line.tokens != null ||
+                                line.tokensPerSec != null) && (
+                                <span
+                                  className="msg-metrics"
+                                  title={
+                                    line.streamMs != null
+                                      ? `Estimated ~${line.tokens ?? "?"} tokens over ${(line.streamMs / 1000).toFixed(1)}s of streaming (not API usage)`
+                                      : "Estimated tokens from reply length (not API usage)"
+                                  }
+                                >
+                                  {line.tokens != null && (
+                                    <span className="msg-metric">
+                                      ~{line.tokens} tok
+                                    </span>
+                                  )}
+                                  {line.tokensPerSec != null && (
+                                    <span className="msg-metric">
+                                      {formatTokensPerSec(line.tokensPerSec)}{" "}
+                                      tok/s
+                                    </span>
+                                  )}
+                                </span>
+                              )}
+                            </div>
                           )}
                         </div>
                       </div>
@@ -2790,19 +4066,200 @@ export default function App() {
                     );
                   }
                   if (line.kind === "user") {
+                    const timeLabel = formatMessageTime(line.at);
+                    const imgs = (line.attachments ?? []).filter(
+                      (a) =>
+                        a.mime?.startsWith("image/") &&
+                        (a.previewSrc || a.path),
+                    );
+                    const files = (line.attachments ?? []).filter(
+                      (a) => !a.mime?.startsWith("image/"),
+                    );
+                    const isEditing = editingUserId === line.id;
+                    const canEdit = !busy && !connecting && !isEditing;
                     return (
                       <div
                         key={line.id}
                         className={`msg msg-user${
                           highlightUserId === line.id ? " msg-user-highlight" : ""
-                        }`}
+                        }${isEditing ? " msg-user-editing" : ""}`}
                         data-user-msg={line.id}
                         ref={(el) => {
                           if (el) userMsgEls.current.set(line.id, el);
                           else userMsgEls.current.delete(line.id);
                         }}
                       >
-                        <div className="msg-body">{line.text}</div>
+                        <div className="msg-user-stack">
+                          {isEditing ? (
+                            <div className="msg-body msg-user-edit-body">
+                              {imgs.length > 0 && (
+                                <div className="msg-user-thumbs">
+                                  {imgs.map((a) => {
+                                    const src =
+                                      a.previewSrc ||
+                                      (a.path ? convertFileSrc(a.path) : "");
+                                    return src ? (
+                                      <span
+                                        key={a.path || a.name}
+                                        className="msg-user-thumb"
+                                      >
+                                        <img src={src} alt={a.name} />
+                                      </span>
+                                    ) : null;
+                                  })}
+                                </div>
+                              )}
+                              {files.length > 0 && (
+                                <div className="msg-user-files">
+                                  {files.map((a) => (
+                                    <span
+                                      key={a.path || a.name}
+                                      className="msg-user-file-chip"
+                                      title={a.path}
+                                    >
+                                      📎 {a.name}
+                                    </span>
+                                  ))}
+                                </div>
+                              )}
+                              <textarea
+                                ref={editTextareaRef}
+                                className="msg-user-edit-input"
+                                value={editDraft}
+                                rows={2}
+                                placeholder="Edit your message…"
+                                onChange={(e) => {
+                                  setEditDraft(e.target.value);
+                                  const el = e.target;
+                                  el.style.height = "auto";
+                                  el.style.height = `${Math.min(
+                                    el.scrollHeight,
+                                    200,
+                                  )}px`;
+                                }}
+                                onKeyDown={(e) => {
+                                  if (e.key === "Escape") {
+                                    e.preventDefault();
+                                    cancelEditUser();
+                                  } else if (
+                                    e.key === "Enter" &&
+                                    (e.metaKey || e.ctrlKey)
+                                  ) {
+                                    e.preventDefault();
+                                    void onResendEditedUser();
+                                  }
+                                }}
+                              />
+                              <div className="msg-user-edit-actions">
+                                <button
+                                  type="button"
+                                  className="msg-user-edit-cancel"
+                                  onClick={cancelEditUser}
+                                >
+                                  Cancel
+                                </button>
+                                <button
+                                  type="button"
+                                  className="msg-user-edit-send"
+                                  disabled={
+                                    !editDraft.trim() &&
+                                    (line.attachments?.length ?? 0) === 0
+                                  }
+                                  title="Send edited message and restart from here (⌘↵)"
+                                  onClick={() => void onResendEditedUser()}
+                                >
+                                  <IconSend size={13} />
+                                  Send
+                                </button>
+                              </div>
+                            </div>
+                          ) : (
+                            <>
+                              <div className="msg-body">
+                                {imgs.length > 0 && (
+                                  <div className="msg-user-thumbs">
+                                    {imgs.map((a) => {
+                                      const src =
+                                        a.previewSrc ||
+                                        (a.path ? convertFileSrc(a.path) : "");
+                                      return (
+                                        <a
+                                          key={a.path || a.name}
+                                          className="msg-user-thumb"
+                                          href={src || undefined}
+                                          title={a.name}
+                                          onClick={(e) => {
+                                            e.preventDefault();
+                                            if (a.path) {
+                                              void openUrl(
+                                                a.path.startsWith("file:")
+                                                  ? a.path
+                                                  : `file://${a.path}`,
+                                              ).catch(() => {});
+                                            }
+                                          }}
+                                        >
+                                          {src ? (
+                                            <img src={src} alt={a.name} />
+                                          ) : (
+                                            <span className="msg-user-file-chip">
+                                              {a.name}
+                                            </span>
+                                          )}
+                                        </a>
+                                      );
+                                    })}
+                                  </div>
+                                )}
+                                {files.length > 0 && (
+                                  <div className="msg-user-files">
+                                    {files.map((a) => (
+                                      <span
+                                        key={a.path || a.name}
+                                        className="msg-user-file-chip"
+                                        title={a.path}
+                                      >
+                                        📎 {a.name}
+                                      </span>
+                                    ))}
+                                  </div>
+                                )}
+                                {line.text ? (
+                                  <div className="msg-user-text">
+                                    {line.text}
+                                  </div>
+                                ) : null}
+                              </div>
+                              <div className="msg-user-meta">
+                                {canEdit && (
+                                  <button
+                                    type="button"
+                                    className="msg-user-edit-btn"
+                                    title="Edit and re-send from this message"
+                                    aria-label="Edit message"
+                                    onClick={() => beginEditUser(line)}
+                                  >
+                                    <IconPen size={12} />
+                                    Edit
+                                  </button>
+                                )}
+                                {timeLabel && (
+                                  <time
+                                    className="msg-user-time"
+                                    dateTime={line.at}
+                                    title={
+                                      line.at
+                                        ? new Date(line.at).toLocaleString()
+                                        : undefined
+                                    }
+                                  >
+                                    {timeLabel}
+                                  </time>
+                                )}
+                              </div>
+                            </>
+                          )}
+                        </div>
                       </div>
                     );
                   }
@@ -2815,6 +4272,17 @@ export default function App() {
                 <div ref={bottomRef} />
               </div>
               </div>
+              {showScrollToBottom && (
+                <button
+                  type="button"
+                  className="scroll-to-bottom-btn"
+                  title="Scroll to bottom"
+                  aria-label="Scroll to bottom"
+                  onClick={jumpToBottom}
+                >
+                  <IconChevronDown size={18} />
+                </button>
+              )}
             </div>
 
             <div className="composer-dock">
@@ -2894,12 +4362,42 @@ export default function App() {
                   </button>
                   <button
                     type="button"
-                    className={`access-toggle${autoApprove ? "" : " off"}`}
-                    onClick={() => setAutoApprove((v) => !v)}
-                    title="Auto-approve tools on next connect"
+                    className={`access-toggle access-mode-${permissionMode}${
+                      permissionMode === "ask" ? " off" : ""
+                    }`}
+                    onClick={() => cyclePermissionMode()}
+                    title={
+                      permissionMode === "always-approve"
+                        ? "Full trust: all tools auto-approved (saved). Click to cycle. New task/reconnect applies."
+                        : permissionMode === "auto"
+                          ? "Auto: engine may auto-allow low-risk tools (saved). Click to cycle. New task/reconnect applies."
+                          : "Needs approval: confirm each tool (saved). Click to cycle → Auto → Full trust."
+                    }
                   >
-                    {autoApprove ? "Auto-approve" : "Needs approval"}
+                    {permissionModeLabel(permissionMode)}
                   </button>
+                  {session && (
+                    <div
+                      className={contextMeterClass}
+                      title={
+                        contextFromEngine
+                          ? `Context: ${contextUsed.toLocaleString()} / ${contextWindow.toLocaleString()} tokens (engine-reported for this task)`
+                          : `Context (estimated from this task’s chat): ~${contextUsed.toLocaleString()} / ${contextWindow.toLocaleString()} tokens · set window in Settings`
+                      }
+                    >
+                      <div className="context-meter-track" aria-hidden>
+                        <div
+                          className="context-meter-fill"
+                          style={{ width: `${contextPct}%` }}
+                        />
+                      </div>
+                      <span className="context-meter-label">
+                        {formatTokenCount(contextUsed)}/
+                        {formatTokenCount(contextWindow)}
+                        {contextFromEngine ? "" : " ~"}
+                      </span>
+                    </div>
+                  )}
                 </div>
                 <div className="composer-right">
                   <select
@@ -2971,7 +4469,7 @@ export default function App() {
 
           {outputsOpen && (
             <aside className="right">
-              <div className="right-header" data-tauri-drag-region>
+              <div className="right-header" onMouseDown={onTitlebarMouseDown}>
                 <h2>Outputs</h2>
               </div>
 

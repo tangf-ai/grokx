@@ -77,12 +77,24 @@ button {
   min-height: 0;
   background: var(--sidebar);
   border-right: 1px solid var(--border);
-  padding: 18px 12px 14px;
+  padding: 0 12px 14px;
 }
 
-/* macOS overlay: only sidebar needs clearance for traffic lights. */
-html.platform-mac .sidebar {
+/* Top chrome under traffic lights: entire strip is a window drag region.
+   Drag is driven by data-tauri-drag-region="deep" (Tauri JS); CSS app-region
+   alone is unreliable in WKWebView for nested title/status text. */
+.sidebar-titlebar {
+  flex-shrink: 0;
+  padding: 18px 0 0;
+  cursor: default;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+html.platform-mac .sidebar-titlebar {
+  /* Clear traffic lights; keep drag surface continuous with main topbar. */
   padding-top: 36px;
+  min-height: 52px;
 }
 
 .brand-row {
@@ -90,8 +102,6 @@ html.platform-mac .sidebar {
   align-items: center;
   justify-content: space-between;
   padding: 4px 8px 18px;
-  app-region: drag;
-  -webkit-app-region: drag;
 }
 
 html.platform-mac .brand-row {
@@ -113,8 +123,6 @@ html.platform-mac .brand-row {
   background: transparent;
   padding: 0;
   cursor: pointer;
-  app-region: no-drag;
-  -webkit-app-region: no-drag;
 }
 
 .brand-btn:hover {
@@ -130,19 +138,6 @@ html.platform-mac .brand-row {
   color: var(--muted);
   display: grid;
   place-items: center;
-  app-region: no-drag;
-  -webkit-app-region: no-drag;
-}
-
-/* Interactive controls must remain clickable inside drag regions. */
-.topbar button,
-.topbar .btn,
-.topbar a,
-.topbar input,
-.topbar select,
-.right-header button {
-  app-region: no-drag;
-  -webkit-app-region: no-drag;
 }
 
 .icon-btn.active {
@@ -259,12 +254,12 @@ html.platform-mac .brand-row {
   cursor: not-allowed;
 }
 
-/* Projects (concrete path) sit above Tasks (temporary) */
+/* ─── Projects (folder containers) vs Tasks (chat sessions) ─── */
 .project-list {
-  max-height: 36%;
+  max-height: 48%;
   overflow: auto;
   min-height: 0;
-  padding-bottom: 4px;
+  padding-bottom: 6px;
   flex-shrink: 0;
 }
 
@@ -277,40 +272,64 @@ html.platform-mac .brand-row {
   border-radius: 8px;
 }
 
+.project-block {
+  margin-bottom: 6px;
+}
+
+/* Project = heavier “folder” card */
 .project-row {
   display: block;
   width: 100%;
   text-align: left;
-  background: transparent;
-  border: none;
-  border-radius: 10px;
+  background: #e9e9ee;
+  border: 1px solid rgba(0, 0, 0, 0.06);
+  border-radius: 12px;
   color: var(--text);
-  padding: 8px 12px;
-  margin-bottom: 2px;
+  padding: 9px 10px 9px 10px;
+  margin-bottom: 0;
   cursor: pointer;
 }
 
 .project-row:hover {
-  background: rgba(0, 0, 0, 0.05);
+  background: #e2e2e8;
+  border-color: rgba(0, 0, 0, 0.08);
 }
 
 .project-row.active {
-  background: rgba(0, 0, 0, 0.07);
+  background: #dedee5;
+  border-color: rgba(255, 90, 31, 0.35);
   box-shadow: inset 3px 0 0 var(--accent);
 }
 
 .project-row-main {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 7px;
   min-width: 0;
+}
+
+.project-icon {
+  flex-shrink: 0;
+  width: 22px;
+  height: 22px;
+  border-radius: 7px;
+  background: rgba(255, 255, 255, 0.7);
+  color: #5c5c66;
+  display: grid;
+  place-items: center;
+}
+
+.project-row.active .project-icon {
+  background: var(--accent-soft);
+  color: var(--accent);
 }
 
 .project-title {
   flex: 1;
   min-width: 0;
   font-size: 13px;
-  font-weight: 600;
+  font-weight: 700;
+  letter-spacing: -0.01em;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -322,26 +341,46 @@ html.platform-mac .brand-row {
   height: 18px;
   padding: 0 5px;
   border-radius: 9px;
-  background: rgba(0, 0, 0, 0.06);
+  background: rgba(255, 255, 255, 0.65);
   color: var(--muted);
   font-size: 11px;
-  font-weight: 600;
+  font-weight: 650;
   display: grid;
   place-items: center;
 }
 
 .project-row.active .project-count {
-  background: rgba(0, 0, 0, 0.1);
+  background: rgba(255, 255, 255, 0.85);
   color: var(--text);
 }
 
-.project-meta {
-  font-size: 11px;
-  color: var(--muted);
-  margin-top: 2px;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
+.project-add-task-btn,
+.project-delete-btn {
+  opacity: 0;
+}
+
+.project-row:hover .project-add-task-btn,
+.project-row:hover .project-delete-btn,
+.project-row.active .project-add-task-btn,
+.project-row.active .project-delete-btn {
+  opacity: 1;
+}
+
+/* Path under project name is intentionally hidden — keep sidebar clean. */
+
+/* Nested tasks under the selected project */
+.project-tasks {
+  margin: 4px 0 2px 8px;
+  padding: 4px 0 2px 8px;
+  border-left: 2px solid rgba(0, 0, 0, 0.08);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.session-empty-nested {
+  padding: 6px 10px;
+  font-size: 12px;
 }
 
 .session-list {
@@ -366,30 +405,76 @@ html.platform-mac .brand-row {
   color: var(--muted);
 }
 
-.session-row {
+/* Task = lighter “session” chip (distinct from project folder card) */
+.session-row,
+.task-row {
   display: block;
   width: 100%;
   text-align: left;
   background: transparent;
-  border: none;
+  border: 1px solid transparent;
   border-radius: 10px;
   color: var(--text);
-  padding: 10px 12px;
+  padding: 8px 10px;
   margin-bottom: 2px;
   cursor: pointer;
 }
 
-.session-row:hover {
-  background: rgba(0, 0, 0, 0.05);
+.session-row:hover,
+.task-row:hover {
+  background: rgba(255, 255, 255, 0.72);
+  border-color: rgba(0, 0, 0, 0.05);
 }
 
-.session-row.active {
-  background: rgba(0, 0, 0, 0.07);
-  box-shadow: inset 3px 0 0 var(--accent);
+.session-row.active,
+.task-row.active {
+  background: #fff;
+  border-color: rgba(255, 90, 31, 0.28);
+  box-shadow: inset 2px 0 0 var(--accent);
 }
 
-.session-row.active .session-title {
+.session-row.active .session-title,
+.task-row.active .session-title {
   color: var(--text);
+  font-weight: 650;
+}
+
+.session-row.nested {
+  padding: 7px 8px 7px 8px;
+  margin-bottom: 0;
+  background: rgba(255, 255, 255, 0.45);
+  border-radius: 9px;
+}
+
+.session-row.nested:hover {
+  background: rgba(255, 255, 255, 0.9);
+}
+
+.session-row.nested.active {
+  background: #fff;
+}
+
+.task-icon {
+  flex-shrink: 0;
+  width: 18px;
+  height: 18px;
+  color: var(--muted-2);
+  display: grid;
+  place-items: center;
+}
+
+.session-row.active .task-icon,
+.task-row.active .task-icon {
+  color: var(--accent);
+}
+
+/* Active task is streaming / running tools */
+.session-row.working {
+  background: var(--accent-soft);
+}
+
+.session-row.working.active {
+  box-shadow: inset 3px 0 0 var(--accent);
 }
 
 .session-row-main {
@@ -407,6 +492,23 @@ html.platform-mac .brand-row {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+/* Compact working indicator: single spinning ring (no second row / badge). */
+.session-working-spin {
+  flex-shrink: 0;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  border: 2px solid rgba(255, 90, 31, 0.25);
+  border-top-color: var(--accent);
+  animation: session-working-spin 0.7s linear infinite;
+}
+
+@keyframes session-working-spin {
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 .session-action-btn,
@@ -461,13 +563,21 @@ html.platform-mac .brand-row {
   box-shadow: 0 0 0 3px rgba(0, 0, 0, 0.04);
 }
 
+/* Only show meta for live working status; hide paths to reduce clutter. */
 .session-meta {
+  display: none;
   font-size: 11px;
   color: var(--muted);
   margin-top: 3px;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+.session-meta.working-only {
+  display: block;
+  color: var(--accent);
+  font-weight: 500;
 }
 
 .sidebar-bottom {
@@ -539,14 +649,22 @@ html.platform-mac .brand-row {
   background: rgba(255, 255, 255, 0.9);
   backdrop-filter: blur(10px);
   flex-shrink: 0;
-  app-region: drag;
-  -webkit-app-region: drag;
+  /* Drag via data-tauri-drag-region="deep"; buttons stay clickable (Tauri skips them). */
+  cursor: default;
+  user-select: none;
+  -webkit-user-select: none;
 }
 
 /* Overlay title bar: main chrome flush to window top (traffic lights are over sidebar only). */
 html.platform-mac .topbar {
   padding-top: 10px;
   padding-bottom: 10px;
+  min-height: 52px;
+}
+
+.topbar-main {
+  min-width: 0;
+  flex: 1;
 }
 
 .topbar-actions {
@@ -554,8 +672,10 @@ html.platform-mac .topbar {
   align-items: center;
   gap: 8px;
   flex-shrink: 0;
-  app-region: no-drag;
-  -webkit-app-region: no-drag;
+}
+
+.topbar-actions .status-pill {
+  cursor: default;
 }
 
 .topbar-outputs-toggle {
@@ -593,6 +713,31 @@ html.platform-mac .topbar {
   border: 1px solid var(--border);
   border-radius: 999px;
   padding: 5px 10px;
+  font: inherit;
+  cursor: default;
+}
+
+/* Disconnected: status pill is the recovery affordance (replaces sidebar Reconnect). */
+button.status-pill {
+  appearance: none;
+  -webkit-appearance: none;
+}
+
+button.status-pill:disabled {
+  opacity: 1;
+  cursor: default;
+}
+
+.status-pill-action {
+  cursor: pointer;
+  color: var(--text);
+  border-color: #d0d0d6;
+}
+
+.status-pill-action:hover:not(:disabled) {
+  background: #fff;
+  border-color: var(--accent);
+  color: var(--accent);
 }
 
 .status-dot {
@@ -620,6 +765,43 @@ html.platform-mac .topbar {
   flex-direction: column;
 }
 
+/* Sit just above the floating composer (not on top of it). */
+.scroll-to-bottom-btn {
+  position: absolute;
+  left: 50%;
+  /* composer bottom 18px + typical dock height ~110px + gap */
+  bottom: calc(18px + 118px);
+  z-index: 6;
+  transform: translateX(-50%);
+  width: 36px;
+  height: 36px;
+  border: 1px solid var(--border);
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.96);
+  color: var(--muted);
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.1);
+  display: grid;
+  place-items: center;
+  cursor: pointer;
+  padding: 0;
+}
+
+.scroll-to-bottom-btn:hover {
+  color: var(--text);
+  border-color: #d0d0d6;
+  background: #fff;
+  box-shadow: 0 8px 22px rgba(0, 0, 0, 0.12);
+}
+
+.scroll-to-bottom-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.scroll-to-bottom-btn svg {
+  display: block;
+}
+
 .chat-scroll {
   position: relative;
   flex: 1;
@@ -635,27 +817,28 @@ html.platform-mac .topbar {
   margin: 0 auto;
 }
 
-/* Overlay user prompt while scrolling through replies (fixed to pane, not scroll flow). */
+/* Overlay user prompt — right-aligned like chat user bubbles. */
 .user-sticky-bar {
   position: absolute;
   top: 12px;
-  left: 50%;
-  transform: translateX(-50%);
+  right: 24px;
+  left: auto;
   z-index: 5;
   display: flex;
   align-items: center;
+  justify-content: flex-end;
   gap: 10px;
-  width: min(var(--content-max), calc(100% - 48px));
-  max-width: var(--content-max);
+  /* Match user bubble max width; hug the right edge of the chat pane. */
+  width: auto;
+  max-width: min(var(--content-max), calc(100% - 48px), 560px);
   margin: 0;
   padding: 10px 14px;
   border: 1px solid var(--border);
-  border-radius: 14px;
-  background: rgba(255, 255, 255, 0.94);
-  /* blur on every scroll frame is expensive / janky on trackpad */
+  border-radius: 16px 16px 4px 16px;
+  background: rgba(255, 255, 255, 0.96);
   box-shadow: 0 6px 20px rgba(0, 0, 0, 0.06);
   cursor: pointer;
-  text-align: left;
+  text-align: right;
   color: var(--text);
   pointer-events: auto;
 }
@@ -667,6 +850,7 @@ html.platform-mac .topbar {
 
 .user-sticky-label {
   flex-shrink: 0;
+  order: 2;
   font-size: 11px;
   font-weight: 700;
   color: var(--accent);
@@ -679,16 +863,19 @@ html.platform-mac .topbar {
 .user-sticky-text {
   flex: 1;
   min-width: 0;
+  order: 1;
   font-size: 13px;
   line-height: 1.4;
   color: var(--text);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+  text-align: right;
 }
 
 .user-sticky-jump {
   flex-shrink: 0;
+  order: 3;
   font-size: 12px;
   font-weight: 600;
   color: var(--muted);
@@ -753,6 +940,14 @@ html.platform-mac .topbar {
   word-break: break-word;
 }
 
+.msg-user-stack {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 4px;
+  max-width: min(85%, 560px);
+}
+
 .msg-user .msg-body {
   background: var(--user-bubble);
   border-radius: 16px 16px 4px 16px;
@@ -760,9 +955,225 @@ html.platform-mac .topbar {
   font-size: 14.5px;
   line-height: 1.5;
   color: var(--text);
-  text-align: left;
+  text-align: right;
   box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
+  max-width: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 8px;
+}
+
+.msg-user-text {
   white-space: pre-wrap;
+  word-break: break-word;
+  text-align: right;
+}
+
+.msg-user-thumbs {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 6px;
+  max-width: 100%;
+}
+
+.msg-user-thumb {
+  display: block;
+  width: 120px;
+  height: 120px;
+  border-radius: 12px;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  background: #fff;
+  flex-shrink: 0;
+  cursor: pointer;
+  padding: 0;
+}
+
+.msg-user-thumb img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+.msg-user-files {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+.msg-user-file-chip {
+  display: inline-flex;
+  align-items: center;
+  max-width: 220px;
+  padding: 4px 8px;
+  border-radius: 999px;
+  background: rgba(0, 0, 0, 0.05);
+  font-size: 12px;
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Edit + time under the user bubble */
+.msg-user-meta {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 0 2px;
+  min-height: 18px;
+}
+
+.msg-user-edit-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  border: none;
+  background: transparent;
+  color: var(--muted-2);
+  font-size: 11px;
+  font-weight: 500;
+  line-height: 1;
+  padding: 2px 6px;
+  border-radius: 6px;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.12s ease, color 0.12s ease, background 0.12s ease;
+}
+
+.msg-user-stack:hover .msg-user-edit-btn,
+.msg-user-edit-btn:focus-visible {
+  opacity: 1;
+}
+
+.msg-user-edit-btn:hover {
+  color: var(--text);
+  background: var(--chip);
+}
+
+.msg-user-edit-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.msg-user-edit-btn svg {
+  display: block;
+  flex-shrink: 0;
+}
+
+.msg-user-time {
+  display: block;
+  padding: 0 2px;
+  font-size: 11px;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+  color: var(--muted-2);
+  line-height: 1;
+  user-select: none;
+}
+
+/* Inline edit mode for a past user prompt */
+.msg-user-editing .msg-body,
+.msg-user-edit-body {
+  align-items: stretch !important;
+  text-align: left !important;
+  min-width: min(100%, 320px);
+  width: min(100%, 480px);
+  max-width: 100%;
+  gap: 8px;
+  box-shadow: 0 0 0 2px rgba(0, 0, 0, 0.06);
+}
+
+.msg-user-edit-input {
+  width: 100%;
+  min-height: 56px;
+  max-height: 200px;
+  resize: none;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: #fff;
+  color: var(--text);
+  font: inherit;
+  font-size: 14px;
+  line-height: 1.45;
+  padding: 8px 10px;
+  text-align: left;
+  outline: none;
+  box-sizing: border-box;
+}
+
+.msg-user-edit-input:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px rgba(0, 0, 0, 0.04);
+}
+
+.msg-user-edit-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 2px;
+}
+
+.msg-user-edit-cancel {
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  font-size: 12.5px;
+  font-weight: 500;
+  padding: 6px 10px;
+  border-radius: 8px;
+  cursor: pointer;
+}
+
+.msg-user-edit-cancel:hover {
+  color: var(--text);
+  background: var(--chip);
+}
+
+.msg-user-edit-send {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  border: none;
+  background: var(--text);
+  color: #fff;
+  font-size: 12.5px;
+  font-weight: 600;
+  padding: 6px 12px;
+  border-radius: 999px;
+  cursor: pointer;
+}
+
+.msg-user-edit-send:hover:not(:disabled) {
+  opacity: 0.9;
+}
+
+.msg-user-edit-send:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.msg-user-edit-send svg {
+  display: block;
+}
+
+.msg-assistant {
+  flex-direction: column;
+  align-items: stretch;
+}
+
+.msg-assistant-wrap {
+  width: 100%;
+  max-width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
 }
 
 .msg-assistant .msg-body {
@@ -773,6 +1184,79 @@ html.platform-mac .topbar {
   max-width: 100%;
   /* Markdown owns spacing — do not use pre-wrap (doubles blank lines). */
   white-space: normal;
+}
+
+.msg-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 2px;
+  opacity: 0.55;
+  transition: opacity 0.15s ease;
+}
+
+.msg-assistant-wrap:hover .msg-actions,
+.msg-actions:focus-within {
+  opacity: 1;
+}
+
+.msg-copy-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 1;
+  padding: 5px 8px;
+  border-radius: 8px;
+  cursor: pointer;
+}
+
+.msg-copy-btn:hover {
+  color: var(--text);
+  background: var(--chip);
+  border-color: var(--border);
+}
+
+.msg-copy-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.msg-copy-btn-done {
+  color: #248a3d;
+}
+
+.msg-copy-btn-done:hover {
+  color: #248a3d;
+}
+
+.msg-copy-btn svg {
+  display: block;
+  flex-shrink: 0;
+}
+
+.msg-metrics {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: 4px;
+  padding-left: 10px;
+  border-left: 1px solid var(--border);
+  font-size: 11px;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+  color: var(--muted-2);
+  letter-spacing: 0.01em;
+  cursor: default;
+  user-select: none;
+}
+
+.msg-metric {
+  white-space: nowrap;
 }
 
 .msg-thought .msg-body {
@@ -1314,15 +1798,87 @@ html.platform-mac .topbar {
   font-weight: 600;
   padding: 4px 6px;
   border-radius: 8px;
+  white-space: nowrap;
 }
 
 .access-toggle:hover {
   background: var(--accent-soft);
 }
 
-.access-toggle.off {
+.access-toggle.off,
+.access-toggle.access-mode-ask {
   color: var(--muted);
   font-weight: 500;
+}
+
+.access-toggle.access-mode-auto {
+  color: #b36b00;
+}
+
+.access-toggle.access-mode-always-approve {
+  color: var(--accent);
+  font-weight: 700;
+}
+
+/* Session context usage next to Auto-approve */
+.context-meter {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  max-width: 148px;
+  margin-left: 2px;
+  padding: 3px 8px 3px 6px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--chip);
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 550;
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+  cursor: default;
+  user-select: none;
+  flex-shrink: 1;
+  min-width: 0;
+}
+
+.context-meter-track {
+  width: 36px;
+  height: 4px;
+  border-radius: 999px;
+  background: rgba(0, 0, 0, 0.08);
+  overflow: hidden;
+  flex-shrink: 0;
+}
+
+.context-meter-fill {
+  height: 100%;
+  border-radius: inherit;
+  background: #34c759;
+  transition: width 0.25s ease;
+}
+
+.context-meter.mid .context-meter-fill {
+  background: #ff9f0a;
+}
+
+.context-meter.high .context-meter-fill {
+  background: var(--error, #d70015);
+}
+
+.context-meter.mid {
+  color: #b36b00;
+}
+
+.context-meter.high {
+  color: var(--error, #d70015);
+}
+
+.context-meter-label {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
 }
 
 .model-label {
@@ -1373,14 +1929,9 @@ html.platform-mac .right {
   gap: 8px;
   margin-bottom: 12px;
   min-height: 28px;
-  app-region: drag;
-  -webkit-app-region: drag;
-}
-
-.right-header .icon-btn,
-.right-header button {
-  app-region: no-drag;
-  -webkit-app-region: no-drag;
+  cursor: default;
+  user-select: none;
+  -webkit-user-select: none;
 }
 
 .right-header h2 {

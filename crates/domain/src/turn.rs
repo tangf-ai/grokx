@@ -70,6 +70,12 @@ pub enum AppEvent {
         session_id: SessionId,
         state: TurnState,
     },
+    /// Session context usage from engine `_meta.totalTokens` when available.
+    ContextUsage {
+        session_id: SessionId,
+        /// Accumulated tokens used in the session (engine-reported).
+        used_tokens: u64,
+    },
     AgentError {
         message: String,
     },

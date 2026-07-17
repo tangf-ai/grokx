@@ -4,22 +4,44 @@ use domain::{
 };
 use serde_json::Value;
 
+/// Pull `totalTokens` from ACP update / notification `_meta` when present.
+fn extract_total_tokens(update: &Value, params: Option<&Value>) -> Option<u64> {
+    let from_meta = |meta: Option<&Value>| -> Option<u64> {
+        meta?.get("totalTokens")
+            .or_else(|| meta?.get("total_tokens"))
+            .and_then(|v| v.as_u64())
+    };
+    from_meta(update.get("_meta"))
+        .or_else(|| from_meta(update.get("meta")))
+        .or_else(|| from_meta(params.and_then(|p| p.get("_meta"))))
+        .or_else(|| from_meta(params.and_then(|p| p.get("meta"))))
+}
+
 /// Map a subset of ACP `session/update` payloads into app events.
 /// Returns an empty list when the update type is unknown (forward-compatible).
-pub fn map_session_update(session_id: SessionId, update: &Value) -> Vec<AppEvent> {
+///
+/// `params` is the full notification params (may carry `_meta.totalTokens`).
+pub fn map_session_update(
+    session_id: SessionId,
+    update: &Value,
+    params: Option<&Value>,
+) -> Vec<AppEvent> {
     let kind = update
         .get("sessionUpdate")
         .or_else(|| update.get("session_update"))
         .and_then(|v| v.as_str())
         .unwrap_or("");
 
-    match kind {
+    let mut events = match kind {
         "agent_message_chunk" => {
             let text = extract_text(update).unwrap_or_default();
             if text.is_empty() {
                 vec![]
             } else {
-                vec![AppEvent::MessageDelta { session_id, text }]
+                vec![AppEvent::MessageDelta {
+                    session_id: session_id.clone(),
+                    text,
+                }]
             }
         }
         "agent_thought_chunk" => {
@@ -27,7 +49,10 @@ pub fn map_session_update(session_id: SessionId, update: &Value) -> Vec<AppEvent
             if text.is_empty() {
                 vec![]
             } else {
-                vec![AppEvent::ThoughtDelta { session_id, text }]
+                vec![AppEvent::ThoughtDelta {
+                    session_id: session_id.clone(),
+                    text,
+                }]
             }
         }
         "tool_call" => {
@@ -50,7 +75,10 @@ pub fn map_session_update(session_id: SessionId, update: &Value) -> Vec<AppEvent
                     .or_else(|| update.get("input").cloned()),
                 output_preview: None,
             };
-            vec![AppEvent::ToolStarted { session_id, tool }]
+            vec![AppEvent::ToolStarted {
+                session_id: session_id.clone(),
+                tool,
+            }]
         }
         "tool_call_update" => {
             let status = update
@@ -77,7 +105,10 @@ pub fn map_session_update(session_id: SessionId, update: &Value) -> Vec<AppEvent
                     .or_else(|| update.get("input").cloned()),
                 output_preview: extract_tool_output(update),
             };
-            vec![AppEvent::ToolUpdated { session_id, tool }]
+            vec![AppEvent::ToolUpdated {
+                session_id: session_id.clone(),
+                tool,
+            }]
         }
         "plan" => {
             let steps = update
@@ -94,10 +125,22 @@ pub fn map_session_update(session_id: SessionId, update: &Value) -> Vec<AppEvent
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default();
-            vec![AppEvent::PlanUpdated { session_id, steps }]
+            vec![AppEvent::PlanUpdated {
+                session_id: session_id.clone(),
+                steps,
+            }]
         }
         _ => vec![],
+    };
+
+    if let Some(used) = extract_total_tokens(update, params) {
+        events.push(AppEvent::ContextUsage {
+            session_id,
+            used_tokens: used,
+        });
     }
+
+    events
 }
 
 /// Map a `session/request_permission` params object into a UI event.
@@ -247,12 +290,34 @@ mod tests {
                 "sessionUpdate": "agent_message_chunk",
                 "content": { "text": "hello" }
             }),
+            None,
         );
         assert_eq!(events.len(), 1);
         match &events[0] {
             AppEvent::MessageDelta { text, .. } => assert_eq!(text, "hello"),
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    #[test]
+    fn maps_context_usage_from_meta() {
+        let sid = SessionId::new();
+        let events = map_session_update(
+            sid,
+            &json!({
+                "sessionUpdate": "agent_message_chunk",
+                "content": { "text": "hi" },
+                "_meta": { "totalTokens": 1234u64 }
+            }),
+            None,
+        );
+        assert!(events.iter().any(|e| matches!(
+            e,
+            AppEvent::ContextUsage {
+                used_tokens: 1234,
+                ..
+            }
+        )));
     }
 
     #[test]
@@ -266,6 +331,7 @@ mod tests {
                 "status": "completed",
                 "title": "read_file"
             }),
+            None,
         );
         assert_eq!(events.len(), 1);
         match &events[0] {

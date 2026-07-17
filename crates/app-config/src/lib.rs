@@ -132,6 +132,44 @@ pub struct UserSettings {
     /// Also write endpoint into ~/.grok/config.toml so the engine picks it up.
     #[serde(default = "default_true")]
     pub sync_to_grok_config: bool,
+    /// Tool permission mode: `ask` | `auto` | `always-approve` (full trust).
+    #[serde(default = "default_permission_mode")]
+    pub permission_mode: String,
+    /// Legacy bool (older settings.json). Migrated into `permission_mode` on load.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_approve: Option<bool>,
+}
+
+fn default_permission_mode() -> String {
+    "ask".into()
+}
+
+/// Canonical permission modes used by Grokx + engine `[ui].permission_mode`.
+pub mod permission_modes {
+    pub const ASK: &str = "ask";
+    pub const AUTO: &str = "auto";
+    pub const ALWAYS_APPROVE: &str = "always-approve";
+
+    pub fn normalize(raw: &str) -> &'static str {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "auto" => AUTO,
+            "always-approve" | "always_approve" | "yolo" | "full-trust" | "full_trust"
+            | "trusted" => ALWAYS_APPROVE,
+            _ => ASK,
+        }
+    }
+
+    pub fn is_full_trust(mode: &str) -> bool {
+        normalize(mode) == ALWAYS_APPROVE
+    }
+
+    pub fn label(mode: &str) -> &'static str {
+        match normalize(mode) {
+            AUTO => "Auto",
+            ALWAYS_APPROVE => "Full trust",
+            _ => "Needs approval",
+        }
+    }
 }
 
 fn default_true() -> bool {
@@ -153,6 +191,8 @@ impl UserSettings {
             effort: Some("medium".into()),
             endpoint: ModelEndpointSettings::default(),
             sync_to_grok_config: true,
+            permission_mode: default_permission_mode(),
+            auto_approve: None,
         }
     }
 
@@ -166,7 +206,25 @@ impl UserSettings {
         if s.endpoint.model_id.is_empty() {
             s.endpoint.model_id = "grok-4.5".into();
         }
+        // Migrate legacy auto_approve bool → permission_mode.
+        if let Some(true) = s.auto_approve {
+            if s.permission_mode.trim().is_empty()
+                || s.permission_mode == default_permission_mode()
+            {
+                s.permission_mode = permission_modes::ALWAYS_APPROVE.into();
+            }
+        }
+        s.permission_mode = permission_modes::normalize(&s.permission_mode).into();
+        s.auto_approve = None;
         Ok(s)
+    }
+
+    pub fn permission_mode_normalized(&self) -> &'static str {
+        permission_modes::normalize(&self.permission_mode)
+    }
+
+    pub fn is_full_trust(&self) -> bool {
+        permission_modes::is_full_trust(&self.permission_mode)
     }
 
     pub fn save(&self, path: impl AsRef<Path>) -> Result<(), ConfigError> {
@@ -198,6 +256,9 @@ impl UserSettings {
             model: self.model.clone(),
             effort: self.effort.clone(),
             sync_to_grok_config: self.sync_to_grok_config,
+            permission_mode: self.permission_mode_normalized().to_string(),
+            // Legacy mirror for older UI builds.
+            auto_approve: self.is_full_trust(),
             endpoint: PublicEndpointSettings {
                 model_id: self.endpoint.model_id.clone(),
                 name: self.endpoint.name.clone(),
@@ -267,6 +328,62 @@ impl UserSettings {
         std::fs::write(path, merged)?;
         Ok(())
     }
+
+    /// Sync this app's permission mode into ~/.grok/config.toml for the engine.
+    pub fn sync_permission_mode_to_grok_toml(&self) -> Result<(), ConfigError> {
+        self.apply_engine_permission_mode(self.permission_mode_normalized())
+    }
+
+    /// Write a specific mode into ~/.grok/config.toml (used at agent spawn).
+    pub fn apply_engine_permission_mode(&self, mode: &str) -> Result<(), ConfigError> {
+        let mode = permission_modes::normalize(mode);
+        let yolo = mode == permission_modes::ALWAYS_APPROVE;
+        self.write_ui_permission_mode(mode, yolo)
+    }
+
+    /// Force the engine to ask for tool permissions (overrides always-approve in config).
+    pub fn force_permission_mode_ask(&self) -> Result<(), ConfigError> {
+        self.apply_engine_permission_mode(permission_modes::ASK)
+    }
+
+    /// Force engine YOLO / always-approve in ~/.grok/config.toml.
+    pub fn force_permission_mode_always_approve(&self) -> Result<(), ConfigError> {
+        self.apply_engine_permission_mode(permission_modes::ALWAYS_APPROVE)
+    }
+
+    fn write_ui_permission_mode(&self, mode: &str, yolo: bool) -> Result<(), ConfigError> {
+        let path = AppPaths::grok_cli_config();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let existing = if path.is_file() {
+            std::fs::read_to_string(&path)?
+        } else {
+            String::new()
+        };
+        let mut lines: Vec<String> = existing.lines().map(|s| s.to_string()).collect();
+        if !lines.is_empty() && !lines.last().map(|s| s.is_empty()).unwrap_or(false) {
+            lines.push(String::new());
+        }
+        upsert_toml_section_key(
+            &mut lines,
+            "ui",
+            "permission_mode",
+            &format!("\"{mode}\""),
+        );
+        upsert_toml_section_key(
+            &mut lines,
+            "ui",
+            "yolo",
+            if yolo { "true" } else { "false" },
+        );
+        let mut out = lines.join("\n");
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+        std::fs::write(path, out)?;
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -289,6 +406,12 @@ pub struct PublicUserSettings {
     pub model: Option<String>,
     pub effort: Option<String>,
     pub sync_to_grok_config: bool,
+    /// `ask` | `auto` | `always-approve`
+    #[serde(default = "default_permission_mode")]
+    pub permission_mode: String,
+    /// Legacy mirror: true when mode is full trust.
+    #[serde(default)]
+    pub auto_approve: bool,
     pub endpoint: PublicEndpointSettings,
     pub grok_config_path: String,
 }
@@ -301,6 +424,10 @@ pub struct SettingsUpdate {
     pub model: Option<String>,
     pub effort: Option<String>,
     pub sync_to_grok_config: Option<bool>,
+    /// Preferred: `ask` | `auto` | `always-approve`
+    pub permission_mode: Option<String>,
+    /// Legacy: maps to always-approve when true, ask when false (if permission_mode omitted).
+    pub auto_approve: Option<bool>,
     pub endpoint_model_id: Option<String>,
     pub endpoint_name: Option<String>,
     pub endpoint_base_url: Option<String>,
@@ -333,6 +460,17 @@ impl UserSettings {
         }
         if let Some(v) = u.sync_to_grok_config {
             self.sync_to_grok_config = v;
+        }
+        if let Some(v) = u.permission_mode {
+            self.permission_mode = permission_modes::normalize(&v).into();
+            self.auto_approve = None;
+        } else if let Some(v) = u.auto_approve {
+            self.permission_mode = if v {
+                permission_modes::ALWAYS_APPROVE.into()
+            } else {
+                permission_modes::ASK.into()
+            };
+            self.auto_approve = None;
         }
         if let Some(v) = u.endpoint_model_id {
             if !v.trim().is_empty() {
