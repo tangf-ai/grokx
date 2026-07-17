@@ -1,5 +1,5 @@
 {
-  "app_version": "0.1.2",
+  "app_version": "0.1.3",
   "engine_name": "grok-build",
   "engine_version": "subtree",
   "engine_commit": "8cf69e306284c944b0766206924c02ef2ec38c9f",

@@ -61,8 +61,9 @@ button {
   background: var(--bg);
 }
 
+/* Collapsed: no right rail at all (toggle lives in topbar far right). */
 .layout.layout-outputs-collapsed {
-  grid-template-columns: 248px minmax(0, 1fr) 44px;
+  grid-template-columns: 248px minmax(0, 1fr);
 }
 
 .layout.layout-settings {
@@ -79,11 +80,23 @@ button {
   padding: 18px 12px 14px;
 }
 
+/* macOS overlay: only sidebar needs clearance for traffic lights. */
+html.platform-mac .sidebar {
+  padding-top: 36px;
+}
+
 .brand-row {
   display: flex;
   align-items: center;
   justify-content: space-between;
   padding: 4px 8px 18px;
+  app-region: drag;
+  -webkit-app-region: drag;
+}
+
+html.platform-mac .brand-row {
+  /* Leave room for traffic lights on the left of the brand row. */
+  padding-left: 72px;
 }
 
 .brand {
@@ -100,6 +113,8 @@ button {
   background: transparent;
   padding: 0;
   cursor: pointer;
+  app-region: no-drag;
+  -webkit-app-region: no-drag;
 }
 
 .brand-btn:hover {
@@ -115,6 +130,19 @@ button {
   color: var(--muted);
   display: grid;
   place-items: center;
+  app-region: no-drag;
+  -webkit-app-region: no-drag;
+}
+
+/* Interactive controls must remain clickable inside drag regions. */
+.topbar button,
+.topbar .btn,
+.topbar a,
+.topbar input,
+.topbar select,
+.right-header button {
+  app-region: no-drag;
+  -webkit-app-region: no-drag;
 }
 
 .icon-btn.active {
@@ -454,9 +482,41 @@ button {
 }
 
 .sidebar-meta {
-  padding: 4px 12px 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 4px 8px 0 12px;
   font-size: 11px;
   color: var(--muted-2);
+}
+
+.sidebar-version {
+  min-width: 0;
+}
+
+.sidebar-github-btn {
+  flex-shrink: 0;
+  width: 26px;
+  height: 26px;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--muted);
+  display: grid;
+  place-items: center;
+  padding: 0;
+  cursor: pointer;
+}
+
+.sidebar-github-btn:hover {
+  color: var(--text);
+  background: rgba(0, 0, 0, 0.06);
+}
+
+.sidebar-github-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
 }
 
 /* ─── Main ─── */
@@ -474,10 +534,32 @@ button {
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  padding: 14px 22px;
+  padding: 14px 16px 14px 22px;
   border-bottom: 1px solid var(--border-soft);
   background: rgba(255, 255, 255, 0.9);
   backdrop-filter: blur(10px);
+  flex-shrink: 0;
+  app-region: drag;
+  -webkit-app-region: drag;
+}
+
+/* Overlay title bar: main chrome flush to window top (traffic lights are over sidebar only). */
+html.platform-mac .topbar {
+  padding-top: 10px;
+  padding-bottom: 10px;
+}
+
+.topbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+  app-region: no-drag;
+  -webkit-app-region: no-drag;
+}
+
+.topbar-outputs-toggle {
+  flex-shrink: 0;
 }
 
 .topbar-title {
@@ -529,10 +611,22 @@ button {
   box-shadow: 0 0 0 3px var(--accent-soft);
 }
 
+/* Chat column: scroll lives here; sticky bar overlays (does not affect scrollHeight). */
+.chat-pane {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
 .chat-scroll {
   position: relative;
   flex: 1;
+  min-height: 0;
   overflow: auto;
+  overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
   padding: 28px 24px 150px;
 }
 
@@ -541,31 +635,29 @@ button {
   margin: 0 auto;
 }
 
-.chat-inner-sticky {
-  /* room under sticky bar so first lines aren't hidden while sticky shows */
-  padding-top: 4px;
-}
-
-/* Sticky user prompt while scrolling through replies */
+/* Overlay user prompt while scrolling through replies (fixed to pane, not scroll flow). */
 .user-sticky-bar {
-  position: sticky;
-  top: 0;
-  z-index: 4;
+  position: absolute;
+  top: 12px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 5;
   display: flex;
   align-items: center;
   gap: 10px;
-  width: min(var(--content-max), 100%);
+  width: min(var(--content-max), calc(100% - 48px));
   max-width: var(--content-max);
-  margin: -12px auto 14px;
+  margin: 0;
   padding: 10px 14px;
   border: 1px solid var(--border);
   border-radius: 14px;
-  background: rgba(255, 255, 255, 0.92);
-  backdrop-filter: blur(12px);
+  background: rgba(255, 255, 255, 0.94);
+  /* blur on every scroll frame is expensive / janky on trackpad */
   box-shadow: 0 6px 20px rgba(0, 0, 0, 0.06);
   cursor: pointer;
   text-align: left;
   color: var(--text);
+  pointer-events: auto;
 }
 
 .user-sticky-bar:hover {
@@ -1269,12 +1361,26 @@ button {
   min-height: 0;
 }
 
+html.platform-mac .right {
+  /* Match main topbar — no tall empty band under the window edge. */
+  padding-top: 10px;
+}
+
 .right-header {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 8px;
   margin-bottom: 12px;
+  min-height: 28px;
+  app-region: drag;
+  -webkit-app-region: drag;
+}
+
+.right-header .icon-btn,
+.right-header button {
+  app-region: no-drag;
+  -webkit-app-region: no-drag;
 }
 
 .right-header h2 {
@@ -1289,21 +1395,6 @@ button {
   font-size: 13px;
   font-weight: 650;
   color: var(--text);
-}
-
-.right-collapsed {
-  border-left: 1px solid var(--border);
-  background: var(--bg);
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  padding-top: 14px;
-  min-height: 0;
-}
-
-.right-expand-btn {
-  width: 32px;
-  height: 32px;
 }
 
 .card {
@@ -1565,8 +1656,12 @@ code {
     grid-template-columns: 220px minmax(0, 1fr);
   }
 
-  .right,
-  .right-collapsed {
+  .right {
     display: none;
+  }
+
+  /* Keep toggle visible so user can re-open when viewport grows again */
+  .topbar-outputs-toggle {
+    display: grid;
   }
 }

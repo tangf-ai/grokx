@@ -1,12 +1,14 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { open as openUrl } from "@tauri-apps/plugin-shell";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import {
   IconAlert,
   IconChevronLeft,
   IconChevronRight,
+  IconGithub,
   IconInfo,
   IconPaperclip,
   IconPen,
@@ -18,6 +20,66 @@ import {
   IconTool,
   IconTrash,
 } from "./icons";
+
+/** Public open-source repository (opens in the system browser). */
+const GROKX_GITHUB_URL = "https://github.com/tangf-ai/grokx";
+
+/** Debounce identical opens — prevents shell open + webview target=_blank double fire. */
+let lastExternalOpen: { url: string; at: number } | null = null;
+
+/** Open http(s) / mailto links with the OS default app (browser, mail, …). */
+function openExternalUrl(url: string): void {
+  const trimmed = url.trim();
+  if (!trimmed) return;
+  // Allow only schemes that should leave the app shell.
+  if (!/^(https?:|mailto:)/i.test(trimmed)) return;
+  const now = Date.now();
+  if (
+    lastExternalOpen &&
+    lastExternalOpen.url === trimmed &&
+    now - lastExternalOpen.at < 800
+  ) {
+    return;
+  }
+  lastExternalOpen = { url: trimmed, at: now };
+  void openUrl(trimmed).catch((err) => {
+    console.error("Failed to open URL:", err);
+  });
+}
+
+/**
+ * Shared markdown rendering for chat: links open in the system browser,
+ * not inside the Tauri webview.
+ */
+function ChatMarkdown({ children }: { children: string }) {
+  return (
+    <ReactMarkdown
+      remarkPlugins={[remarkGfm]}
+      components={{
+        a({ href, children: linkChildren, node: _node, ...props }) {
+          return (
+            <a
+              {...props}
+              href={href}
+              // No target=_blank: WKWebView would also open the system browser,
+              // doubling with our shell open().
+              rel="noopener noreferrer"
+              onClick={(e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                if (href) openExternalUrl(href);
+              }}
+            >
+              {linkChildren}
+            </a>
+          );
+        },
+      }}
+    >
+      {children}
+    </ReactMarkdown>
+  );
+}
 
 type EngineInfo = {
   path: string;
@@ -369,6 +431,26 @@ export default function App() {
   const userScrollIntentRef = useRef(false);
   const scrollAnimRef = useRef<number | null>(null);
   const lastProgrammaticScrollRef = useRef(0);
+  /** Coalesce sticky visibility checks to one layout read per frame. */
+  const stickyRafRef = useRef<number | null>(null);
+  const stickyUserIdRef = useRef<string | null>(null);
+  /** Last trackpad/wheel activity — don't fight inertia by re-enabling auto-scroll too soon. */
+  const lastUserScrollAtRef = useRef(0);
+  /**
+   * Per-task scroll resume: when switching Tasks, restore the viewport
+   * position the user left (not always jump to bottom).
+   */
+  const sessionScrollRef = useRef<
+    Map<
+      string,
+      {
+        scrollTop: number;
+        /** True if user was near the live edge — resume bottom + auto-follow. */
+        pinBottom: boolean;
+        autoScroll: boolean;
+      }
+    >
+  >(new Map());
 
   useEffect(() => {
     linesRef.current = lines;
@@ -761,6 +843,54 @@ export default function App() {
     [distanceFromBottom],
   );
 
+  /** Snapshot current chat viewport for the active task (call before switching away). */
+  const saveSessionScroll = useCallback(
+    (sessionId: string | null | undefined) => {
+      if (!sessionId) return;
+      const el = chatScrollRef.current;
+      if (!el) return;
+      const pinBottom = distanceFromBottom(el) <= 80;
+      sessionScrollRef.current.set(sessionId, {
+        scrollTop: el.scrollTop,
+        pinBottom,
+        autoScroll: autoScrollEnabledRef.current || pinBottom,
+      });
+    },
+    [distanceFromBottom],
+  );
+
+  /**
+   * Restore a task's saved scroll after its transcript is in the DOM.
+   * Double rAF waits for layout after setLines (scrollTop assignment fires
+   * the existing scroll listener for sticky updates).
+   */
+  const restoreSessionScroll = useCallback((sessionId: string) => {
+    const apply = () => {
+      const el = chatScrollRef.current;
+      if (!el) return;
+      const saved = sessionScrollRef.current.get(sessionId);
+      lastProgrammaticScrollRef.current = performance.now() + 160;
+
+      if (!saved || saved.pinBottom) {
+        el.scrollTop = el.scrollHeight;
+        autoScrollEnabledRef.current = true;
+        userScrollIntentRef.current = false;
+      } else {
+        const maxTop = Math.max(0, el.scrollHeight - el.clientHeight);
+        el.scrollTop = Math.min(Math.max(0, saved.scrollTop), maxTop);
+        // Stay where the user left off — do not auto-follow until they send
+        // or intentionally return to the bottom.
+        autoScrollEnabledRef.current = false;
+        userScrollIntentRef.current = true;
+      }
+    };
+
+    // First frame: React commit; second: layout with restored lines.
+    requestAnimationFrame(() => {
+      requestAnimationFrame(apply);
+    });
+  }, []);
+
   /** Ease viewport toward bottom (slow + smooth). Does not jump. */
   const ensureSmoothAutoScroll = useCallback(() => {
     if (!autoScrollEnabledRef.current) return;
@@ -813,10 +943,16 @@ export default function App() {
     }
   }, []);
 
+  const applyStickyUserId = useCallback((next: string | null) => {
+    if (stickyUserIdRef.current === next) return;
+    stickyUserIdRef.current = next;
+    setStickyUserId(next);
+  }, []);
+
   const updateStickyUser = useCallback(() => {
     const scroller = chatScrollRef.current;
     if (!scroller || !lastUserMessage) {
-      setStickyUserId(null);
+      applyStickyUserId(null);
       return;
     }
     const el = userMsgEls.current.get(lastUserMessage.id);
@@ -824,27 +960,40 @@ export default function App() {
       // Message just added — keep sticky once there's content after it.
       const idx = lines.findIndex((l) => l.id === lastUserMessage.id);
       const hasAfter = idx >= 0 && idx < lines.length - 1;
-      setStickyUserId(hasAfter ? lastUserMessage.id : null);
+      applyStickyUserId(hasAfter ? lastUserMessage.id : null);
       return;
     }
     const scrollerRect = scroller.getBoundingClientRect();
     const msgRect = el.getBoundingClientRect();
     // Sticky when the user bubble has scrolled above the visible chat area.
-    const scrolledPast = msgRect.bottom < scrollerRect.top + 8;
+    // Hysteresis avoids flicker at the threshold while trackpad-scrolling.
+    const currentlySticky = stickyUserIdRef.current === lastUserMessage.id;
+    const scrolledPast = currentlySticky
+      ? msgRect.bottom < scrollerRect.top + 28
+      : msgRect.bottom < scrollerRect.top + 4;
     const idx = lines.findIndex((l) => l.id === lastUserMessage.id);
     const hasAfter = idx >= 0 && idx < lines.length - 1;
-    setStickyUserId(scrolledPast && hasAfter ? lastUserMessage.id : null);
-  }, [lastUserMessage, lines]);
+    applyStickyUserId(scrolledPast && hasAfter ? lastUserMessage.id : null);
+  }, [lastUserMessage, lines, applyStickyUserId]);
+
+  /** Schedule sticky check once per frame — never every raw scroll event. */
+  const scheduleStickyUser = useCallback(() => {
+    if (stickyRafRef.current != null) return;
+    stickyRafRef.current = requestAnimationFrame(() => {
+      stickyRafRef.current = null;
+      updateStickyUser();
+    });
+  }, [updateStickyUser]);
 
   // When chat content grows, ease toward bottom only if auto-follow is on.
   useEffect(() => {
     if (!autoScrollEnabledRef.current) {
-      updateStickyUser();
+      scheduleStickyUser();
       return;
     }
     ensureSmoothAutoScroll();
-    requestAnimationFrame(() => updateStickyUser());
-  }, [lines, busy, pendingPerm, ensureSmoothAutoScroll, updateStickyUser]);
+    scheduleStickyUser();
+  }, [lines, busy, pendingPerm, ensureSmoothAutoScroll, scheduleStickyUser]);
 
   // Detect user-driven scroll vs programmatic ease.
   useEffect(() => {
@@ -853,6 +1002,7 @@ export default function App() {
 
     const markUserIntent = () => {
       userScrollIntentRef.current = true;
+      lastUserScrollAtRef.current = performance.now();
       // Any wheel/touch/keys means the user is in control.
       disableAutoScroll();
     };
@@ -860,9 +1010,14 @@ export default function App() {
     const onWheel = () => markUserIntent();
     const onTouchStart = () => markUserIntent();
     const onPointerDown = (e: PointerEvent) => {
-      // Trackpad/mouse drag on scrollbar or content.
+      // Only scrollbar / content drag — not every click (avoids fighting Jump, etc.).
+      const t = e.target as HTMLElement | null;
+      if (t?.closest("button, a, input, textarea, select, label")) return;
       if (e.pointerType === "mouse" || e.pointerType === "pen" || e.pointerType === "touch") {
-        markUserIntent();
+        // Likely scrollbar drag starts with pointerdown on the scroller chrome.
+        if (e.offsetX >= scroller.clientWidth) {
+          markUserIntent();
+        }
       }
     };
     const onKeyDown = (e: KeyboardEvent) => {
@@ -873,7 +1028,7 @@ export default function App() {
         e.key === "End" ||
         e.key === "ArrowUp" ||
         e.key === "ArrowDown" ||
-        e.key === " " 
+        e.key === " "
       ) {
         // Only if chat is focused / event not from input.
         const t = e.target as HTMLElement | null;
@@ -883,8 +1038,11 @@ export default function App() {
     };
 
     const onScroll = () => {
-      updateStickyUser();
+      scheduleStickyUser();
       // Ignore scroll events we just caused programmatically.
+      if (performance.now() < lastProgrammaticScrollRef.current) {
+        return;
+      }
       if (performance.now() - lastProgrammaticScrollRef.current < 48) {
         return;
       }
@@ -900,10 +1058,12 @@ export default function App() {
       }
     };
 
-    // Re-enable when user scrolls back to the live edge.
+    // Re-enable when user scrolls back to the live edge — after inertia settles.
     const onScrollEndCheck = () => {
       if (autoScrollEnabledRef.current) return;
-      if (isNearBottom(scroller, 40)) {
+      // Trackpad inertia can keep scrolling 200–400ms after last wheel event.
+      if (performance.now() - lastUserScrollAtRef.current < 280) return;
+      if (isNearBottom(scroller, 48)) {
         // User returned to bottom — resume gentle follow.
         userScrollIntentRef.current = false;
         enableAutoScroll();
@@ -914,7 +1074,7 @@ export default function App() {
     const onScrollWithEnd = () => {
       onScroll();
       if (endTimer) clearTimeout(endTimer);
-      endTimer = setTimeout(onScrollEndCheck, 140);
+      endTimer = setTimeout(onScrollEndCheck, 220);
     };
 
     scroller.addEventListener("wheel", onWheel, { passive: true });
@@ -922,8 +1082,8 @@ export default function App() {
     scroller.addEventListener("pointerdown", onPointerDown, { passive: true });
     scroller.addEventListener("scroll", onScrollWithEnd, { passive: true });
     window.addEventListener("keydown", onKeyDown);
-    window.addEventListener("resize", updateStickyUser);
-    updateStickyUser();
+    window.addEventListener("resize", scheduleStickyUser);
+    scheduleStickyUser();
 
     return () => {
       if (endTimer) clearTimeout(endTimer);
@@ -931,28 +1091,60 @@ export default function App() {
         cancelAnimationFrame(scrollAnimRef.current);
         scrollAnimRef.current = null;
       }
+      if (stickyRafRef.current != null) {
+        cancelAnimationFrame(stickyRafRef.current);
+        stickyRafRef.current = null;
+      }
       scroller.removeEventListener("wheel", onWheel);
       scroller.removeEventListener("touchstart", onTouchStart);
       scroller.removeEventListener("pointerdown", onPointerDown);
       scroller.removeEventListener("scroll", onScrollWithEnd);
       window.removeEventListener("keydown", onKeyDown);
-      window.removeEventListener("resize", updateStickyUser);
+      window.removeEventListener("resize", scheduleStickyUser);
     };
-  }, [updateStickyUser, view, disableAutoScroll, enableAutoScroll, isNearBottom]);
+  }, [scheduleStickyUser, view, disableAutoScroll, enableAutoScroll, isNearBottom]);
 
   const jumpToUserMessage = useCallback(
     (id: string) => {
-      const el = userMsgEls.current.get(id);
       const scroller = chatScrollRef.current;
+      const el = userMsgEls.current.get(id);
       if (!el || !scroller) return;
+
       // Manual navigation — pause auto-follow.
       disableAutoScroll();
-      el.scrollIntoView({ behavior: "smooth", block: "start" });
+      // Hide sticky immediately so the jump target isn't covered.
+      stickyUserIdRef.current = null;
+      setStickyUserId(null);
       setHighlightUserId(id);
+
+      const scrollToTarget = () => {
+        const target = userMsgEls.current.get(id);
+        const root = chatScrollRef.current;
+        if (!target || !root) return;
+
+        const rootRect = root.getBoundingClientRect();
+        const targetRect = target.getBoundingClientRect();
+        // Match .chat-scroll top padding so the bubble isn't clipped.
+        const topPad = 28;
+        const nextTop = root.scrollTop + (targetRect.top - rootRect.top) - topPad;
+        // Cover the whole smooth-scroll duration so scroll listeners
+        // don't treat this as a competing user gesture.
+        lastProgrammaticScrollRef.current = performance.now() + 700;
+        root.scrollTo({
+          top: Math.max(0, nextTop),
+          behavior: "smooth",
+        });
+      };
+
+      // Wait for sticky unmount reflow before measuring positions.
+      requestAnimationFrame(() => {
+        requestAnimationFrame(scrollToTarget);
+      });
+
       window.setTimeout(() => {
         setHighlightUserId((cur) => (cur === id ? null : cur));
       }, 1600);
-      window.setTimeout(() => updateStickyUser(), 400);
+      window.setTimeout(() => updateStickyUser(), 550);
     },
     [updateStickyUser, disableAutoScroll],
   );
@@ -1084,8 +1276,8 @@ export default function App() {
         if (list.length) setEfforts(list);
       })
       .catch(() => {
+        // Grok Build / Grok 4.5 practical menu (not the full API enum).
         setEfforts([
-          { id: "none", label: "None" },
           { id: "low", label: "Low" },
           { id: "medium", label: "Medium" },
           { id: "high", label: "High" },
@@ -1273,6 +1465,7 @@ export default function App() {
     try {
       const picked = await invoke<string | null>("pick_project_dir");
       if (!picked) return;
+      saveSessionScroll(sessionIdRef.current);
       await flushPersistHistory();
       setLines([]);
       linesRef.current = [];
@@ -1280,6 +1473,8 @@ export default function App() {
       setAttachments([]);
       setDraft("");
       setConnecting(true);
+      autoScrollEnabledRef.current = true;
+      userScrollIntentRef.current = false;
       const root = picked;
       setProjectRoot(root);
       await invoke<string>("set_project_root", { projectRoot: root });
@@ -1319,6 +1514,8 @@ export default function App() {
   const onNewSession = async () => {
     if (connecting || busy) return;
     setView("workspace");
+    // Remember where we were reading so returning to this task restores it.
+    saveSessionScroll(sessionIdRef.current);
     // Save current task transcript before leaving.
     await flushPersistHistory();
     historyEpochRef.current += 1;
@@ -1331,6 +1528,11 @@ export default function App() {
     setBusy(false);
     turnStartedAtRef.current = null;
     setConnecting(true);
+    // Fresh task starts at bottom with auto-follow on.
+    autoScrollEnabledRef.current = true;
+    userScrollIntentRef.current = false;
+    stickyUserIdRef.current = null;
+    setStickyUserId(null);
     // Only treat an explicitly selected sidebar Project as a real project.
     const userProject = selectedProject;
     const standalone = !userProject;
@@ -1394,6 +1596,8 @@ export default function App() {
     const leavingId = sessionIdRef.current;
     const leavingWork = workPathRef.current;
     const leavingLines = linesRef.current;
+    // Capture scroll before DOM is replaced by the other task's transcript.
+    saveSessionScroll(leavingId);
     if (historySaveTimer.current) {
       clearTimeout(historySaveTimer.current);
       historySaveTimer.current = null;
@@ -1413,6 +1617,8 @@ export default function App() {
     setDraft("");
     setBusy(false);
     turnStartedAtRef.current = null;
+    stickyUserIdRef.current = null;
+    setStickyUserId(null);
 
     // Optimistically highlight the clicked row immediately.
     setSession({
@@ -1428,17 +1634,20 @@ export default function App() {
     // Restore transcript ASAP (by work_path) so chat is visible during reconnect.
     const history = await loadChatHistory(s.session_id, s.work_path);
     if (historyEpochRef.current !== epoch) return;
+    // Apply scroll policy *before* setLines so the lines-effect auto-follow
+    // does not race and yank the viewport to the bottom.
+    const savedScroll = sessionScrollRef.current.get(s.session_id);
+    if (!savedScroll || savedScroll.pinBottom) {
+      autoScrollEnabledRef.current = true;
+      userScrollIntentRef.current = false;
+    } else {
+      autoScrollEnabledRef.current = false;
+      userScrollIntentRef.current = true;
+    }
     setLines(history);
     linesRef.current = history;
-    // Land at bottom of restored history, then allow gentle follow again.
-    autoScrollEnabledRef.current = true;
-    userScrollIntentRef.current = false;
-    requestAnimationFrame(() => {
-      const el = chatScrollRef.current;
-      if (!el) return;
-      lastProgrammaticScrollRef.current = performance.now();
-      el.scrollTop = el.scrollHeight;
-    });
+    // Resume at the leave position (or bottom if first visit / was pinned).
+    restoreSessionScroll(s.session_id);
 
     try {
       if (s.project_root) {
@@ -1481,11 +1690,23 @@ export default function App() {
         info.work_path ?? s.work_path,
       );
       if (historyEpochRef.current !== epoch) return;
+      let historyChanged = false;
       if (history2.length > 0) {
-        setLines(history2);
-        linesRef.current = history2;
+        // Only replace if content actually differs — avoid resetting scroll.
+        const prev = linesRef.current;
+        historyChanged =
+          history2.length !== prev.length ||
+          history2.some((l, i) => l.id !== prev[i]?.id || l.kind !== prev[i]?.kind);
+        if (historyChanged) {
+          setLines(history2);
+          linesRef.current = history2;
+        }
       } else if (hasRealChatContent(linesRef.current)) {
         // Keep what we already showed.
+      }
+
+      if (historyChanged) {
+        restoreSessionScroll(s.session_id);
       }
 
       // Keep list order stable: only refresh session metadata/titles, no full hierarchy reshuffle.
@@ -1554,6 +1775,7 @@ export default function App() {
       await invoke("delete_session", { sessionId: s.session_id });
       setSessions((prev) => prev.filter((row) => row.session_id !== s.session_id));
       autoTitledSessionRef.current.delete(s.session_id);
+      sessionScrollRef.current.delete(s.session_id);
 
       if (wasActive) {
         setSession(null);
@@ -1955,7 +2177,7 @@ export default function App() {
       }`}
     >
       <aside className="sidebar">
-        <div className="brand-row">
+        <div className="brand-row" data-tauri-drag-region>
           <button
             type="button"
             className="brand brand-btn"
@@ -2129,13 +2351,28 @@ export default function App() {
             </span>
             Settings
           </button>
-          <div className="sidebar-meta">v{appVersion}</div>
+          <div className="sidebar-meta">
+            <span className="sidebar-version">v{appVersion}</span>
+            <button
+              type="button"
+              className="sidebar-github-btn"
+              title="Open source on GitHub"
+              aria-label="Open Grokx on GitHub"
+              onClick={() => {
+                void openUrl(GROKX_GITHUB_URL).catch((err) => {
+                  console.error("Failed to open GitHub:", err);
+                });
+              }}
+            >
+              <IconGithub size={14} />
+            </button>
+          </div>
         </div>
       </aside>
 
       {view === "settings" ? (
         <main className="main settings-main">
-          <header className="topbar">
+          <header className="topbar" data-tauri-drag-region>
             <div style={{ minWidth: 0 }}>
               <h1 className="topbar-title">Settings</h1>
               <p className="topbar-sub">
@@ -2249,18 +2486,21 @@ export default function App() {
                     <label>Default effort</label>
                     <select
                       className="settings-select"
-                      value={cfgEffort}
+                      value={
+                        efforts.some((e) => e.id === cfgEffort)
+                          ? cfgEffort
+                          : "medium"
+                      }
                       onChange={(e) => setCfgEffort(e.target.value)}
+                      title="Reasoning effort for Grok (Low · Medium · High · Extra high)"
                     >
                       {(efforts.length
                         ? efforts
                         : [
-                            { id: "none", label: "None" },
                             { id: "low", label: "Low" },
                             { id: "medium", label: "Medium" },
                             { id: "high", label: "High" },
                             { id: "xhigh", label: "Extra high" },
-                            { id: "max", label: "Max" },
                           ]
                       ).map((e) => (
                         <option key={e.id} value={e.id}>
@@ -2383,7 +2623,7 @@ export default function App() {
       ) : (
         <>
           <main className="main">
-            <header className="topbar">
+            <header className="topbar" data-tauri-drag-region>
               <div style={{ minWidth: 0 }}>
                 <h1 className="topbar-title">{title}</h1>
                 <p className="topbar-sub">
@@ -2401,13 +2641,28 @@ export default function App() {
                         : ""}
                 </p>
               </div>
-              <div className="status-pill">
-                <span className={`status-dot ${statusClass}`} />
-                {busy ? "Working" : connected ? "Ready" : agentStatus}
+              <div className="topbar-actions">
+                <div className="status-pill">
+                  <span className={`status-dot ${statusClass}`} />
+                  {busy ? "Working" : connected ? "Ready" : agentStatus}
+                </div>
+                <button
+                  type="button"
+                  className="icon-btn topbar-outputs-toggle"
+                  title={outputsOpen ? "Hide outputs panel" : "Show outputs panel"}
+                  onClick={() => setOutputsOpen((v) => !v)}
+                >
+                  {outputsOpen ? (
+                    <IconChevronRight size={16} />
+                  ) : (
+                    <IconChevronLeft size={16} />
+                  )}
+                </button>
               </div>
             </header>
 
-            <div className="chat-scroll" ref={chatScrollRef}>
+            <div className="chat-pane">
+              {/* Overlay (not in scroll flow) so show/hide never changes scrollHeight. */}
               {stickyUserId && stickyUserText != null && (
                 <button
                   type="button"
@@ -2420,11 +2675,8 @@ export default function App() {
                   <span className="user-sticky-jump">Jump ↓</span>
                 </button>
               )}
-              <div
-                className={`chat-inner${
-                  stickyUserId ? " chat-inner-sticky" : ""
-                }`}
-              >
+              <div className="chat-scroll" ref={chatScrollRef}>
+              <div className="chat-inner">
                 {lines.length === 0 && (
                   <div className="empty-state">
                     <h2>Start a task</h2>
@@ -2469,11 +2721,7 @@ export default function App() {
                                       className="msg msg-thought trace-item"
                                     >
                                       <div className="msg-body md-body thought-md">
-                                        <ReactMarkdown
-                                          remarkPlugins={[remarkGfm]}
-                                        >
-                                          {item.text}
-                                        </ReactMarkdown>
+                                        <ChatMarkdown>{item.text}</ChatMarkdown>
                                       </div>
                                     </div>
                                   );
@@ -2524,9 +2772,7 @@ export default function App() {
                     return (
                       <div key={line.id} className="msg msg-assistant">
                         <div className="msg-body md-body">
-                          <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                            {line.text}
-                          </ReactMarkdown>
+                          <ChatMarkdown>{line.text}</ChatMarkdown>
                           {busy && i === lines.length - 1 && (
                             <span className="stream-caret" aria-hidden />
                           )}
@@ -2538,9 +2784,7 @@ export default function App() {
                     return (
                       <div key={line.id} className="msg msg-thought">
                         <div className="msg-body md-body thought-md">
-                          <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                            {line.text}
-                          </ReactMarkdown>
+                          <ChatMarkdown>{line.text}</ChatMarkdown>
                         </div>
                       </div>
                     );
@@ -2569,6 +2813,7 @@ export default function App() {
                   );
                 })}
                 <div ref={bottomRef} />
+              </div>
               </div>
             </div>
 
@@ -2675,9 +2920,11 @@ export default function App() {
                   </select>
                   <select
                     className="composer-select effort"
-                    value={effortId}
+                    value={
+                      efforts.some((e) => e.id === effortId) ? effortId : "medium"
+                    }
                     onChange={(e) => setEffortId(e.target.value)}
-                    title="Reasoning effort"
+                    title="Reasoning effort (Grok: Low · Medium · High · Extra high)"
                     disabled={busy}
                   >
                     {(efforts.length
@@ -2686,6 +2933,7 @@ export default function App() {
                           { id: "low", label: "Low" },
                           { id: "medium", label: "Medium" },
                           { id: "high", label: "High" },
+                          { id: "xhigh", label: "Extra high" },
                         ]
                     ).map((e) => (
                       <option key={e.id} value={e.id}>
@@ -2721,18 +2969,10 @@ export default function App() {
             </div>
           </main>
 
-          {outputsOpen ? (
+          {outputsOpen && (
             <aside className="right">
-              <div className="right-header">
+              <div className="right-header" data-tauri-drag-region>
                 <h2>Outputs</h2>
-                <button
-                  type="button"
-                  className="icon-btn"
-                  title="Collapse outputs"
-                  onClick={() => setOutputsOpen(false)}
-                >
-                  <IconChevronRight size={16} />
-                </button>
               </div>
 
               {error && !session && (
@@ -2816,17 +3056,6 @@ export default function App() {
                 </div>
               )}
             </aside>
-          ) : (
-            <div className="right-collapsed">
-              <button
-                type="button"
-                className="icon-btn right-expand-btn"
-                title="Show outputs"
-                onClick={() => setOutputsOpen(true)}
-              >
-                <IconChevronLeft size={16} />
-              </button>
-            </div>
           )}
         </>
       )}

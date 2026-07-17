@@ -11,20 +11,27 @@ pub struct PromptAttachment {
 }
 
 /// Reasoning / effort level for the turn (maps to engine effort flags).
+///
+/// Wire values align with Grok Build / xAI sampling:
+/// `none | minimal | low | medium | high | xhigh` (`max` is a UX alias of `xhigh`).
+/// The UI menu only exposes the practical set the engine's legacy menu uses.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ReasoningEffort {
+    /// No extended reasoning (power-user / API only).
     None,
+    /// Minimal reasoning (power-user / API only).
     Minimal,
     Low,
     #[default]
     Medium,
     High,
+    /// Maximum reasoning (engine alias: `max` → `xhigh`).
     Xhigh,
-    Max,
 }
 
 impl ReasoningEffort {
+    /// Canonical wire token sent to the engine (`max` is never emitted).
     pub fn as_str(self) -> &'static str {
         match self {
             Self::None => "none",
@@ -33,7 +40,6 @@ impl ReasoningEffort {
             Self::Medium => "medium",
             Self::High => "high",
             Self::Xhigh => "xhigh",
-            Self::Max => "max",
         }
     }
 
@@ -44,11 +50,29 @@ impl ReasoningEffort {
             Self::Low => "Low",
             Self::Medium => "Medium",
             Self::High => "High",
+            // Match Grok Build effort menu wording.
             Self::Xhigh => "Extra high",
-            Self::Max => "Max",
         }
     }
 
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::None => "No extended reasoning",
+            Self::Minimal => "Minimal reasoning",
+            Self::Low => "Faster, lighter reasoning",
+            Self::Medium => "Balanced reasoning",
+            Self::High => "Heavy reasoning",
+            Self::Xhigh => "Maximum reasoning",
+        }
+    }
+
+    /// Levels shown in the desktop composer / settings (Grok Build menu).
+    /// `none` / `minimal` remain parseable for API/history but are not listed.
+    pub fn menu() -> &'static [ReasoningEffort] {
+        &[Self::Low, Self::Medium, Self::High, Self::Xhigh]
+    }
+
+    /// All canonical levels including power-user values.
     pub fn all() -> &'static [ReasoningEffort] {
         &[
             Self::None,
@@ -57,7 +81,6 @@ impl ReasoningEffort {
             Self::Medium,
             Self::High,
             Self::Xhigh,
-            Self::Max,
         ]
     }
 
@@ -68,9 +91,17 @@ impl ReasoningEffort {
             "low" => Some(Self::Low),
             "medium" | "med" => Some(Self::Medium),
             "high" => Some(Self::High),
-            "xhigh" | "extra" | "extra_high" => Some(Self::Xhigh),
-            "max" => Some(Self::Max),
+            // Engine treats `max` as alias of `xhigh`.
+            "xhigh" | "extra" | "extra_high" | "max" => Some(Self::Xhigh),
             _ => None,
+        }
+    }
+
+    /// Clamp a stored preference into the UI menu (unknown → Medium).
+    pub fn for_menu(self) -> Self {
+        match self {
+            Self::None | Self::Minimal => Self::Low,
+            other => other,
         }
     }
 }

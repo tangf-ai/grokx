@@ -859,8 +859,10 @@ impl AppCore {
         Ok(())
     }
 
+    /// Effort levels shown in the desktop UI (matches Grok Build menu:
+    /// Low / Medium / High / Extra high).
     pub fn effort_options() -> Vec<ReasoningEffort> {
-        ReasoningEffort::all().to_vec()
+        ReasoningEffort::menu().to_vec()
     }
 
     pub async fn cancel_turn(&self) -> Result<(), CoreError> {
