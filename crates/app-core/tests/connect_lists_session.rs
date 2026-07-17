@@ -57,6 +57,7 @@ async fn fake_shim_handshake_via_spawn_agent_stdio() {
         custom_engine_path: Some(shim.display().to_string()),
         prefer_bundled_engine: false,
         model: None,
+        ..UserSettings::default()
     };
     let engine = resolve_engine(&settings, None, false).expect("resolve custom shim");
     let child = spawn_agent_stdio(
@@ -96,7 +97,7 @@ async fn fake_shim_handshake_via_spawn_agent_stdio() {
 async fn connect_workspace_lists_session_with_project_metadata() {
     let shim = install_fake_grok_shim("connect-list");
 
-    let core = AppCore::bootstrap().expect("bootstrap");
+    let core = AppCore::bootstrap_for_test().expect("bootstrap");
     {
         let mut settings = core.settings.write().await;
         settings.custom_engine_path = Some(shim.display().to_string());

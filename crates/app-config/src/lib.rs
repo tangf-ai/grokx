@@ -33,14 +33,18 @@ impl AppPaths {
     pub fn discover() -> Result<Self, ConfigError> {
         let base = directories::ProjectDirs::from(APP_QUALIFIER, APP_ORGANIZATION, APP_NAME)
             .ok_or(ConfigError::NoDataDir)?;
-        let data_dir = base.data_dir().to_path_buf();
-        Ok(Self {
+        Ok(Self::from_data_dir(base.data_dir().to_path_buf()))
+    }
+
+    /// Build paths under an arbitrary data directory (tests / portable installs).
+    pub fn from_data_dir(data_dir: PathBuf) -> Self {
+        Self {
             config_file: data_dir.join("settings.json"),
             sessions_db: data_dir.join("sessions.db"),
             logs_dir: data_dir.join("logs"),
             engine_data_dir: data_dir.join("engine-data"),
             data_dir,
-        })
+        }
     }
 
     pub fn ensure_dirs(&self) -> Result<(), ConfigError> {

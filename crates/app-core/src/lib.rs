@@ -66,7 +66,15 @@ pub struct AppCore {
 
 impl AppCore {
     pub fn bootstrap() -> Result<Arc<Self>, CoreError> {
-        let paths = AppPaths::discover()?;
+        Self::bootstrap_with_paths(AppPaths::discover()?, true)
+    }
+
+    /// Bootstrap with explicit app paths.
+    ///
+    /// When `import_tasks` is false, skips loading/importing real session history
+    /// (used by unit/integration tests so they do not depend on or overwrite
+    /// the developer's `~/.grokx` index).
+    pub fn bootstrap_with_paths(paths: AppPaths, import_tasks: bool) -> Result<Arc<Self>, CoreError> {
         paths.ensure_dirs()?;
         let settings = UserSettings::load(&paths.config_file).unwrap_or_else(|_| {
             UserSettings::product_defaults()
@@ -78,10 +86,12 @@ impl AppCore {
                 warn!(error = %e, "failed to load sessions index; starting empty");
                 SessionStore::new()
             });
-        let imported = store.import_from_tasks_root(&AppPaths::tasks_root());
-        if imported > 0 {
-            warn!(imported, "recovered tasks from ~/.grokx/tasks");
-            let _ = store.save_to_file(&paths.sessions_index_file());
+        if import_tasks {
+            let imported = store.import_from_tasks_root(&AppPaths::tasks_root());
+            if imported > 0 {
+                warn!(imported, "recovered tasks from ~/.grokx/tasks");
+                let _ = store.save_to_file(&paths.sessions_index_file());
+            }
         }
 
         let (event_tx, event_rx) = mpsc::unbounded_channel();
@@ -99,6 +109,20 @@ impl AppCore {
             event_tx,
             event_rx: Mutex::new(Some(event_rx)),
         }))
+    }
+
+    /// Isolated bootstrap for tests: temp data dir, empty store, no task import.
+    pub fn bootstrap_for_test() -> Result<Arc<Self>, CoreError> {
+        let unique = format!(
+            "grokx-app-core-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+        let data_dir = std::env::temp_dir().join(unique);
+        Self::bootstrap_with_paths(AppPaths::from_data_dir(data_dir), false)
     }
 
     async fn persist_session_meta(&self, session_id: &SessionId) {
@@ -980,7 +1004,7 @@ mod tests {
 
     #[tokio::test]
     async fn set_project_and_list_sessions_after_store() {
-        let core = AppCore::bootstrap().unwrap();
+        let core = AppCore::bootstrap_for_test().unwrap();
         // Use crate dir as a real directory
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let set = core.set_project_root(root.clone()).await.unwrap();
