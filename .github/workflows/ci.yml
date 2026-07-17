@@ -3,6 +3,7 @@ name: ci
 on:
   push:
     branches: [main]
+    tags: ["v*"]
   pull_request:
   workflow_dispatch:
 
@@ -30,6 +31,14 @@ jobs:
           node-version: 24
           cache: pnpm
           cache-dependency-path: apps/desktop/pnpm-lock.yaml
+      - name: Verify release tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          APP_VERSION="$(node -e 'const fs = require("node:fs"); const config = JSON.parse(fs.readFileSync("apps/desktop/src-tauri/tauri.conf.json", "utf8")); process.stdout.write(config.version)')"
+          if [[ "$GITHUB_REF_NAME" != "v$APP_VERSION" ]]; then
+            echo "error: tag $GITHUB_REF_NAME does not match app version $APP_VERSION" >&2
+            exit 1
+          fi
       - name: Install Linux build dependencies
         run: |
           sudo apt-get update
@@ -49,3 +58,26 @@ jobs:
           name: grokx-deb-${{ github.sha }}
           path: target/release/bundle/deb/*.deb
           if-no-files-found: error
+
+  publish-release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [product-crates, desktop-deb]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download Debian package
+        uses: actions/download-artifact@v4
+        with:
+          name: grokx-deb-${{ github.sha }}
+          path: release-assets
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" --repo "$GH_REPO" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" release-assets/*.deb --clobber --repo "$GH_REPO"
+          else
+            gh release create "$GITHUB_REF_NAME" release-assets/*.deb --verify-tag --generate-notes --title "Grokx $GITHUB_REF_NAME" --repo "$GH_REPO"
+          fi

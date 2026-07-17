@@ -6,4 +6,6 @@
 4. Bump app version in `apps/desktop/src-tauri/tauri.conf.json` and workspace as needed.
 5. Build/sign installer via Tauri + `packaging/*` helpers. On Linux, run
    `./packaging/linux/deb.sh` to produce `target/release/bundle/deb/*.deb`.
-6. Tag `app-vX.Y.Z` and record engine commit in release notes.
+6. Tag and push `vX.Y.Z`. CI verifies that the tag matches the app version,
+   creates the GitHub Release, and uploads the Debian package. Record the
+   engine commit in the release notes.
