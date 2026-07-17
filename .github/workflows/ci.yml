@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 
 jobs:
   product-crates:
@@ -15,3 +16,36 @@ jobs:
         run: cargo check -p domain -p app-config -p agent-process -p acp-bridge -p permissions -p session-store -p app-core
       - name: Test libraries
         run: cargo test -p domain -p app-config -p agent-process -p acp-bridge -p permissions -p session-store
+
+  desktop-deb:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.9.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: apps/desktop/pnpm-lock.yaml
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev patchelf
+          cargo install dotslash --locked
+      - name: Build bundled runtime
+        run: |
+          ./tools/build-engine.sh
+          ./packaging/bundle_runtime.sh
+          cargo clean --manifest-path engine/grok-build/Cargo.toml
+      - name: Build Debian package
+        working-directory: apps/desktop
+        run: pnpm build:deb
+      - name: Upload Debian package
+        uses: actions/upload-artifact@v4
+        with:
+          name: grokx-deb-${{ github.sha }}
+          path: target/release/bundle/deb/*.deb
+          if-no-files-found: error
