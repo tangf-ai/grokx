@@ -11,12 +11,14 @@ import {
   IconChevronLeft,
   IconChevronRight,
   IconCopy,
+  IconFile,
   IconFolder,
   IconGithub,
   IconInfo,
   IconPaperclip,
   IconPen,
   IconPlus,
+  IconRefresh,
   IconSend,
   IconSettings,
   IconStop,
@@ -25,6 +27,10 @@ import {
   IconTrash,
 } from "./icons";
 import { onTitlebarMouseDown } from "./windowDrag";
+import {
+  detectVerbalOnlyCompletion,
+  VERBAL_COMPLETION_NUDGE,
+} from "./lib/verbalCompletion";
 
 /** Public open-source repository (opens in the system browser). */
 const GROKX_GITHUB_URL = "https://github.com/tangf-ai/grokx";
@@ -216,6 +222,36 @@ function formatBytes(n?: number | null): string {
   return `${(n / (1024 * 1024)).toFixed(1)} MB`;
 }
 
+/** True for image attachments (mime or extension). */
+function isImageAttachment(a: {
+  name?: string | null;
+  mime?: string | null;
+}): boolean {
+  if (a.mime?.startsWith("image/")) return true;
+  const n = (a.name || "").toLowerCase();
+  return /\.(png|jpe?g|gif|webp|bmp|svg)$/i.test(n);
+}
+
+/**
+ * Prefer the original human filename. Never show a temp uuid-prefixed path
+ * leaf when a real name is available.
+ */
+function attachmentDisplayName(a: {
+  name?: string | null;
+  path?: string | null;
+}): string {
+  const fromName = (a.name || "").trim();
+  if (fromName && !/^[0-9a-f]{8}-/i.test(fromName)) {
+    // Strip any accidental path prefix; keep basename.
+    const leaf = fromName.split(/[/\\]/).pop() || fromName;
+    if (leaf) return leaf;
+  }
+  const fromPath = (a.path || "").split(/[/\\]/).pop() || "";
+  // Temp paste files look like `a1b2c3d4-报告.docx` — strip uuid prefix if present.
+  const stripped = fromPath.replace(/^[0-9a-f]{8}-/i, "");
+  return stripped || fromName || fromPath || "file";
+}
+
 function formatDuration(ms: number): string {
   if (ms < 1000) return `${Math.max(1, Math.round(ms))}ms`;
   const sec = ms / 1000;
@@ -397,7 +433,20 @@ function nextLineId(kind: string): string {
   return `${kind}-${Date.now()}-${chatLineSeq}`;
 }
 
-/** After a turn ends: fold thought/tool/system into one collapsible trace above the answer. */
+/** Process kinds that fold into the collapsible "Worked" strip. */
+function isProcessLine(
+  line: ChatLine,
+): line is Extract<ChatLine, { kind: "thought" | "tool" | "system" }> {
+  return (
+    line.kind === "thought" || line.kind === "tool" || line.kind === "system"
+  );
+}
+
+/**
+ * After a turn ends: fold thought/tool/system into one collapsible trace
+ * above the answer(s). Safe to call again if late tool events arrived after
+ * a previous collapse (merges into existing trace).
+ */
 function collapseTurnProcess(
   lines: ChatLine[],
   durationMs: number,
@@ -413,20 +462,25 @@ function collapseTurnProcess(
 
   const head = lines.slice(0, lastUser + 1);
   const tail = lines.slice(lastUser + 1);
-  // Don't collapse twice.
-  if (tail.some((l) => l.kind === "trace")) return lines;
 
   const items: TraceItem[] = [];
   const answers: ChatLine[] = [];
   const rest: ChatLine[] = [];
+  let existingTrace: Extract<ChatLine, { kind: "trace" }> | null = null;
 
   for (const line of tail) {
-    if (line.kind === "waiting") continue; // drop typing placeholder
-    if (
-      line.kind === "thought" ||
-      line.kind === "tool" ||
-      line.kind === "system"
-    ) {
+    if (line.kind === "waiting") continue;
+    if (line.kind === "trace") {
+      // Keep first trace; fold any later process lines into it.
+      if (!existingTrace) {
+        existingTrace = line;
+        items.push(...line.items);
+      } else {
+        items.push(...line.items);
+      }
+      continue;
+    }
+    if (isProcessLine(line)) {
       items.push({ id: line.id, kind: line.kind, text: line.text });
     } else if (line.kind === "assistant") {
       answers.push(line);
@@ -437,15 +491,52 @@ function collapseTurnProcess(
 
   if (items.length === 0) return lines;
 
+  // Prefer measured duration; keep prior trace duration if new measure is 0.
+  const priorDur = existingTrace?.durationMs ?? 0;
+  const dur =
+    durationMs > 0 ? durationMs : priorDur > 0 ? priorDur : 0;
+
   const trace: ChatLine = {
-    id: nextLineId("trace"),
+    id: existingTrace?.id ?? nextLineId("trace"),
     kind: "trace",
     items,
-    durationMs: Math.max(0, durationMs),
+    durationMs: Math.max(0, dur),
     expanded: false,
   };
 
   return [...head, trace, ...answers, ...rest];
+}
+
+/**
+ * Collapse every turn in a transcript that still has raw thought/tool lines.
+ * Used when loading history that was saved before collapse ran.
+ */
+function collapseAllTurnsInHistory(lines: ChatLine[]): ChatLine[] {
+  const userIdx: number[] = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i].kind === "user") userIdx.push(i);
+  }
+  if (userIdx.length === 0) return lines;
+
+  const out: ChatLine[] = [];
+  // Preserve any prefix before the first user message.
+  if (userIdx[0] > 0) {
+    out.push(...lines.slice(0, userIdx[0]));
+  }
+
+  for (let u = 0; u < userIdx.length; u++) {
+    const start = userIdx[u];
+    const end = u + 1 < userIdx.length ? userIdx[u + 1] : lines.length;
+    const turnSlice = lines.slice(start, end);
+    if (turnSlice.some(isProcessLine)) {
+      // collapseTurnProcess folds from the last user in its input — pass only this turn.
+      const collapsed = collapseTurnProcess(turnSlice, 0);
+      out.push(...collapsed);
+    } else {
+      out.push(...turnSlice);
+    }
+  }
+  return out;
 }
 
 function summarizeTrace(items: TraceItem[]): string {
@@ -459,6 +550,7 @@ function summarizeTrace(items: TraceItem[]): string {
   if (parts.length === 0) parts.push(`${items.length} steps`);
   return parts.join(" · ");
 }
+
 
 type AgentEvent = {
   type: string;
@@ -498,6 +590,23 @@ function shortPath(p: string | null | undefined): string {
   if (parts.length <= 2) return p;
   return `…/${parts.slice(-2).join("/")}`;
 }
+
+/** Parent directory of a path (POSIX-ish). */
+function parentDir(path: string): string | null {
+  const norm = path.replace(/\\/g, "/").replace(/\/+$/, "");
+  const i = norm.lastIndexOf("/");
+  if (i <= 0) return null;
+  // Keep leading slash on absolute paths.
+  return norm.slice(0, i) || "/";
+}
+
+type DirEntry = {
+  name: string;
+  path: string;
+  is_dir: boolean;
+  size?: number | null;
+  modified?: string | null;
+};
 
 function ChipIcon({ kind }: { kind: ChatLine["kind"] | TraceItem["kind"] }) {
   switch (kind) {
@@ -565,6 +674,14 @@ export default function App() {
   const [view, setView] = useState<"workspace" | "settings">("workspace");
   /** Right Outputs rail — collapsible to free chat space. */
   const [outputsOpen, setOutputsOpen] = useState(true);
+  /** Right panel tab: overview (approvals/task) vs session files. */
+  const [outputsTab, setOutputsTab] = useState<"overview" | "files">("overview");
+  /** Which root is listed: task cwd vs project folder. */
+  const [filesRootKind, setFilesRootKind] = useState<"task" | "project">("task");
+  const [filesBrowsePath, setFilesBrowsePath] = useState<string | null>(null);
+  const [filesEntries, setFilesEntries] = useState<DirEntry[]>([]);
+  const [filesLoading, setFilesLoading] = useState(false);
+  const [filesError, setFilesError] = useState<string | null>(null);
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   const [models, setModels] = useState<ModelOption[]>([]);
   const [modelId, setModelId] = useState<string>("grok-4.5");
@@ -603,6 +720,12 @@ export default function App() {
   const userMsgEls = useRef<Map<string, HTMLDivElement>>(new Map());
   /** Wall-clock start of the in-flight agent turn (for duration on collapse). */
   const turnStartedAtRef = useRef<number | null>(null);
+  /**
+   * Auto-continue when the model ends a turn with only verbal progress.
+   * Resets when the user sends a new prompt; max 1 auto-nudge per user turn.
+   */
+  const verbalNudgeUsedRef = useRef(false);
+  const autoNudgeInFlightRef = useRef(false);
   /** First assistant delta for the in-flight reply (for tok/s). */
   const assistantStreamStartedAtRef = useRef<number | null>(null);
   /** Last assistant delta timestamp for the in-flight reply. */
@@ -799,9 +922,11 @@ export default function App() {
         if (!raw) return [] as ChatLine[];
         const parsed = JSON.parse(raw) as ChatLine[];
         if (!Array.isArray(parsed)) return [] as ChatLine[];
-        return parsed.filter(
+        const filtered = parsed.filter(
           (l) => l && l.kind && l.kind !== "waiting" && !isConnectionNoise(l),
         );
+        // Older histories may still have expanded thought/tool rows — fold them.
+        return collapseAllTurnsInHistory(filtered);
       } catch {
         return [] as ChatLine[];
       }
@@ -984,6 +1109,104 @@ export default function App() {
     }
   }, []);
 
+  /**
+   * If the model ended with talk-only progress, warn in chat and auto-send a
+   * one-shot follow-up that forces tool use + delivery confirmation.
+   */
+  const maybeHandleVerbalOnlyCompletion = useCallback(
+    (chat: ChatLine[]) => {
+      if (autoNudgeInFlightRef.current) return;
+      const hit = detectVerbalOnlyCompletion(
+        chat as Parameters<typeof detectVerbalOnlyCompletion>[0],
+      );
+      if (!hit) return;
+
+      // Always surface a clear system note; auto-continue only once per user send.
+      const canAutoNudge = hit.shouldNudge && !verbalNudgeUsedRef.current;
+      const warnText = canAutoNudge
+        ? hit.warning
+        : hit.warning.replace(
+            /将自动续跑一次[^\n]*/g,
+            "请手动再发一条明确指令（要求执行工具并确认文件存在）。",
+          );
+      if (canAutoNudge) verbalNudgeUsedRef.current = true;
+
+      const warnLine: ChatLine = {
+        id: nextLineId("system"),
+        kind: "system",
+        text: warnText,
+      };
+      const withWarn = [...chat, warnLine];
+      setLines(withWarn);
+      linesRef.current = withWarn;
+      void flushPersistHistory();
+
+      if (!canAutoNudge) return;
+      if (!sessionIdRef.current) return;
+
+      autoNudgeInFlightRef.current = true;
+      // Brief delay so UI paints the warning before the next turn starts.
+      window.setTimeout(() => {
+        void (async () => {
+          const sid = sessionIdRef.current;
+          if (!sid) {
+            autoNudgeInFlightRef.current = false;
+            return;
+          }
+          // User bubble for the auto-continue (visible, so history is honest).
+          const userId = nextLineId("user");
+          const waitingId = nextLineId("waiting");
+          const nudged: ChatLine[] = [
+            ...linesRef.current,
+            {
+              id: userId,
+              kind: "user",
+              text: "（自动续跑）请用工具完成交付并确认文件存在",
+              at: new Date().toISOString(),
+            },
+            {
+              id: waitingId,
+              kind: "waiting",
+              text: "Grokx is thinking…",
+            },
+          ];
+          setLines(nudged);
+          linesRef.current = nudged;
+          turnStartedAtRef.current = Date.now();
+          setSessionBusyState(sid, true);
+          // Resume bottom follow for the auto-continue turn.
+          autoScrollEnabledRef.current = true;
+          userScrollIntentRef.current = false;
+          try {
+            await invoke("send_prompt_rich", {
+              payload: {
+                text: VERBAL_COMPLETION_NUDGE,
+                attachments: [],
+                model: modelId || null,
+                effort: effortId || null,
+              },
+            });
+          } catch (e) {
+            setSessionBusyState(sid, false);
+            // Drop waiting placeholder on send failure.
+            setLines((prev) => {
+              if (prev.length && prev[prev.length - 1].kind === "waiting") {
+                const next = prev.slice(0, -1);
+                linesRef.current = next;
+                return next;
+              }
+              return prev;
+            });
+            push({ kind: "error", text: String(e) });
+          } finally {
+            autoNudgeInFlightRef.current = false;
+          }
+        })();
+      }, 350);
+    },
+    [flushPersistHistory, setSessionBusyState, push, modelId, effortId],
+  );
+
   const finishTurnCollapse = useCallback(
     (error?: boolean) => {
       const started = turnStartedAtRef.current;
@@ -995,6 +1218,8 @@ export default function App() {
       const streamEnd = assistantStreamLastAtRef.current ?? Date.now();
       assistantStreamStartedAtRef.current = null;
       assistantStreamLastAtRef.current = null;
+
+      let finalChat: ChatLine[] | null = null;
 
       setLines((prev) => {
         let next = collapseTurnProcess(prev, durationMs);
@@ -1050,16 +1275,51 @@ export default function App() {
           }
         }
         linesRef.current = next;
+        finalChat = next;
         // After first successful assistant reply, summarize and rename the task.
         if (!error) {
           void maybeAutoTitleFromChat(next);
         }
         return next;
       });
+
+      // Late tool/thought events can race turn_finished — collapse once more
+      // from the latest ref after React state has been scheduled.
+      window.setTimeout(() => {
+        const stillRaw = linesRef.current.some(
+          (l, i, arr) => {
+            if (!isProcessLine(l)) return false;
+            // Only care about process lines after the last user.
+            let lastUser = -1;
+            for (let j = arr.length - 1; j >= 0; j--) {
+              if (arr[j].kind === "user") {
+                lastUser = j;
+                break;
+              }
+            }
+            return i > lastUser;
+          },
+        );
+        if (!stillRaw) return;
+        const repaired = collapseTurnProcess(linesRef.current, durationMs);
+        linesRef.current = repaired;
+        setLines(repaired);
+        void flushPersistHistory();
+      }, 80);
+
       // Persist immediately after a turn settles.
       void flushPersistHistory();
+
+      // Premature verbal-only completion → warn + one auto-continue.
+      if (!error && finalChat) {
+        maybeHandleVerbalOnlyCompletion(finalChat);
+      }
     },
-    [flushPersistHistory, maybeAutoTitleFromChat],
+    [
+      flushPersistHistory,
+      maybeAutoTitleFromChat,
+      maybeHandleVerbalOnlyCompletion,
+    ],
   );
 
   const toggleTrace = useCallback(
@@ -2684,10 +2944,14 @@ export default function App() {
         for (const f of files) {
           if (seen.has(f.path)) continue;
           seen.add(f.path);
+          const displayName = attachmentDisplayName({
+            name: f.name,
+            path: f.path,
+          });
           next.push({
             path: f.path,
-            name: f.name || f.path.split(/[/\\]/).pop() || f.path,
-            mime: f.mime,
+            name: displayName,
+            mime: f.mime ?? null,
             size: f.size,
             previewUrl: f.previewUrl ?? null,
           });
@@ -3033,6 +3297,7 @@ export default function App() {
     }
 
     turnStartedAtRef.current = Date.now();
+    verbalNudgeUsedRef.current = false;
     const sid = sessionIdRef.current;
     if (sid) setSessionBusyState(sid, true);
     else setBusy(true);
@@ -3080,14 +3345,17 @@ export default function App() {
       textareaRef.current.style.height = "auto";
     }
     turnStartedAtRef.current = Date.now();
+    // Fresh user turn: allow one auto-nudge again if the model only talks.
+    verbalNudgeUsedRef.current = false;
     const sid = sessionIdRef.current;
     if (sid) setSessionBusyState(sid, true);
     else setBusy(true);
     // New user turn: resume gentle auto-follow from the bottom.
     enableAutoScroll();
     const chatAtts: ChatAttachment[] = pendingAttachments.map((a) => {
+      const name = attachmentDisplayName(a);
       let previewSrc: string | null = a.previewUrl ?? null;
-      if (!previewSrc && a.path && a.mime?.startsWith("image/")) {
+      if (!previewSrc && a.path && isImageAttachment({ name, mime: a.mime })) {
         try {
           previewSrc = convertFileSrc(a.path);
         } catch {
@@ -3096,20 +3364,15 @@ export default function App() {
       }
       return {
         path: a.path,
-        name: a.name,
+        name,
         mime: a.mime ?? null,
         size: a.size ?? null,
         previewSrc,
       };
     });
-    // Text for history/search; images render as thumbnails via attachments.
-    const display =
-      text ||
-      (chatAtts.length
-        ? chatAtts.every((a) => a.mime?.startsWith("image/"))
-          ? ""
-          : chatAtts.map((a) => a.name).join(", ")
-        : "");
+    // User bubble always keeps original attachment names (Word/docx etc.).
+    // Text is the typed prompt; files render as chips under the bubble.
+    const display = text;
     push({
       kind: "user",
       text: display,
@@ -3124,7 +3387,7 @@ export default function App() {
           text,
           attachments: pendingAttachments.map((a) => ({
             path: a.path,
-            name: a.name,
+            name: attachmentDisplayName(a),
             mime: a.mime ?? null,
             size: a.size ?? null,
           })),
@@ -3155,6 +3418,110 @@ export default function App() {
       finishTurnCollapse(false);
     }
   };
+
+  /** Absolute root for the Files tab (task cwd or project folder). */
+  const filesRootPath = useMemo(() => {
+    if (!session) return null;
+    if (filesRootKind === "project") {
+      return session.project_root || session.work_path || null;
+    }
+    return session.work_path || session.project_root || null;
+  }, [session, filesRootKind]);
+
+  const loadFilesDir = useCallback(
+    async (path: string) => {
+      setFilesLoading(true);
+      setFilesError(null);
+      try {
+        const rows = await invoke<DirEntry[]>("list_directory", {
+          path,
+          maxEntries: 200,
+        });
+        setFilesBrowsePath(path);
+        setFilesEntries(rows);
+      } catch (e) {
+        setFilesError(String(e));
+        setFilesEntries([]);
+      } finally {
+        setFilesLoading(false);
+      }
+    },
+    [],
+  );
+
+  const refreshFilesTab = useCallback(() => {
+    const root = filesRootPath;
+    if (!root) {
+      setFilesEntries([]);
+      setFilesBrowsePath(null);
+      setFilesError(null);
+      return;
+    }
+    // Stay under the current root when refreshing mid-browse.
+    const target =
+      filesBrowsePath &&
+      (filesBrowsePath === root ||
+        filesBrowsePath.startsWith(root + "/") ||
+        filesBrowsePath.startsWith(root + "\\"))
+        ? filesBrowsePath
+        : root;
+    void loadFilesDir(target);
+  }, [filesRootPath, filesBrowsePath, loadFilesDir]);
+
+  // Load / refresh Files when tab opens or session / root kind changes.
+  useEffect(() => {
+    if (outputsTab !== "files") return;
+    if (!filesRootPath) {
+      setFilesEntries([]);
+      setFilesBrowsePath(null);
+      setFilesError(session ? null : "Open a task to browse files");
+      return;
+    }
+    // Reset browse path when root kind / session root changes.
+    void loadFilesDir(filesRootPath);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- only re-root on session/root change
+  }, [outputsTab, filesRootPath, session?.session_id]);
+
+  // After a turn finishes, refresh file list if Files tab is open.
+  useEffect(() => {
+    if (outputsTab !== "files" || busy || !filesBrowsePath) return;
+    // Soft refresh when leaving busy (agent may have written files).
+    const t = window.setTimeout(() => {
+      void loadFilesDir(filesBrowsePath);
+    }, 400);
+    return () => window.clearTimeout(t);
+  }, [busy, outputsTab, filesBrowsePath, loadFilesDir]);
+
+  const onOpenFilesPath = useCallback(async (path: string) => {
+    try {
+      await invoke("open_path", { path });
+    } catch (e) {
+      setFilesError(String(e));
+    }
+  }, []);
+
+  const onFilesEntryClick = useCallback(
+    (ent: DirEntry) => {
+      if (ent.is_dir) {
+        void loadFilesDir(ent.path);
+      } else {
+        void onOpenFilesPath(ent.path);
+      }
+    },
+    [loadFilesDir, onOpenFilesPath],
+  );
+
+  const filesCanGoUp = useMemo(() => {
+    if (!filesBrowsePath || !filesRootPath) return false;
+    const parent = parentDir(filesBrowsePath);
+    if (!parent) return false;
+    // Stay inside the selected root.
+    return (
+      parent === filesRootPath ||
+      parent.startsWith(filesRootPath + "/") ||
+      parent.startsWith(filesRootPath + "\\")
+    );
+  }, [filesBrowsePath, filesRootPath]);
 
   const onPermission = async (decision: "allow_once" | "deny") => {
     if (!pendingPerm) return;
@@ -3882,9 +4249,11 @@ export default function App() {
                             <span className="trace-label">
                               Worked · {summarizeTrace(line.items)}
                             </span>
-                            <span className="trace-duration">
-                              {formatDuration(line.durationMs)}
-                            </span>
+                            {line.durationMs > 0 && (
+                              <span className="trace-duration">
+                                {formatDuration(line.durationMs)}
+                              </span>
+                            )}
                           </button>
                           {line.expanded && (
                             <div className="trace-body">
@@ -4067,14 +4436,12 @@ export default function App() {
                   }
                   if (line.kind === "user") {
                     const timeLabel = formatMessageTime(line.at);
-                    const imgs = (line.attachments ?? []).filter(
+                    const atts = line.attachments ?? [];
+                    const imgs = atts.filter(
                       (a) =>
-                        a.mime?.startsWith("image/") &&
-                        (a.previewSrc || a.path),
+                        isImageAttachment(a) && (a.previewSrc || a.path),
                     );
-                    const files = (line.attachments ?? []).filter(
-                      (a) => !a.mime?.startsWith("image/"),
-                    );
+                    const files = atts.filter((a) => !isImageAttachment(a));
                     const isEditing = editingUserId === line.id;
                     const canEdit = !busy && !connecting && !isEditing;
                     return (
@@ -4111,15 +4478,18 @@ export default function App() {
                               )}
                               {files.length > 0 && (
                                 <div className="msg-user-files">
-                                  {files.map((a) => (
-                                    <span
-                                      key={a.path || a.name}
-                                      className="msg-user-file-chip"
-                                      title={a.path}
-                                    >
-                                      📎 {a.name}
-                                    </span>
-                                  ))}
+                                  {files.map((a) => {
+                                    const label = attachmentDisplayName(a);
+                                    return (
+                                      <span
+                                        key={a.path || label}
+                                        className="msg-user-file-chip"
+                                        title={a.path || label}
+                                      >
+                                        📎 {label}
+                                      </span>
+                                    );
+                                  })}
                                 </div>
                               )}
                               <textarea
@@ -4213,15 +4583,31 @@ export default function App() {
                                 )}
                                 {files.length > 0 && (
                                   <div className="msg-user-files">
-                                    {files.map((a) => (
-                                      <span
-                                        key={a.path || a.name}
-                                        className="msg-user-file-chip"
-                                        title={a.path}
-                                      >
-                                        📎 {a.name}
-                                      </span>
-                                    ))}
+                                    {files.map((a) => {
+                                      const label = attachmentDisplayName(a);
+                                      return (
+                                        <button
+                                          key={a.path || label}
+                                          type="button"
+                                          className="msg-user-file-chip"
+                                          title={a.path || label}
+                                          onClick={() => {
+                                            if (!a.path) return;
+                                            void invoke("open_path", {
+                                              path: a.path,
+                                            }).catch(() => {
+                                              void openUrl(
+                                                a.path.startsWith("file:")
+                                                  ? a.path
+                                                  : `file://${a.path}`,
+                                              ).catch(() => {});
+                                            });
+                                          }}
+                                        >
+                                          📎 {label}
+                                        </button>
+                                      );
+                                    })}
                                   </div>
                                 )}
                                 {line.text ? (
@@ -4229,6 +4615,13 @@ export default function App() {
                                     {line.text}
                                   </div>
                                 ) : null}
+                                {!line.text &&
+                                  files.length === 0 &&
+                                  imgs.length === 0 && (
+                                    <div className="msg-user-text muted">
+                                      (empty)
+                                    </div>
+                                  )}
                               </div>
                               <div className="msg-user-meta">
                                 {canEdit && (
@@ -4288,41 +4681,48 @@ export default function App() {
             <div className="composer-dock">
               {attachments.length > 0 && (
                 <div className="attach-row">
-                  {attachments.map((a) => (
-                    <div
-                      key={a.path}
-                      className={`attach-chip${
-                        a.mime?.startsWith("image/") ? " attach-chip-image" : ""
-                      }`}
-                      title={a.path}
-                    >
-                      {a.mime?.startsWith("image/") && a.previewUrl ? (
-                        <img
-                          className="attach-thumb"
-                          src={a.previewUrl}
-                          alt={a.name}
-                        />
-                      ) : (
-                        <span className="attach-icon">
-                          {a.mime?.startsWith("image/") ? "🖼" : "📄"}
-                        </span>
-                      )}
-                      <span className="attach-name">{a.name}</span>
-                      {a.size != null && (
-                        <span className="attach-size">
-                          {formatBytes(a.size)}
-                        </span>
-                      )}
-                      <button
-                        type="button"
-                        className="attach-remove"
-                        onClick={() => removeAttachment(a.path)}
-                        aria-label="Remove attachment"
+                  {attachments.map((a) => {
+                    const label = attachmentDisplayName(a);
+                    const isImg = isImageAttachment(a);
+                    return (
+                      <div
+                        key={a.path}
+                        className={`attach-chip${
+                          isImg ? " attach-chip-image" : ""
+                        }`}
+                        title={label}
                       >
-                        ×
-                      </button>
-                    </div>
-                  ))}
+                        {isImg && (a.previewUrl || a.path) ? (
+                          <img
+                            className="attach-thumb"
+                            src={
+                              a.previewUrl ||
+                              (a.path ? convertFileSrc(a.path) : "")
+                            }
+                            alt={label}
+                          />
+                        ) : (
+                          <span className="attach-icon" aria-hidden>
+                            📄
+                          </span>
+                        )}
+                        <span className="attach-name">{label}</span>
+                        {a.size != null && (
+                          <span className="attach-size">
+                            {formatBytes(a.size)}
+                          </span>
+                        )}
+                        <button
+                          type="button"
+                          className="attach-remove"
+                          onClick={() => removeAttachment(a.path)}
+                          aria-label="Remove attachment"
+                        >
+                          ×
+                        </button>
+                      </div>
+                    );
+                  })}
                 </div>
               )}
               <textarea
@@ -4473,84 +4873,246 @@ export default function App() {
                 <h2>Outputs</h2>
               </div>
 
-              {error && !session && (
+              <div className="outputs-tabs" role="tablist" aria-label="Outputs">
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={outputsTab === "overview"}
+                  className={`outputs-tab${
+                    outputsTab === "overview" ? " active" : ""
+                  }`}
+                  onClick={() => setOutputsTab("overview")}
+                >
+                  Overview
+                </button>
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={outputsTab === "files"}
+                  className={`outputs-tab${
+                    outputsTab === "files" ? " active" : ""
+                  }`}
+                  onClick={() => setOutputsTab("files")}
+                  title="Browse this task's workspace and project files"
+                >
+                  Files
+                </button>
+              </div>
+
+              {error && !session && outputsTab === "overview" && (
                 <div className="error-banner" style={{ marginBottom: 12 }}>
                   {error}
                 </div>
               )}
 
-              {pendingPerm && (
-                <div className="card">
-                  <div className="perm-title">{pendingPerm.tool_name}</div>
-                  <p>{pendingPerm.summary}</p>
-                  {pendingPerm.detail && (
-                    <pre className="perm-detail">{pendingPerm.detail}</pre>
+              {outputsTab === "overview" && (
+                <>
+                  {pendingPerm && (
+                    <div className="card">
+                      <div className="perm-title">{pendingPerm.tool_name}</div>
+                      <p>{pendingPerm.summary}</p>
+                      {pendingPerm.detail && (
+                        <pre className="perm-detail">{pendingPerm.detail}</pre>
+                      )}
+                      <div className="btn-row" style={{ marginTop: 12 }}>
+                        <button
+                          className="btn btn-accent"
+                          onClick={() => void onPermission("allow_once")}
+                        >
+                          Allow
+                        </button>
+                        <button
+                          className="btn btn-ghost"
+                          onClick={() => void onPermission("deny")}
+                        >
+                          Deny
+                        </button>
+                      </div>
+                      <p className="hint">
+                        Agent waiting · {pendingPerm.id.slice(0, 8)}
+                      </p>
+                    </div>
                   )}
-                  <div className="btn-row" style={{ marginTop: 12 }}>
+
+                  {session && !pendingPerm && (
+                    <div className="card">
+                      <h3>Approvals</h3>
+                      <p className="muted">
+                        When auto-approve is off, tool permission requests appear
+                        here.
+                      </p>
+                    </div>
+                  )}
+
+                  {session && (
+                    <div className="card">
+                      <h3>Current task</h3>
+                      <dl className="kv">
+                        {session.project_root && (
+                          <>
+                            <dt>Project</dt>
+                            <dd className="mono" title={session.project_root}>
+                              {shortPath(session.project_root)}
+                            </dd>
+                          </>
+                        )}
+                        {session.work_path && (
+                          <>
+                            <dt>Task cwd</dt>
+                            <dd className="mono" title={session.work_path}>
+                              {shortPath(session.work_path)}
+                            </dd>
+                          </>
+                        )}
+                      </dl>
+                      <p className="muted" style={{ marginTop: 8 }}>
+                        Temporary workspace under ~/.grokx/tasks/. Project
+                        sources via ./project.
+                      </p>
+                    </div>
+                  )}
+
+                  {!session && !pendingPerm && (
+                    <div className="card">
+                      <h3>Outputs</h3>
+                      <p className="muted">
+                        Permissions and task details show up here after you open
+                        a project from the sidebar.
+                      </p>
+                    </div>
+                  )}
+                </>
+              )}
+
+              {outputsTab === "files" && (
+                <div className="card files-card">
+                  <div className="files-card-head">
+                    <h3>Session files</h3>
                     <button
-                      className="btn btn-accent"
-                      onClick={() => void onPermission("allow_once")}
+                      type="button"
+                      className="files-icon-btn"
+                      title="Refresh"
+                      disabled={!filesRootPath || filesLoading}
+                      onClick={() => refreshFilesTab()}
                     >
-                      Allow
-                    </button>
-                    <button
-                      className="btn btn-ghost"
-                      onClick={() => void onPermission("deny")}
-                    >
-                      Deny
+                      <IconRefresh size={14} />
                     </button>
                   </div>
-                  <p className="hint">
-                    Agent waiting · {pendingPerm.id.slice(0, 8)}
-                  </p>
-                </div>
-              )}
 
-              {session && !pendingPerm && (
-                <div className="card">
-                  <h3>Approvals</h3>
-                  <p className="muted">
-                    When auto-approve is off, tool permission requests appear
-                    here.
-                  </p>
-                </div>
-              )}
+                  {!session ? (
+                    <p className="muted">Open a task to browse its directory.</p>
+                  ) : (
+                    <>
+                      <div className="files-root-toggle" role="group">
+                        <button
+                          type="button"
+                          className={`files-root-btn${
+                            filesRootKind === "task" ? " active" : ""
+                          }`}
+                          disabled={!session.work_path}
+                          onClick={() => setFilesRootKind("task")}
+                          title={session.work_path || "No task cwd"}
+                        >
+                          Task
+                        </button>
+                        <button
+                          type="button"
+                          className={`files-root-btn${
+                            filesRootKind === "project" ? " active" : ""
+                          }`}
+                          disabled={!session.project_root}
+                          onClick={() => setFilesRootKind("project")}
+                          title={session.project_root || "No project"}
+                        >
+                          Project
+                        </button>
+                      </div>
 
-              {session && (
-                <div className="card">
-                  <h3>Current task</h3>
-                  <dl className="kv">
-                    {session.project_root && (
-                      <>
-                        <dt>Project</dt>
-                        <dd className="mono" title={session.project_root}>
-                          {shortPath(session.project_root)}
-                        </dd>
-                      </>
-                    )}
-                    {session.work_path && (
-                      <>
-                        <dt>Task cwd</dt>
-                        <dd className="mono" title={session.work_path}>
-                          {shortPath(session.work_path)}
-                        </dd>
-                      </>
-                    )}
-                  </dl>
-                  <p className="muted" style={{ marginTop: 8 }}>
-                    Temporary workspace under ~/.grokx/tasks/. Project sources
-                    via ./project.
-                  </p>
-                </div>
-              )}
+                      <div className="files-path-bar" title={filesBrowsePath || ""}>
+                        <button
+                          type="button"
+                          className="files-icon-btn"
+                          title="Go up"
+                          disabled={!filesCanGoUp || filesLoading}
+                          onClick={() => {
+                            const p = filesBrowsePath
+                              ? parentDir(filesBrowsePath)
+                              : null;
+                            if (p) void loadFilesDir(p);
+                          }}
+                        >
+                          ↑
+                        </button>
+                        <button
+                          type="button"
+                          className="files-path-text mono"
+                          title="Open in Finder / Explorer"
+                          disabled={!filesBrowsePath}
+                          onClick={() => {
+                            if (filesBrowsePath) {
+                              void onOpenFilesPath(filesBrowsePath);
+                            }
+                          }}
+                        >
+                          {filesBrowsePath
+                            ? shortPath(filesBrowsePath)
+                            : "—"}
+                        </button>
+                      </div>
 
-              {!session && !pendingPerm && (
-                <div className="card">
-                  <h3>Outputs</h3>
-                  <p className="muted">
-                    Permissions and task details show up here after you open a
-                    project from the sidebar.
-                  </p>
+                      {filesError && (
+                        <p className="files-error">{filesError}</p>
+                      )}
+                      {filesLoading && (
+                        <p className="muted files-loading">Loading…</p>
+                      )}
+
+                      {!filesLoading && !filesError && filesEntries.length === 0 && (
+                        <p className="muted">Empty folder</p>
+                      )}
+
+                      <ul className="files-list">
+                        {filesEntries.map((ent) => (
+                          <li key={ent.path}>
+                            <button
+                              type="button"
+                              className={`files-entry${
+                                ent.is_dir ? " is-dir" : ""
+                              }`}
+                              title={ent.path}
+                              onClick={() => onFilesEntryClick(ent)}
+                              onDoubleClick={() => {
+                                if (ent.is_dir) {
+                                  void loadFilesDir(ent.path);
+                                } else {
+                                  void onOpenFilesPath(ent.path);
+                                }
+                              }}
+                            >
+                              <span className="files-entry-icon" aria-hidden>
+                                {ent.is_dir ? (
+                                  <IconFolder size={14} />
+                                ) : (
+                                  <IconFile size={14} />
+                                )}
+                              </span>
+                              <span className="files-entry-name">{ent.name}</span>
+                              {!ent.is_dir && ent.size != null && (
+                                <span className="files-entry-meta">
+                                  {formatBytes(ent.size)}
+                                </span>
+                              )}
+                            </button>
+                          </li>
+                        ))}
+                      </ul>
+
+                      <p className="muted files-hint">
+                        Click a file to open · folder to enter · path bar opens
+                        in Finder
+                      </p>
+                    </>
+                  )}
                 </div>
               )}
             </aside>

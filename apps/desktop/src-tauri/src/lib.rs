@@ -481,6 +481,74 @@ async fn save_settings(
         .map_err(|e| e.to_string())
 }
 
+/// Guess mime when mime_guess is weak (Office Open XML, etc.).
+fn mime_from_path_or_name(path: &std::path::Path, name: &str) -> Option<String> {
+    if let Some(m) = mime_guess::from_path(path).first() {
+        let s = m.essence_str().to_string();
+        if s != "application/octet-stream" {
+            return Some(s);
+        }
+    }
+    mime_from_filename(name)
+}
+
+fn mime_from_filename(name: &str) -> Option<String> {
+    let lower = name.to_ascii_lowercase();
+    let ext = lower.rsplit('.').next().unwrap_or("");
+    let mime = match ext {
+        "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "doc" => "application/msword",
+        "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "xls" => "application/vnd.ms-excel",
+        "pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "ppt" => "application/vnd.ms-powerpoint",
+        "pdf" => "application/pdf",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "txt" => "text/plain",
+        "md" => "text/markdown",
+        "json" => "application/json",
+        "csv" => "text/csv",
+        _ => return None,
+    };
+    Some(mime.to_string())
+}
+
+/// Sanitize a display filename for use on disk while keeping readable names
+/// (including Chinese). Only strips path separators and control chars.
+fn safe_filename_for_disk(name: &str, fallback_ext: &str) -> String {
+    let trimmed = name.trim();
+    let base = if trimmed.is_empty() {
+        format!("file.{fallback_ext}")
+    } else {
+        trimmed.to_string()
+    };
+    let mut out: String = base
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | '\0' => '_',
+            c if c.is_control() => '_',
+            c => c,
+        })
+        .collect();
+    // Avoid empty / dot-only names.
+    if out.trim_matches('.').is_empty() {
+        out = format!("file.{fallback_ext}");
+    }
+    // Ensure extension if missing and we know one.
+    if !fallback_ext.is_empty()
+        && !out
+            .to_ascii_lowercase()
+            .ends_with(&format!(".{}", fallback_ext.to_ascii_lowercase()))
+        && !out.contains('.')
+    {
+        out = format!("{out}.{fallback_ext}");
+    }
+    out
+}
+
 #[tauri::command]
 async fn pick_attachments(app: AppHandle) -> Result<Vec<AttachmentInput>, String> {
     use tauri_plugin_dialog::DialogExt;
@@ -489,12 +557,23 @@ async fn pick_attachments(app: AppHandle) -> Result<Vec<AttachmentInput>, String
         .file()
         .set_title("Attach files")
         .add_filter(
-            "Common",
+            "Documents",
             &[
-                "png", "jpg", "jpeg", "gif", "webp", "pdf", "txt", "md", "json", "rs", "ts",
-                "tsx", "js", "py", "go", "toml", "yaml", "yml", "csv", "html", "css",
+                "docx", "doc", "xlsx", "xls", "pptx", "ppt", "pdf", "txt", "md", "csv",
             ],
         )
+        .add_filter(
+            "Images",
+            &["png", "jpg", "jpeg", "gif", "webp", "bmp", "svg"],
+        )
+        .add_filter(
+            "Code",
+            &[
+                "json", "rs", "ts", "tsx", "js", "py", "go", "toml", "yaml", "yml", "html",
+                "css",
+            ],
+        )
+        .add_filter("All", &["*"])
         .blocking_pick_files();
     let Some(files) = files else {
         return Ok(vec![]);
@@ -504,14 +583,13 @@ async fn pick_attachments(app: AppHandle) -> Result<Vec<AttachmentInput>, String
         let path = f
             .into_path()
             .map_err(|e| format!("invalid path: {e}"))?;
+        // Always keep the on-disk original basename for display (Word, etc.).
         let name = path
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| path.display().to_string());
         let size = std::fs::metadata(&path).ok().map(|m| m.len());
-        let mime = mime_guess::from_path(&path)
-            .first()
-            .map(|m| m.essence_str().to_string());
+        let mime = mime_from_path_or_name(&path, &name);
         out.push(AttachmentInput {
             path: path.display().to_string(),
             name: Some(name),
@@ -534,17 +612,26 @@ fn mime_to_ext(mime: &str) -> &'static str {
         "text/plain" => "txt",
         "text/markdown" => "md",
         "application/json" => "json",
+        "application/msword" => "doc",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document" => "docx",
+        "application/vnd.ms-excel" => "xls",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" => "xlsx",
+        "application/vnd.ms-powerpoint" => "ppt",
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation" => {
+            "pptx"
+        }
         _ if mime.starts_with("image/") => "png",
         _ => "bin",
     }
 }
 
 /// Save a clipboard-pasted image/file into a temp path for the agent to read.
+/// `name` on the result is the **original display name** (e.g. `报告.docx`), not the temp path.
 #[tauri::command]
 async fn save_pasted_attachment(
     payload: PastedAttachmentInput,
 ) -> Result<AttachmentInput, String> {
-    let mime = payload
+    let mut mime = payload
         .mime
         .as_deref()
         .map(str::trim)
@@ -577,48 +664,55 @@ async fn save_pasted_attachment(
         return Err("pasted file too large (max 25MB)".into());
     }
 
-    let ext = mime_to_ext(&mime);
-    let name = payload
+    // Prefer original filename; refine mime from it when browser only sent octet-stream.
+    let display_name_raw = payload
         .name
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| {
-            let stamp = chrono_like_stamp();
-            format!("paste-{stamp}.{ext}")
-        });
+        .map(|s| s.to_string());
+
+    if mime == "application/octet-stream" || mime.is_empty() {
+        if let Some(ref n) = display_name_raw {
+            if let Some(m) = mime_from_filename(n) {
+                mime = m;
+            }
+        }
+    }
+
+    let ext = mime_to_ext(&mime);
+    let display_name = display_name_raw.unwrap_or_else(|| {
+        let stamp = chrono_like_stamp();
+        format!("paste-{stamp}.{ext}")
+    });
+    // Keep original basename for the user-visible name (Word keeps 报告.docx).
+    let display_name = {
+        let leaf = display_name
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or(&display_name)
+            .trim();
+        if leaf.is_empty() {
+            format!("file.{ext}")
+        } else {
+            leaf.to_string()
+        }
+    };
 
     let dir = std::env::temp_dir().join("grokx-pastes");
     std::fs::create_dir_all(&dir).map_err(|e| format!("create paste dir: {e}"))?;
-    let safe_name = name
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect::<String>();
+    // Unique on-disk path; display name stays original.
+    let disk_name = safe_filename_for_disk(&display_name, ext);
     let path = dir.join(format!(
         "{}-{}",
         &Uuid::new_v4().to_string()[..8],
-        if safe_name.is_empty() {
-            format!("paste.{ext}")
-        } else {
-            safe_name
-        }
+        disk_name
     ));
     std::fs::write(&path, &bytes).map_err(|e| format!("write paste file: {e}"))?;
 
     Ok(AttachmentInput {
         path: path.display().to_string(),
-        name: Some(
-            path.file_name()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or(name),
-        ),
+        name: Some(display_name),
         mime: Some(mime),
         size: Some(bytes.len() as u64),
     })
@@ -777,6 +871,117 @@ async fn list_live_sessions(core: State<'_, CoreState>) -> Result<Vec<String>, S
         .collect())
 }
 
+#[derive(Debug, Serialize)]
+struct DirEntryInfo {
+    name: String,
+    path: String,
+    is_dir: bool,
+    size: Option<u64>,
+    /// ISO-ish modified time when available.
+    modified: Option<String>,
+}
+
+/// List one directory level for the Files tab (task workspace / project root).
+/// Skips hidden names (leading `.`) and caps entry count for UI.
+#[tauri::command]
+fn list_directory(
+    path: String,
+    max_entries: Option<usize>,
+) -> Result<Vec<DirEntryInfo>, String> {
+    let root = PathBuf::from(path.trim());
+    if root.as_os_str().is_empty() {
+        return Err("empty path".into());
+    }
+    if !root.is_dir() {
+        return Err(format!("not a directory: {}", root.display()));
+    }
+    let limit = max_entries.unwrap_or(200).clamp(1, 500);
+    let mut entries = Vec::new();
+    let read = std::fs::read_dir(&root).map_err(|e| format!("read_dir {}: {e}", root.display()))?;
+    for ent in read {
+        let ent = match ent {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        let name = ent.file_name().to_string_lossy().into_owned();
+        if name.starts_with('.') {
+            continue;
+        }
+        // Skip heavy / uninteresting dirs in task workspaces.
+        if name == "node_modules" || name == "target" || name == ".git" {
+            continue;
+        }
+        let path = ent.path();
+        let meta = ent.metadata().ok();
+        let is_dir = meta.as_ref().map(|m| m.is_dir()).unwrap_or(path.is_dir());
+        let size = meta.as_ref().and_then(|m| {
+            if m.is_file() {
+                Some(m.len())
+            } else {
+                None
+            }
+        });
+        let modified = meta.and_then(|m| m.modified().ok()).map(|t| {
+            match t.duration_since(std::time::UNIX_EPOCH) {
+                Ok(d) => format!("{}", d.as_secs()),
+                Err(_) => String::new(),
+            }
+        });
+        entries.push(DirEntryInfo {
+            name,
+            path: path.display().to_string(),
+            is_dir,
+            size,
+            modified: modified.filter(|s| !s.is_empty()),
+        });
+        if entries.len() >= limit {
+            break;
+        }
+    }
+    // Dirs first, then files; alphabetical within group.
+    entries.sort_by(|a, b| match (a.is_dir, b.is_dir) {
+        (true, false) => std::cmp::Ordering::Less,
+        (false, true) => std::cmp::Ordering::Greater,
+        _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+    });
+    Ok(entries)
+}
+
+/// Open a file or folder with the OS default app (Finder / Explorer / …).
+#[tauri::command]
+fn open_path(path: String) -> Result<(), String> {
+    let p = path.trim();
+    if p.is_empty() {
+        return Err("empty path".into());
+    }
+    let pb = PathBuf::from(p);
+    if !pb.exists() {
+        return Err(format!("path does not exist: {p}"));
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg(p)
+            .spawn()
+            .map_err(|e| format!("open: {e}"))?;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("cmd")
+            .args(["/C", "start", "", p])
+            .spawn()
+            .map_err(|e| format!("open: {e}"))?;
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        std::process::Command::new("xdg-open")
+            .arg(p)
+            .spawn()
+            .map_err(|e| format!("open: {e}"))?;
+    }
+    Ok(())
+}
+
 fn spawn_event_forwarder(app: AppHandle, core: Arc<AppCore>) {
     tauri::async_runtime::spawn(async move {
         let Some(mut rx) = core.take_event_receiver().await else {
@@ -875,6 +1080,8 @@ pub fn run() {
             is_session_live,
             is_session_busy,
             list_live_sessions,
+            list_directory,
+            open_path,
         ])
         .run(tauri::generate_context!())
         .expect("error while running grokx desktop");
