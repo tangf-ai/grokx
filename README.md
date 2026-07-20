@@ -12,7 +12,7 @@
 <p align="center">
   <a href="https://github.com/tangf-ai/grokx"><img src="https://img.shields.io/badge/github-tangf--ai%2Fgrokx-111?style=flat-square" alt="GitHub" /></a>
   <img src="https://img.shields.io/badge/license-Apache%202.0-blue?style=flat-square" alt="License" />
-  <img src="https://img.shields.io/badge/platform-macOS-lightgrey?style=flat-square" alt="Platform" />
+  <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Windows%20%7C%20Linux-lightgrey?style=flat-square" alt="Platform" />
 </p>
 
 ---
@@ -24,6 +24,19 @@
 | **App** | Tauri 2 + Rust core + React UI |
 | **Engine** | Grok Build via `git subtree` (`engine/grok-build`) |
 | **Boundary** | ACP over `grok agent stdio` (process isolation) |
+
+## Platforms
+
+Grokx is a **cross-platform** desktop app (macOS, Windows, Linux) built with Tauri.
+
+| Platform | Prebuilt installer | How to run |
+|----------|--------------------|------------|
+| **macOS** (Apple Silicon) | Yes — DMG on [Releases](https://github.com/tangf-ai/grokx/releases) | Download → install |
+| **Windows** | Not published yet | Clone repo → build yourself |
+| **Linux** | Not published yet | Clone repo → build yourself |
+
+Official GitHub Releases currently ship **macOS Apple Silicon** packages only.  
+**Windows and Linux users: download the source and compile locally** (see [Build from source](#build-from-source)). Contributors who produce installers for other targets are welcome to share them.
 
 ## Screenshots
 
@@ -46,14 +59,14 @@ User prompt, collapsible thinking trace with duration, final assistant reply.
 ## Features
 
 - Light Codex-style UI: projects, tasks, chat, sticky user prompts
+- **Multi-session agents** — switch Tasks while work continues in the background
 - **New task** without picking a folder (default sandbox `~/.grokx/workspace`)
-- Per-task workspace under `~/.grokx/tasks/<id>` with `project` symlink for source access
+- Projects nesting vs temporary Tasks; per-task workspace under `~/.grokx/tasks/<id>`
 - Attachments, **clipboard paste** (text + images), model picker, reasoning effort
-- Collapsible thinking / tool traces with duration after each turn
-- Permission approvals (park until Allow / Deny)
+- **Edit & re-send** past user prompts; collapsible thinking / tool traces
+- Permission modes: Needs approval · Auto · Full trust (synced to `~/.grok/config.toml`)
 - Settings for API base URL, key, model, and engine path
-- Task rename / delete; list order stays by creation time
-- Chat + task list persistence across app restarts
+- Task rename / delete; chat + task list persistence across restarts
 - Bundled runtime resolution (prefer `resources/runtime/grok` over PATH)
 
 ## Repository layout
@@ -74,9 +87,20 @@ See [docs/repo-structure.md](docs/repo-structure.md) and [docs/engine-policy.md]
 - Rust stable (`rustup`)
 - Node.js 20+ and pnpm (for the desktop UI)
 - Platform build tools for Tauri (see [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/))
+  - **macOS**: Xcode Command Line Tools
+  - **Windows**: Visual Studio C++ build tools, WebView2
+  - **Linux**: `webkit2gtk`, `libgtk`, and related packages (see Tauri docs)
 - Optional: a working `grok` CLI for PATH fallback during development
 
-## Quick start
+## Install (prebuilt)
+
+1. Open [GitHub Releases](https://github.com/tangf-ai/grokx/releases)
+2. Download the asset for your platform (currently `Grokx_*_aarch64.dmg` for **macOS Apple Silicon**)
+3. Install and launch; if macOS Gatekeeper blocks the app, see [FAQ](#macos-app-is-damaged--gatekeeper-blocks-grokx-after-download)
+
+For **Windows / Linux** (or Intel Mac), use [Build from source](#build-from-source) below.
+
+## Quick start (dev)
 
 ```bash
 git clone git@github.com:tangf-ai/grokx.git
@@ -86,7 +110,7 @@ cd grokx
 cargo test -p domain -p acp-bridge -p agent-process -p app-core \
   -p app-config -p permissions -p session-store
 
-# Desktop app
+# Desktop app (hot reload)
 cd apps/desktop
 pnpm install
 pnpm tauri dev
@@ -100,17 +124,30 @@ pnpm tauri dev
 4. Paste text/images into the composer, pick model / effort, approve tools when needed.
 5. Rename (✎) or delete (🗑) tasks from the sidebar; reopen the app to resume history.
 
-### Bundle engine runtime (optional)
+## Build from source
+
+Use this on **any supported platform**, or when you need a release binary (Windows / Linux / Intel macOS).
 
 ```bash
-# From repo root — build from subtree when possible:
-./tools/build-engine.sh && ./packaging/bundle_runtime.sh
+git clone git@github.com:tangf-ai/grokx.git
+cd grokx
 
-# Or place a grok binary into runtime-dist/ then:
-./packaging/bundle_runtime.sh
+# 1) Build + bundle the engine runtime into Tauri resources
+./tools/build-engine.sh && ./packaging/bundle_runtime.sh
+# Or drop a platform-native `grok` binary into runtime-dist/, then:
+# ./packaging/bundle_runtime.sh
+
+# 2) Install UI deps and produce a release installer
+cd apps/desktop
+pnpm install
+pnpm tauri build
 ```
 
-The packaged binary is **not** committed; local builds write to `apps/desktop/src-tauri/resources/runtime/grok` (gitignored).
+Artifacts land under `target/release/bundle/` (e.g. `.dmg` / `.app` on macOS, `.msi` / `.exe` on Windows, `.deb` / AppImage on Linux depending on Tauri config).
+
+The packaged engine binary is **not** committed; local builds write to `apps/desktop/src-tauri/resources/runtime/grok` (gitignored).
+
+See also [packaging/README.md](packaging/README.md).
 
 ## Engine strategy
 
@@ -127,6 +164,10 @@ The packaged binary is **not** committed; local builds write to `apps/desktop/sr
 ```
 
 ## FAQ
+
+### Do you support Windows and Linux?
+
+**Yes.** The app stack (Tauri + React + Rust) is multi-platform. Prebuilt installers on GitHub Releases are currently **macOS-only**; on Windows and Linux, [build from source](#build-from-source).
 
 ### macOS: “app is damaged” / Gatekeeper blocks Grokx after download
 
