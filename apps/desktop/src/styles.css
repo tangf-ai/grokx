@@ -56,18 +56,84 @@ button {
 
 .layout {
   display: grid;
-  grid-template-columns: 248px minmax(0, 1fr) 300px;
+  /* sidebar | handle | main | handle | outputs — widths via CSS vars from JS */
+  grid-template-columns:
+    var(--sidebar-w, 248px)
+    5px
+    minmax(0, 1fr)
+    5px
+    var(--right-w, 300px);
   height: 100%;
   background: var(--bg);
 }
 
 /* Collapsed: no right rail at all (toggle lives in topbar far right). */
 .layout.layout-outputs-collapsed {
-  grid-template-columns: 248px minmax(0, 1fr);
+  grid-template-columns:
+    var(--sidebar-w, 248px)
+    5px
+    minmax(0, 1fr);
 }
 
+/* Settings: sidebar | handle | settings (no outputs column). */
 .layout.layout-settings {
-  grid-template-columns: 248px minmax(0, 1fr);
+  grid-template-columns:
+    var(--sidebar-w, 248px)
+    5px
+    minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr);
+  align-items: stretch;
+}
+
+/* Outputs resizer is not mounted on settings; hide if ever present. */
+.layout.layout-settings .panel-resizer-right {
+  display: none;
+}
+
+/* Vertical drag handles between panels */
+.panel-resizer {
+  position: relative;
+  z-index: 5;
+  width: 5px;
+  margin: 0;
+  padding: 0;
+  border: none;
+  background: transparent;
+  cursor: col-resize;
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.panel-resizer::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 50%;
+  width: 1px;
+  transform: translateX(-50%);
+  background: var(--border);
+  opacity: 0.85;
+  transition: background 0.12s ease, width 0.12s ease, opacity 0.12s ease;
+}
+
+.panel-resizer:hover::after,
+body.resizing-panels .panel-resizer:hover::after {
+  width: 2px;
+  background: var(--text);
+  opacity: 0.35;
+}
+
+body.resizing-panels {
+  cursor: col-resize !important;
+  user-select: none !important;
+  -webkit-user-select: none !important;
+}
+
+body.resizing-panels iframe,
+body.resizing-panels * {
+  cursor: col-resize !important;
 }
 
 /* ─── Sidebar ─── */
@@ -327,6 +393,9 @@ html.platform-mac .brand-row {
 .project-title {
   flex: 1;
   min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 6px;
   font-size: 13px;
   font-weight: 700;
   letter-spacing: -0.01em;
@@ -352,6 +421,21 @@ html.platform-mac .brand-row {
 .project-row.active .project-count {
   background: rgba(255, 255, 255, 0.85);
   color: var(--text);
+}
+
+.project-row.working:not(.active) {
+  background: rgba(255, 90, 31, 0.06);
+  border-color: rgba(255, 90, 31, 0.12);
+}
+
+.project-working-spin {
+  flex-shrink: 0;
+}
+
+.project-count-working {
+  background: rgba(255, 90, 31, 0.14);
+  color: var(--accent);
+  font-variant-numeric: tabular-nums;
 }
 
 .project-add-task-btn,
@@ -487,11 +571,28 @@ html.platform-mac .brand-row {
 .session-title {
   flex: 1;
   min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 6px;
   font-size: 13px;
   font-weight: 600;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+/* Unread activity while task was in the background */
+.session-unread-dot {
+  flex-shrink: 0;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #ff5a1f;
+  box-shadow: 0 0 0 2px rgba(255, 90, 31, 0.18);
+}
+
+.session-row.unread:not(.active) .session-title {
+  color: var(--text);
 }
 
 /* Compact working indicator: single spinning ring (no second row / badge). */
@@ -1371,6 +1472,12 @@ button.msg-user-file-chip:hover {
   opacity: 0.75;
 }
 
+/* Consecutive identical tool status lines merged as "… × N" */
+.msg-chip-merged {
+  color: var(--text);
+  font-weight: 550;
+}
+
 .msg-error .msg-body {
   background: var(--error-bg);
   color: var(--error);
@@ -2166,6 +2273,119 @@ html.platform-mac .right {
   line-height: 1.4;
 }
 
+/* Markdown images in chat (local task assets) */
+.chat-md-img {
+  display: block;
+  max-width: min(100%, 520px);
+  max-height: 360px;
+  width: auto;
+  height: auto;
+  margin: 10px 0;
+  border-radius: 12px;
+  border: 1px solid var(--border);
+  background: #fff;
+  object-fit: contain;
+  cursor: zoom-in;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.06);
+}
+
+.md-body .chat-md-img {
+  margin-left: 0;
+  margin-right: 0;
+}
+
+/* Git card in Outputs overview */
+.git-card .kv {
+  margin-bottom: 8px;
+}
+
+.git-dirty-pill,
+.git-clean-pill {
+  display: inline-block;
+  margin-left: 8px;
+  padding: 1px 7px;
+  border-radius: 999px;
+  font-size: 10.5px;
+  font-weight: 650;
+  vertical-align: middle;
+  font-family: inherit;
+}
+
+.git-dirty-pill {
+  background: rgba(255, 90, 31, 0.14);
+  color: var(--accent);
+}
+
+.git-clean-pill {
+  background: rgba(36, 138, 61, 0.12);
+  color: #248a3d;
+}
+
+.git-section-label {
+  margin: 10px 0 6px;
+  font-size: 11px;
+  font-weight: 650;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.git-change-list,
+.git-commit-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  max-height: 160px;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: #fff;
+}
+
+.git-change-list li {
+  padding: 5px 8px;
+  font-size: 11px;
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--text);
+}
+
+.git-change-list li:last-child,
+.git-commit-list li:last-child {
+  border-bottom: none;
+}
+
+.git-commit-list li {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  gap: 6px 8px;
+  align-items: baseline;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--border);
+  font-size: 12px;
+}
+
+.git-hash {
+  color: var(--accent);
+  font-size: 11px;
+  font-weight: 650;
+}
+
+.git-subject {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text);
+}
+
+.git-meta {
+  font-size: 10.5px;
+  white-space: nowrap;
+}
+
 .right h2 {
   margin: 0 0 12px;
   font-size: 13px;
@@ -2366,24 +2586,69 @@ html.platform-mac .right {
   box-shadow: 0 0 0 3px rgba(0, 0, 0, 0.04);
 }
 
-/* Full settings page (not the right rail) */
+/*
+ * Full settings page.
+ * IMPORTANT: must sit on grid row 1, column 3 (after sidebar + resizer).
+ * Using `grid-column: 2 / -1` collided with the sidebar resizer and forced
+ * settings onto a second grid row — half the window looked empty.
+ */
 .settings-main {
-  grid-column: 2 / -1;
+  grid-column: 3;
+  grid-row: 1;
+  min-width: 0;
+  min-height: 0;
+  height: 100%;
+  max-height: 100%;
+  align-self: stretch;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.settings-main .topbar,
+.settings-topbar {
+  flex-shrink: 0;
+  padding-top: 12px;
+  padding-bottom: 12px;
+}
+
+html.platform-mac .settings-main .topbar,
+html.platform-mac .settings-topbar {
+  padding-top: 10px;
+  padding-bottom: 10px;
+  min-height: 48px;
 }
 
 .settings-page {
-  flex: 1;
+  flex: 1 1 auto;
+  min-height: 0;
   overflow: auto;
-  padding: 24px 28px 40px;
+  padding: 16px clamp(16px, 2.5vw, 32px) 40px;
   background: var(--bg);
+  /* Explicit top packing — never vertical centering */
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-start;
+  align-items: stretch;
 }
 
 .settings-grid {
   display: grid;
-  grid-template-columns: minmax(0, 1.4fr) minmax(280px, 0.9fr);
-  gap: 16px;
-  max-width: 1100px;
+  grid-template-columns: minmax(0, 1.35fr) minmax(300px, 0.95fr);
+  gap: 16px 18px;
+  width: 100%;
+  max-width: min(1280px, 100%);
   margin: 0 auto;
+  /* Stay at the top of settings-page */
+  margin-top: 0;
+  margin-bottom: 0;
+  align-items: start;
+  align-content: start;
+  flex: 0 0 auto;
+}
+
+.settings-card {
+  align-self: start;
 }
 
 .settings-card h3 {
@@ -2403,6 +2668,18 @@ html.platform-mac .right {
   grid-column: 1 / -1;
 }
 
+@media (min-width: 1440px) {
+  .settings-page {
+    padding-top: 18px;
+    padding-bottom: 48px;
+  }
+
+  .settings-grid {
+    max-width: min(1400px, 100%);
+    gap: 18px 20px;
+  }
+}
+
 @media (max-width: 960px) {
   .settings-grid {
     grid-template-columns: 1fr;
@@ -2417,7 +2694,8 @@ html.platform-mac .right {
   }
 
   .settings-main {
-    grid-column: 2;
+    grid-column: 3;
+    grid-row: 1;
   }
 }
 
@@ -2429,10 +2707,14 @@ code {
 @media (max-width: 1100px) {
   .layout,
   .layout.layout-outputs-collapsed {
-    grid-template-columns: 220px minmax(0, 1fr);
+    grid-template-columns:
+      var(--sidebar-w, 220px)
+      5px
+      minmax(0, 1fr);
   }
 
-  .right {
+  .right,
+  .panel-resizer-right {
     display: none;
   }
 

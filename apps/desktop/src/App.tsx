@@ -1,6 +1,15 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type CSSProperties,
+  type MouseEvent as ReactMouseEvent,
+} from "react";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { open as openUrl } from "@tauri-apps/plugin-shell";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -59,13 +68,75 @@ function openExternalUrl(url: string): void {
 }
 
 /**
- * Shared markdown rendering for chat: links open in the system browser,
- * not inside the Tauri webview.
+ * Resolve markdown image src to a webview-loadable URL.
+ * Agents often emit relative paths (e.g. `rdfs-owl-diagrams/01.png`) against
+ * the task cwd — those must become `asset://` URLs via convertFileSrc.
  */
-function ChatMarkdown({ children }: { children: string }) {
+function resolveLocalMediaSrc(
+  src: string | undefined,
+  bases: Array<string | null | undefined>,
+): string | undefined {
+  if (!src) return undefined;
+  const raw = src.trim().replace(/^<|>$/g, "");
+  if (!raw) return undefined;
+  // Remote / data / already asset protocol
+  if (
+    /^(https?:|data:|asset:|blob:)/i.test(raw) ||
+    raw.startsWith("//")
+  ) {
+    return raw;
+  }
+  let path = raw;
+  if (path.startsWith("file://")) {
+    path = decodeURIComponent(path.replace(/^file:\/\//, ""));
+  }
+  // Absolute filesystem path
+  const isAbs =
+    path.startsWith("/") || /^[A-Za-z]:[\\/]/.test(path);
+  if (!isAbs) {
+    // Relative → try task cwd, then project root
+    const rel = path.replace(/^\.\//, "");
+    let joined: string | null = null;
+    for (const base of bases) {
+      if (!base) continue;
+      const b = base.replace(/[/\\]+$/, "");
+      joined = `${b}/${rel}`.replace(/\\/g, "/");
+      break;
+    }
+    if (!joined) return raw;
+    path = joined;
+  }
+  try {
+    return convertFileSrc(path);
+  } catch {
+    return raw;
+  }
+}
+
+/**
+ * Shared markdown rendering for chat: links open in the system browser;
+ * local images resolve against the active task workspace.
+ */
+function ChatMarkdown({
+  children,
+  mediaBases = [],
+}: {
+  children: string;
+  /** Candidate roots for relative media (task cwd, project root). */
+  mediaBases?: Array<string | null | undefined>;
+}) {
   return (
     <ReactMarkdown
       remarkPlugins={[remarkGfm]}
+      urlTransform={(url) => {
+        // Allow local paths / asset URLs through (default sanitizer may strip).
+        if (!url) return url;
+        if (/^(https?:|data:|asset:|blob:|file:)/i.test(url)) return url;
+        if (url.startsWith("/") || url.startsWith("./") || !url.includes(":")) {
+          return url;
+        }
+        return url;
+      }}
       components={{
         a({ href, children: linkChildren, node: _node, ...props }) {
           return (
@@ -83,6 +154,40 @@ function ChatMarkdown({ children }: { children: string }) {
             >
               {linkChildren}
             </a>
+          );
+        },
+        img({ src, alt, node: _node, ...props }) {
+          const resolved = resolveLocalMediaSrc(src, mediaBases);
+          if (!resolved) return null;
+          return (
+            <img
+              {...props}
+              src={resolved}
+              alt={alt ?? ""}
+              className="chat-md-img"
+              loading="lazy"
+              onClick={(e) => {
+                e.preventDefault();
+                // Prefer opening the original path when possible.
+                const orig = (src || "").trim();
+                if (orig && !/^(https?:|data:)/i.test(orig)) {
+                  const abs =
+                    orig.startsWith("/") || /^[A-Za-z]:[\\/]/.test(orig)
+                      ? orig
+                      : mediaBases.find(Boolean)
+                        ? `${String(mediaBases.find(Boolean)).replace(
+                            /[/\\]+$/,
+                            "",
+                          )}/${orig.replace(/^\.\//, "")}`
+                        : null;
+                  if (abs) {
+                    void invoke("open_path", { path: abs }).catch(() => {});
+                    return;
+                  }
+                }
+                if (resolved.startsWith("http")) openExternalUrl(resolved);
+              }}
+            />
           );
         },
       }}
@@ -390,6 +495,8 @@ type TraceItem = {
   id: string;
   kind: "thought" | "tool" | "system" | "waiting";
   text: string;
+  /** Merged consecutive identical tool lines (for × N display). */
+  count?: number;
 };
 
 type ChatLine =
@@ -414,7 +521,13 @@ type ChatLine =
       tokensPerSec?: number;
     }
   | { id: string; kind: "thought"; text: string }
-  | { id: string; kind: "tool"; text: string }
+  | {
+      id: string;
+      kind: "tool";
+      text: string;
+      /** Consecutive identical tool status lines merged into one chip. */
+      count?: number;
+    }
   | { id: string; kind: "system"; text: string }
   | { id: string; kind: "error"; text: string }
   | { id: string; kind: "waiting"; text: string }
@@ -431,6 +544,50 @@ let chatLineSeq = 0;
 function nextLineId(kind: string): string {
   chatLineSeq += 1;
   return `${kind}-${Date.now()}-${chatLineSeq}`;
+}
+
+/** Normalize tool chip text for merge comparison (trim + collapse spaces). */
+function normalizeToolChipText(text: string): string {
+  return text.trim().replace(/\s+/g, " ");
+}
+
+/**
+ * Append a tool status line, merging consecutive identical texts into
+ * `tool → running × N` instead of spamming the chat.
+ */
+function appendOrMergeToolLine(prev: ChatLine[], text: string): ChatLine[] {
+  const label = normalizeToolChipText(text) || "Tool";
+  let base = prev;
+  if (base.length && base[base.length - 1].kind === "waiting") {
+    base = base.slice(0, -1);
+  }
+  const last = base[base.length - 1];
+  if (
+    last &&
+    last.kind === "tool" &&
+    normalizeToolChipText(last.text) === label
+  ) {
+    const copy = base.slice(0, -1);
+    copy.push({
+      ...last,
+      count: (last.count ?? 1) + 1,
+    });
+    return copy;
+  }
+  return [
+    ...base,
+    { id: nextLineId("tool"), kind: "tool", text: label, count: 1 },
+  ];
+}
+
+/** Display label for a tool chip, with ×N when merged. */
+function formatToolChipLabel(line: {
+  text: string;
+  count?: number;
+}): string {
+  const n = line.count ?? 1;
+  if (n <= 1) return line.text;
+  return `${line.text} × ${n}`;
 }
 
 /** Process kinds that fold into the collapsible "Worked" strip. */
@@ -481,7 +638,16 @@ function collapseTurnProcess(
       continue;
     }
     if (isProcessLine(line)) {
-      items.push({ id: line.id, kind: line.kind, text: line.text });
+      if (line.kind === "tool") {
+        items.push({
+          id: line.id,
+          kind: "tool",
+          text: line.text,
+          count: line.count,
+        });
+      } else {
+        items.push({ id: line.id, kind: line.kind, text: line.text });
+      }
     } else if (line.kind === "assistant") {
       answers.push(line);
     } else {
@@ -541,7 +707,10 @@ function collapseAllTurnsInHistory(lines: ChatLine[]): ChatLine[] {
 
 function summarizeTrace(items: TraceItem[]): string {
   const thoughts = items.filter((i) => i.kind === "thought").length;
-  const tools = items.filter((i) => i.kind === "tool").length;
+  // Count merged tool chips by their × N (so 50× running = 50 tools, not 1).
+  const tools = items
+    .filter((i) => i.kind === "tool")
+    .reduce((sum, i) => sum + (i.count ?? 1), 0);
   const systems = items.filter((i) => i.kind === "system").length;
   const parts: string[] = [];
   if (thoughts) parts.push(thoughts === 1 ? "thinking" : `${thoughts} thoughts`);
@@ -591,6 +760,40 @@ function shortPath(p: string | null | undefined): string {
   return `…/${parts.slice(-2).join("/")}`;
 }
 
+const SIDEBAR_W_MIN = 180;
+const SIDEBAR_W_MAX = 440;
+const RIGHT_W_MIN = 220;
+const RIGHT_W_MAX = 560;
+
+function clampWidth(n: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, Math.round(n)));
+}
+
+function readStoredWidth(
+  key: string,
+  fallback: number,
+  min: number,
+  max: number,
+): number {
+  try {
+    const raw = localStorage.getItem(key);
+    if (!raw) return fallback;
+    const n = Number(raw);
+    if (!Number.isFinite(n)) return fallback;
+    return clampWidth(n, min, max);
+  } catch {
+    return fallback;
+  }
+}
+
+function writeStoredWidth(key: string, value: number): void {
+  try {
+    localStorage.setItem(key, String(value));
+  } catch {
+    /* ignore quota / private mode */
+  }
+}
+
 /** Parent directory of a path (POSIX-ish). */
 function parentDir(path: string): string | null {
   const norm = path.replace(/\\/g, "/").replace(/\/+$/, "");
@@ -629,8 +832,16 @@ export default function App() {
   const [engine, setEngine] = useState<EngineInfo | null>(null);
   const [session, setSession] = useState<SessionInfo | null>(null);
   const [projects, setProjects] = useState<ProjectListRow[]>([]);
+  /** Project used for “new task under project” / highlight context. */
   const [selectedProjectId, setSelectedProjectId] = useState<string | null>(
     null,
+  );
+  /**
+   * Projects whose nested task lists are open. Independent of selection so
+   * switching to another project/session does not collapse an open project.
+   */
+  const [expandedProjectIds, setExpandedProjectIds] = useState<Set<string>>(
+    () => new Set(),
   );
   const [sessions, setSessions] = useState<SessionListRow[]>([]);
   const [renamingId, setRenamingId] = useState<string | null>(null);
@@ -654,6 +865,14 @@ export default function App() {
   const [sessionBusyMap, setSessionBusyMap] = useState<Record<string, boolean>>(
     {},
   );
+  /**
+   * Sessions that produced activity while not focused — show a dot next to
+   * the task title until the user opens that task.
+   */
+  const [sessionUnreadMap, setSessionUnreadMap] = useState<
+    Record<string, boolean>
+  >({});
+  const sessionUnreadMapRef = useRef<Map<string, boolean>>(new Map());
   const [connecting, setConnecting] = useState(false);
   const [agentStatus, setAgentStatus] = useState<string>("disconnected");
   /** Tool permission: ask | auto | always-approve (full trust). */
@@ -674,6 +893,26 @@ export default function App() {
   const [view, setView] = useState<"workspace" | "settings">("workspace");
   /** Right Outputs rail — collapsible to free chat space. */
   const [outputsOpen, setOutputsOpen] = useState(true);
+  /** Draggable column widths (px); persisted across restarts. */
+  const [sidebarWidth, setSidebarWidth] = useState(() =>
+    readStoredWidth("grokx.sidebarWidth", 248, SIDEBAR_W_MIN, SIDEBAR_W_MAX),
+  );
+  const [rightWidth, setRightWidth] = useState(() =>
+    readStoredWidth("grokx.rightWidth", 300, RIGHT_W_MIN, RIGHT_W_MAX),
+  );
+  const sidebarWidthRef = useRef(sidebarWidth);
+  const rightWidthRef = useRef(rightWidth);
+  useEffect(() => {
+    sidebarWidthRef.current = sidebarWidth;
+  }, [sidebarWidth]);
+  useEffect(() => {
+    rightWidthRef.current = rightWidth;
+  }, [rightWidth]);
+  const panelDragRef = useRef<{
+    kind: "sidebar" | "right";
+    startX: number;
+    startW: number;
+  } | null>(null);
   /** Right panel tab: overview (approvals/task) vs session files. */
   const [outputsTab, setOutputsTab] = useState<"overview" | "files">("overview");
   /** Which root is listed: task cwd vs project folder. */
@@ -682,6 +921,31 @@ export default function App() {
   const [filesEntries, setFilesEntries] = useState<DirEntry[]>([]);
   const [filesLoading, setFilesLoading] = useState(false);
   const [filesError, setFilesError] = useState<string | null>(null);
+  type GitCommitRow = {
+    hash: string;
+    short: string;
+    subject: string;
+    author: string;
+    relative: string;
+  };
+  type GitStatusInfo = {
+    path: string;
+    is_repo: boolean;
+    branch?: string | null;
+    head_short?: string | null;
+    head?: string | null;
+    upstream?: string | null;
+    dirty: boolean;
+    staged: number;
+    unstaged: number;
+    untracked: number;
+    changes: string[];
+    recent: GitCommitRow[];
+    note?: string | null;
+  };
+  const [gitInfo, setGitInfo] = useState<GitStatusInfo | null>(null);
+  const [gitLoading, setGitLoading] = useState(false);
+  const [gitError, setGitError] = useState<string | null>(null);
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   const [models, setModels] = useState<ModelOption[]>([]);
   const [modelId, setModelId] = useState<string>("grok-4.5");
@@ -790,6 +1054,7 @@ export default function App() {
   /** Update busy for one task; sync focused `busy` when that task is active. */
   const setSessionBusyState = useCallback((sid: string, nextBusy: boolean) => {
     if (!sid) return;
+    const wasBusy = sessionBusyMapRef.current.get(sid) === true;
     sessionBusyMapRef.current.set(sid, nextBusy);
     setSessionBusyMap((prev) => {
       if (prev[sid] === nextBusy) return prev;
@@ -799,7 +1064,130 @@ export default function App() {
       busyRef.current = nextBusy;
       setBusy(nextBusy);
     }
+    // Working → idle while user is not looking at this task → unread (green).
+    if (wasBusy && !nextBusy) {
+      const viewingThis =
+        sessionIdRef.current === sid &&
+        typeof document !== "undefined" &&
+        document.visibilityState === "visible";
+      if (!viewingThis) {
+        // Defer so markSessionUnread is defined; call via ref pattern below.
+        queueMicrotask(() => {
+          if (sessionUnreadMapRef.current.get(sid)) return;
+          if (
+            sessionIdRef.current === sid &&
+            document.visibilityState === "visible"
+          ) {
+            return;
+          }
+          sessionUnreadMapRef.current.set(sid, true);
+          setSessionUnreadMap((prev) =>
+            prev[sid] ? prev : { ...prev, [sid]: true },
+          );
+        });
+      }
+    }
   }, []);
+
+  /** Mark a task as having unread activity (finished or updated while not viewed). */
+  const markSessionUnread = useCallback((sid: string | null | undefined) => {
+    if (!sid) return;
+    // Actively viewing this task in a visible window → not unread.
+    if (
+      sessionIdRef.current === sid &&
+      typeof document !== "undefined" &&
+      document.visibilityState === "visible"
+    ) {
+      return;
+    }
+    if (sessionUnreadMapRef.current.get(sid)) return;
+    sessionUnreadMapRef.current.set(sid, true);
+    setSessionUnreadMap((prev) =>
+      prev[sid] ? prev : { ...prev, [sid]: true },
+    );
+  }, []);
+
+  const clearSessionUnread = useCallback((sid: string | null | undefined) => {
+    if (!sid) return;
+    if (!sessionUnreadMapRef.current.get(sid)) return;
+    sessionUnreadMapRef.current.delete(sid);
+    setSessionUnreadMap((prev) => {
+      if (!prev[sid]) return prev;
+      const next = { ...prev };
+      delete next[sid];
+      return next;
+    });
+  }, []);
+
+  /**
+   * Dock badge (macOS Dock / taskbar):
+   * - Working tasks → red count (system badge; priority)
+   * - Else unread finished tasks → green-style count (label with 🟢 when possible)
+   * - Viewed / idle → clear
+   *
+   * Note: macOS dock badge chrome is system-red for numeric badges; we use
+   * setBadgeCount for working, and setBadgeLabel("🟢N") for unread-only so
+   * the two states stay distinguishable.
+   */
+  const syncDockBadge = useCallback(() => {
+    let working = 0;
+    for (const v of sessionBusyMapRef.current.values()) {
+      if (v) working += 1;
+    }
+    if (busyRef.current && sessionIdRef.current) {
+      if (!sessionBusyMapRef.current.get(sessionIdRef.current)) working += 1;
+    }
+    let unread = 0;
+    for (const [sid, v] of sessionUnreadMapRef.current.entries()) {
+      if (!v) continue;
+      // Don't count unread for a task that is still working (working badge wins).
+      if (sessionBusyMapRef.current.get(sid)) continue;
+      if (busyRef.current && sessionIdRef.current === sid) continue;
+      unread += 1;
+    }
+
+    const win = getCurrentWindow();
+    void (async () => {
+      try {
+        if (working > 0) {
+          // Red system badge = tasks currently working.
+          await win.setBadgeLabel(undefined);
+          await win.setBadgeCount(working);
+        } else if (unread > 0) {
+          // Finished but not viewed: green-tinted label (macOS still uses
+          // badge chrome, but 🟢 distinguishes from working count).
+          await win.setBadgeCount(undefined);
+          await win.setBadgeLabel(`🟢${unread}`);
+        } else {
+          await win.setBadgeCount(undefined);
+          await win.setBadgeLabel(undefined);
+        }
+      } catch {
+        /* badge unsupported on some platforms */
+      }
+    })();
+  }, []);
+
+  useEffect(() => {
+    syncDockBadge();
+  }, [sessionBusyMap, sessionUnreadMap, busy, syncDockBadge]);
+
+  // When the window becomes visible again, clear unread for the focused task
+  // and refresh the dock badge.
+  useEffect(() => {
+    const onVis = () => {
+      if (document.visibilityState === "visible" && sessionIdRef.current) {
+        clearSessionUnread(sessionIdRef.current);
+      }
+      syncDockBadge();
+    };
+    document.addEventListener("visibilitychange", onVis);
+    window.addEventListener("focus", onVis);
+    return () => {
+      document.removeEventListener("visibilitychange", onVis);
+      window.removeEventListener("focus", onVis);
+    };
+  }, [clearSessionUnread, syncDockBadge]);
 
   /** Work path for a task id (active or from list). */
   const workPathForSession = useCallback((sid: string): string | null => {
@@ -2060,6 +2448,11 @@ export default function App() {
           }
         };
 
+        /** Background activity while user looks at another task → unread dot. */
+        const markBgUnread = () => {
+          if (isBackground && evSid) markSessionUnread(evSid);
+        };
+
         /** Append a simple line to background transcript. */
         const bgPush = (
           sid: string,
@@ -2067,6 +2460,9 @@ export default function App() {
           text: string,
         ) => {
           mutateBackgroundLines(sid, (prev) => {
+            if (kind === "tool") {
+              return appendOrMergeToolLine(prev, text);
+            }
             let base = prev;
             if (base.length && base[base.length - 1].kind === "waiting") {
               base = base.slice(0, -1);
@@ -2122,6 +2518,7 @@ export default function App() {
             break;
           case "message_delta":
             markBusy(evSid || activeSid, true);
+            markBgUnread();
             if (isBackground && evSid) {
               if (ev.text) bgAppendStream(evSid, "assistant", ev.text);
             } else if (ev.text) {
@@ -2130,6 +2527,7 @@ export default function App() {
             break;
           case "thought_delta":
             markBusy(evSid || activeSid, true);
+            markBgUnread();
             if (isBackground && evSid) {
               if (ev.text) bgAppendStream(evSid, "thought", ev.text);
             } else if (ev.text) {
@@ -2138,34 +2536,43 @@ export default function App() {
             break;
           case "tool_started":
             markBusy(evSid || activeSid, true);
-            if (isBackground && evSid) {
-              bgPush(evSid, "tool", ev.tool?.title ?? "Running tool");
-            } else {
-              clearWaiting();
-              push({
-                kind: "tool",
-                text: ev.tool?.title ?? "Running tool",
-              });
+            markBgUnread();
+            {
+              const label = ev.tool?.title ?? "Running tool";
+              if (isBackground && evSid) {
+                bgPush(evSid, "tool", label);
+              } else {
+                clearWaiting();
+                setLines((prev) => {
+                  const next = appendOrMergeToolLine(prev, label);
+                  linesRef.current = next;
+                  return next;
+                });
+                schedulePersistHistory();
+              }
             }
             break;
           case "tool_updated":
             markBusy(evSid || activeSid, true);
-            if (isBackground && evSid) {
-              bgPush(
-                evSid,
-                "tool",
-                `${ev.tool?.title ?? "Tool"} → ${ev.tool?.status ?? "updated"}`,
-              );
-            } else {
-              clearWaiting();
-              push({
-                kind: "tool",
-                text: `${ev.tool?.title ?? "Tool"} → ${ev.tool?.status ?? "updated"}`,
-              });
+            markBgUnread();
+            {
+              const label = `${ev.tool?.title ?? "Tool"} → ${ev.tool?.status ?? "updated"}`;
+              if (isBackground && evSid) {
+                bgPush(evSid, "tool", label);
+              } else {
+                clearWaiting();
+                setLines((prev) => {
+                  const next = appendOrMergeToolLine(prev, label);
+                  linesRef.current = next;
+                  return next;
+                });
+                schedulePersistHistory();
+              }
             }
             break;
           case "permission_needed":
             markBusy(evSid || activeSid, true);
+            markBgUnread();
             if (isBackground && evSid) {
               bgPush(
                 evSid,
@@ -2219,6 +2626,18 @@ export default function App() {
           }
           case "turn_finished":
             markBusy(evSid || activeSid, false);
+            // Turn completed off-screen / other task → unread (green dock badge).
+            {
+              const finishedSid = evSid || activeSid;
+              const notViewing =
+                Boolean(finishedSid) &&
+                (finishedSid !== sessionIdRef.current ||
+                  (typeof document !== "undefined" &&
+                    document.visibilityState !== "visible"));
+              if (finishedSid && notViewing) {
+                markSessionUnread(finishedSid);
+              }
+            }
             if (isBackground && evSid) {
               mutateBackgroundLines(evSid, (prev) => {
                 let next = prev;
@@ -2326,6 +2745,7 @@ export default function App() {
     setSessionBusyState,
     mutateBackgroundLines,
     hasRealChatContent,
+    markSessionUnread,
   ]);
 
   const resizeTextarea = () => {
@@ -2362,17 +2782,37 @@ export default function App() {
     return map;
   }, [sessions, userProjectIds]);
 
+  /** Expand a project in the sidebar (keeps other projects open). */
+  const expandProject = useCallback((projectId: string) => {
+    setExpandedProjectIds((prev) => {
+      if (prev.has(projectId)) return prev;
+      const next = new Set(prev);
+      next.add(projectId);
+      return next;
+    });
+  }, []);
+
   /**
-   * Select a project (stable path). Expands nested tasks under it.
-   * Clicking the already-selected project again clears the selection.
+   * Click a project row: toggle its expanded task list (multi-open).
+   * Also marks it as the selected project for “new task under…” context.
    */
   const onSelectProject = async (p: ProjectListRow) => {
     setView("workspace");
-    // Toggle off: second click on the active project deselects it.
-    if (selectedProjectId === p.project_id) {
-      setSelectedProjectId(null);
+    const wasExpanded = expandedProjectIds.has(p.project_id);
+    if (wasExpanded) {
+      // Collapse only this project; leave others expanded.
+      setExpandedProjectIds((prev) => {
+        const next = new Set(prev);
+        next.delete(p.project_id);
+        return next;
+      });
+      // Keep selection if this was selected, or clear if collapsing selected.
+      if (selectedProjectId === p.project_id) {
+        setSelectedProjectId(null);
+      }
       return;
     }
+    expandProject(p.project_id);
     setSelectedProjectId(p.project_id);
     setProjectRoot(p.root_path);
     try {
@@ -2421,14 +2861,33 @@ export default function App() {
             sessionContextTokensRef.current.delete(gone.session_id);
             sessionLinesCacheRef.current.delete(gone.session_id);
             sessionBusyMapRef.current.delete(gone.session_id);
+            sessionUnreadMapRef.current.delete(gone.session_id);
           }
         }
         return kept;
+      });
+      setSessionUnreadMap((prev) => {
+        let changed = false;
+        const next = { ...prev };
+        for (const id of Object.keys(next)) {
+          // Drop unread for deleted project tasks (already removed from ref).
+          if (!sessionUnreadMapRef.current.has(id)) {
+            delete next[id];
+            changed = true;
+          }
+        }
+        return changed ? next : prev;
       });
 
       if (wasSelected) {
         setSelectedProjectId(null);
       }
+      setExpandedProjectIds((prev) => {
+        if (!prev.has(p.project_id)) return prev;
+        const next = new Set(prev);
+        next.delete(p.project_id);
+        return next;
+      });
       if (activeBelongs) {
         setSession(null);
         sessionIdRef.current = null;
@@ -2625,12 +3084,14 @@ export default function App() {
   /** New temporary task only (Tasks section +). */
   const onNewStandaloneTask = async () => {
     setSelectedProjectId(null);
+    // Do not collapse expanded projects when creating a temporary task.
     await onNewSession({ underProject: null });
   };
 
   /** New task nested under a user project. */
   const onNewProjectTask = async (p: ProjectListRow, e?: React.MouseEvent) => {
     e?.stopPropagation();
+    expandProject(p.project_id);
     setSelectedProjectId(p.project_id);
     setProjectRoot(p.root_path);
     await onNewSession({ underProject: p });
@@ -2645,9 +3106,11 @@ export default function App() {
     if (renamingId === s.session_id || connecting) return;
     setView("workspace");
 
-    // Highlight parent Project only if it is a user-visible project.
+    // Open parent project (keep other projects expanded). Temporary tasks
+    // only clear selection — they do not collapse open projects.
     const visibleProject = projects.find((p) => p.project_id === s.project_id);
     if (visibleProject) {
+      expandProject(visibleProject.project_id);
       setSelectedProjectId(visibleProject.project_id);
     } else {
       setSelectedProjectId(null);
@@ -2709,6 +3172,8 @@ export default function App() {
       status: "Starting",
     });
     sessionIdRef.current = s.session_id;
+    // Opening this task clears its unread indicator.
+    clearSessionUnread(s.session_id);
     // Restore this task's last engine total (if any); otherwise estimate from chat.
     setEngineContextTokens(
       sessionContextTokensRef.current.get(s.session_id) ?? null,
@@ -2727,27 +3192,30 @@ export default function App() {
       setLines([]);
       linesRef.current = [];
     }
-    let history =
-      cached && cached.length > 0
-        ? cached
-        : await loadChatHistory(s.session_id, s.work_path);
-    if (historyEpochRef.current !== epoch) return;
-    // Apply scroll policy *before* setLines so the lines-effect auto-follow
-    // does not race and yank the viewport to the bottom.
-    const savedScroll = sessionScrollRef.current.get(s.session_id);
-    if (!savedScroll || savedScroll.pinBottom) {
-      autoScrollEnabledRef.current = true;
-      userScrollIntentRef.current = false;
-    } else {
-      autoScrollEnabledRef.current = false;
-      userScrollIntentRef.current = true;
-    }
-    setLines(history);
-    linesRef.current = history;
-    // Resume at the leave position (or bottom if first visit / was pinned).
-    restoreSessionScroll(s.session_id);
 
+    // Entire activate path must clear `connecting` — early returns used to
+    // leave Connecting stuck forever and block further task switches.
     try {
+      let history =
+        cached && cached.length > 0
+          ? cached
+          : await loadChatHistory(s.session_id, s.work_path);
+      if (historyEpochRef.current !== epoch) return;
+      // Apply scroll policy *before* setLines so the lines-effect auto-follow
+      // does not race and yank the viewport to the bottom.
+      const savedScroll = sessionScrollRef.current.get(s.session_id);
+      if (!savedScroll || savedScroll.pinBottom) {
+        autoScrollEnabledRef.current = true;
+        userScrollIntentRef.current = false;
+      } else {
+        autoScrollEnabledRef.current = false;
+        userScrollIntentRef.current = true;
+      }
+      setLines(history);
+      linesRef.current = history;
+      // Resume at the leave position (or bottom if first visit / was pinned).
+      restoreSessionScroll(s.session_id);
+
       if (s.project_root) {
         try {
           await invoke<string>("set_project_root", {
@@ -2837,7 +3305,11 @@ export default function App() {
     } catch (e) {
       setError(String(e));
       // Keep restored history visible even if reconnect fails.
+      setAgentStatus("failed");
     } finally {
+      // Always release the connecting lock for this activation attempt.
+      // A superseded epoch means a newer activate owns the UI; still clear
+      // if we are the latest so we never stick on Connecting forever.
       if (historyEpochRef.current === epoch) {
         setConnecting(false);
       }
@@ -2907,6 +3379,7 @@ export default function App() {
         delete next[s.session_id];
         return next;
       });
+      clearSessionUnread(s.session_id);
 
       if (wasActive) {
         setSession(null);
@@ -3419,6 +3892,62 @@ export default function App() {
     }
   };
 
+  /** Drag the vertical split between sidebar ↔ chat or chat ↔ Outputs. */
+  const onPanelResizeStart = useCallback(
+    (kind: "sidebar" | "right", e: ReactMouseEvent) => {
+      e.preventDefault();
+      e.stopPropagation();
+      panelDragRef.current = {
+        kind,
+        startX: e.clientX,
+        startW: kind === "sidebar" ? sidebarWidth : rightWidth,
+      };
+      document.body.classList.add("resizing-panels");
+    },
+    [sidebarWidth, rightWidth],
+  );
+
+  useEffect(() => {
+    const onMove = (e: MouseEvent) => {
+      const drag = panelDragRef.current;
+      if (!drag) return;
+      if (drag.kind === "sidebar") {
+        const next = clampWidth(
+          drag.startW + (e.clientX - drag.startX),
+          SIDEBAR_W_MIN,
+          SIDEBAR_W_MAX,
+        );
+        setSidebarWidth(next);
+      } else {
+        // Right edge: drag handle is on the left of the rail; move left → wider.
+        const next = clampWidth(
+          drag.startW - (e.clientX - drag.startX),
+          RIGHT_W_MIN,
+          RIGHT_W_MAX,
+        );
+        setRightWidth(next);
+      }
+    };
+    const onUp = () => {
+      if (!panelDragRef.current) return;
+      const kind = panelDragRef.current.kind;
+      panelDragRef.current = null;
+      document.body.classList.remove("resizing-panels");
+      if (kind === "sidebar") {
+        writeStoredWidth("grokx.sidebarWidth", sidebarWidthRef.current);
+      } else {
+        writeStoredWidth("grokx.rightWidth", rightWidthRef.current);
+      }
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+    return () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+      document.body.classList.remove("resizing-panels");
+    };
+  }, []);
+
   /** Absolute root for the Files tab (task cwd or project folder). */
   const filesRootPath = useMemo(() => {
     if (!session) return null;
@@ -3427,6 +3956,59 @@ export default function App() {
     }
     return session.work_path || session.project_root || null;
   }, [session, filesRootKind]);
+
+  /** Bases for resolving relative markdown images / media. */
+  const chatMediaBases = useMemo(
+    () => [session?.work_path, session?.project_root, projectRoot],
+    [session?.work_path, session?.project_root, projectRoot],
+  );
+
+  const refreshGitStatus = useCallback(async () => {
+    const root =
+      session?.project_root || session?.work_path || projectRoot || null;
+    if (!root) {
+      setGitInfo(null);
+      setGitError(null);
+      return;
+    }
+    setGitLoading(true);
+    setGitError(null);
+    try {
+      const info = await invoke<GitStatusInfo>("git_status", { path: root });
+      setGitInfo(info);
+    } catch (e) {
+      setGitInfo(null);
+      setGitError(String(e));
+    } finally {
+      setGitLoading(false);
+    }
+  }, [session?.project_root, session?.work_path, projectRoot]);
+
+  // Load git summary when overview is visible / session changes.
+  useEffect(() => {
+    if (view !== "workspace" || !outputsOpen) return;
+    if (outputsTab !== "overview") return;
+    void refreshGitStatus();
+  }, [
+    view,
+    outputsOpen,
+    outputsTab,
+    session?.session_id,
+    session?.project_root,
+    session?.work_path,
+    refreshGitStatus,
+  ]);
+
+  // Soft-refresh git after a turn finishes (agent may have committed).
+  useEffect(() => {
+    if (busy) return;
+    if (view !== "workspace" || outputsTab !== "overview") return;
+    if (!session) return;
+    const t = window.setTimeout(() => {
+      void refreshGitStatus();
+    }, 600);
+    return () => window.clearTimeout(t);
+  }, [busy, view, outputsTab, session?.session_id, refreshGitStatus]);
 
   const loadFilesDir = useCallback(
     async (path: string) => {
@@ -3559,11 +4141,17 @@ export default function App() {
     shortPath(session?.project_root || projectRoot) ||
     "New task";
 
+  const layoutStyle = {
+    ["--sidebar-w" as string]: `${sidebarWidth}px`,
+    ["--right-w" as string]: `${rightWidth}px`,
+  } as CSSProperties;
+
   return (
     <div
       className={`layout${outputsOpen ? "" : " layout-outputs-collapsed"}${
         view === "settings" ? " layout-settings" : ""
       }`}
+      style={layoutStyle}
     >
       <aside className="sidebar">
         {/* Full sidebar chrome under traffic lights — drag to move the window. */}
@@ -3619,25 +4207,99 @@ export default function App() {
             </div>
           )}
           {projects.map((p) => {
+            const isExpanded = expandedProjectIds.has(p.project_id);
             const isSelected = p.project_id === selectedProjectId;
             const nested = sessionsByProjectId.get(p.project_id) ?? [];
+            // When project is collapsed, still surface child task activity.
+            let nestedWorking = 0;
+            let nestedUnread = 0;
+            for (const s of nested) {
+              const childActive = s.session_id === session?.session_id;
+              if (
+                sessionBusyMap[s.session_id] ||
+                (childActive && busy)
+              ) {
+                nestedWorking += 1;
+              }
+              if (sessionUnreadMap[s.session_id] && !childActive) {
+                nestedUnread += 1;
+              }
+            }
+            const projectWorking = nestedWorking > 0;
+            const projectUnread = nestedUnread > 0;
+            // Show unread on the project row only while collapsed.
+            const showProjectUnread = projectUnread && !isExpanded;
             return (
               <div key={p.project_id} className="project-block">
                 <div
-                  className={`project-row${isSelected ? " active" : ""}`}
+                  className={`project-row${isSelected ? " active" : ""}${
+                    isExpanded ? " expanded" : ""
+                  }${projectWorking ? " working" : ""}${
+                    showProjectUnread ? " unread" : ""
+                  }`}
                   onClick={() => void onSelectProject(p)}
                   title={
-                    isSelected
-                      ? `Selected · click again to deselect\n${p.root_path}`
-                      : `Project (fixed path)\n${p.root_path}\nClick to select · nested tasks appear below`
+                    projectWorking
+                      ? `Working · ${nestedWorking} task${
+                          nestedWorking === 1 ? "" : "s"
+                        }\n${p.root_path}`
+                      : showProjectUnread
+                        ? `Unread · ${nestedUnread} task${
+                            nestedUnread === 1 ? "" : "s"
+                          }\n${p.root_path}`
+                        : isExpanded
+                          ? `Expanded · click to collapse\n${p.root_path}`
+                          : `Project (fixed path)\n${p.root_path}\nClick to expand nested tasks`
                   }
                 >
                   <div className="project-row-main">
-                    <span className="project-icon" aria-hidden>
-                      <IconFolder size={15} />
+                    {projectWorking ? (
+                      <span
+                        className="session-working-spin project-working-spin"
+                        title={
+                          nestedWorking === 1
+                            ? "1 task working"
+                            : `${nestedWorking} tasks working`
+                        }
+                        aria-label={
+                          nestedWorking === 1
+                            ? "1 task working"
+                            : `${nestedWorking} tasks working`
+                        }
+                      />
+                    ) : (
+                      <span className="project-icon" aria-hidden>
+                        <IconFolder size={15} />
+                      </span>
+                    )}
+                    <div className="project-title">
+                      {p.name}
+                      {showProjectUnread && (
+                        <span
+                          className="session-unread-dot"
+                          title={
+                            nestedUnread === 1
+                              ? "1 unread task"
+                              : `${nestedUnread} unread tasks`
+                          }
+                          aria-label="Unread activity in project"
+                        />
+                      )}
+                    </div>
+                    <span
+                      className={`project-count${
+                        projectWorking ? " project-count-working" : ""
+                      }`}
+                      title={
+                        projectWorking
+                          ? `${nestedWorking} working · ${nested.length} total`
+                          : undefined
+                      }
+                    >
+                      {projectWorking
+                        ? `${nestedWorking}/${nested.length}`
+                        : nested.length}
                     </span>
-                    <div className="project-title">{p.name}</div>
-                    <span className="project-count">{nested.length}</span>
                     <button
                       type="button"
                       className="session-action-btn project-add-task-btn"
@@ -3657,7 +4319,7 @@ export default function App() {
                     </button>
                   </div>
                 </div>
-                {isSelected && (
+                {isExpanded && (
                   <div className="project-tasks">
                     {nested.length === 0 && (
                       <div className="session-empty session-empty-nested">
@@ -3670,18 +4332,25 @@ export default function App() {
                         sessionBusyMap[s.session_id] ||
                           (isActive && busy),
                       );
+                      const isUnread = Boolean(
+                        sessionUnreadMap[s.session_id] && !isActive,
+                      );
                       return (
                         <div
                           key={s.session_id}
                           className={`session-row nested task-row${
                             isActive ? " active" : ""
-                          }${isWorking ? " working" : ""}`}
+                          }${isWorking ? " working" : ""}${
+                            isUnread ? " unread" : ""
+                          }`}
                           onClick={() => void onActivateSession(s)}
                           onDoubleClick={(e) => startRename(s, e)}
                           title={
                             isWorking
                               ? `Working…\n${s.work_path || "~/.grokx/tasks/…"}`
-                              : `Task under ${p.name}\n${s.work_path || "~/.grokx/tasks/…"}`
+                              : isUnread
+                                ? `Unread activity\nTask under ${p.name}\n${s.work_path || "~/.grokx/tasks/…"}`
+                                : `Task under ${p.name}\n${s.work_path || "~/.grokx/tasks/…"}`
                           }
                         >
                           {renamingId === s.session_id ? (
@@ -3718,6 +4387,13 @@ export default function App() {
                                 )}
                                 <div className="session-title">
                                   {s.title || s.session_id.slice(0, 8)}
+                                  {isUnread && (
+                                    <span
+                                      className="session-unread-dot"
+                                      title="Unread"
+                                      aria-label="Unread activity"
+                                    />
+                                  )}
                                 </div>
                                 <button
                                   type="button"
@@ -3772,18 +4448,23 @@ export default function App() {
             const isWorking = Boolean(
               sessionBusyMap[s.session_id] || (isActive && busy),
             );
+            const isUnread = Boolean(
+              sessionUnreadMap[s.session_id] && !isActive,
+            );
             return (
               <div
                 key={s.session_id}
                 className={`session-row task-row${isActive ? " active" : ""}${
                   isWorking ? " working" : ""
-                }`}
+                }${isUnread ? " unread" : ""}`}
                 onClick={() => void onActivateSession(s)}
                 onDoubleClick={(e) => startRename(s, e)}
                 title={
                   isWorking
                     ? `Working…\nTemporary task\n${s.work_path || "~/.grokx/tasks/…"}`
-                    : `Temporary task\n${s.work_path || "~/.grokx/tasks/…"}\nClick to switch · double-click or ✎ to rename`
+                    : isUnread
+                      ? `Unread activity\nTemporary task\n${s.work_path || "~/.grokx/tasks/…"}`
+                      : `Temporary task\n${s.work_path || "~/.grokx/tasks/…"}\nClick to switch · double-click or ✎ to rename`
                 }
               >
                 {renamingId === s.session_id ? (
@@ -3820,6 +4501,13 @@ export default function App() {
                       )}
                       <div className="session-title">
                         {s.title || s.session_id.slice(0, 8)}
+                        {isUnread && (
+                          <span
+                            className="session-unread-dot"
+                            title="Unread"
+                            aria-label="Unread activity"
+                          />
+                        )}
                       </div>
                       <button
                         type="button"
@@ -3881,21 +4569,33 @@ export default function App() {
         </div>
       </aside>
 
+      <div
+        className="panel-resizer panel-resizer-sidebar"
+        role="separator"
+        aria-orientation="vertical"
+        aria-label="Resize sidebar"
+        title="Drag to resize sidebar"
+        onMouseDown={(e) => onPanelResizeStart("sidebar", e)}
+      />
+
       {view === "settings" ? (
         <main className="main settings-main">
-          <header className="topbar" onMouseDown={onTitlebarMouseDown}>
+          <header className="topbar settings-topbar" onMouseDown={onTitlebarMouseDown}>
             <div className="topbar-main">
               <h1 className="topbar-title">Settings</h1>
               <p className="topbar-sub">
                 System · model and engine (set once)
               </p>
             </div>
-            <button
-              className="btn"
-              onClick={() => setView("workspace")}
-            >
-              Back to workspace
-            </button>
+            <div className="topbar-actions">
+              <button
+                type="button"
+                className="btn"
+                onClick={() => setView("workspace")}
+              >
+                Back to workspace
+              </button>
+            </div>
           </header>
 
           <div className="settings-page">
@@ -3903,9 +4603,10 @@ export default function App() {
               <section className="card settings-card">
                 <h3>Model</h3>
                 <p className="muted" style={{ marginBottom: 12 }}>
-                  Configure API endpoint, key, and default model. Daily chat does not need this page; after save
-                  {cfgSyncGrok ? "it syncs to the engine config, " : ""}
-                  reconnect to apply.
+                  Configure API endpoint, key, and default model. Daily chat does
+                  not need this page; after save
+                  {cfgSyncGrok ? " it syncs to the engine config," : ""} reconnect
+                  to apply.
                 </p>
                 {settingsMsg && (
                   <div
@@ -4265,7 +4966,9 @@ export default function App() {
                                       className="msg msg-thought trace-item"
                                     >
                                       <div className="msg-body md-body thought-md">
-                                        <ChatMarkdown>{item.text}</ChatMarkdown>
+                                        <ChatMarkdown mediaBases={chatMediaBases}>
+                                          {item.text}
+                                        </ChatMarkdown>
                                       </div>
                                     </div>
                                   );
@@ -4273,12 +4976,27 @@ export default function App() {
                                 return (
                                   <div
                                     key={item.id}
-                                    className="msg-chip trace-item"
+                                    className={`msg-chip trace-item${
+                                      item.kind === "tool" &&
+                                      (item.count ?? 1) > 1
+                                        ? " msg-chip-merged"
+                                        : ""
+                                    }`}
+                                    title={
+                                      item.kind === "tool" &&
+                                      (item.count ?? 1) > 1
+                                        ? `${item.text} · repeated ${item.count} times`
+                                        : undefined
+                                    }
                                   >
                                     <span className="chip-icon">
                                       <ChipIcon kind={item.kind} />
                                     </span>
-                                    <span>{item.text}</span>
+                                    <span>
+                                      {item.kind === "tool"
+                                        ? formatToolChipLabel(item)
+                                        : item.text}
+                                    </span>
                                   </div>
                                 );
                               })}
@@ -4289,12 +5007,28 @@ export default function App() {
                     );
                   }
                   if (line.kind === "tool" || line.kind === "system") {
+                    const label =
+                      line.kind === "tool"
+                        ? formatToolChipLabel(line)
+                        : line.text;
                     return (
-                      <div key={line.id} className="msg-chip">
+                      <div
+                        key={line.id}
+                        className={`msg-chip${
+                          line.kind === "tool" && (line.count ?? 1) > 1
+                            ? " msg-chip-merged"
+                            : ""
+                        }`}
+                        title={
+                          line.kind === "tool" && (line.count ?? 1) > 1
+                            ? `${line.text} · repeated ${line.count} times`
+                            : undefined
+                        }
+                      >
                         <span className="chip-icon">
                           <ChipIcon kind={line.kind} />
                         </span>
-                        <span>{line.text}</span>
+                        <span>{label}</span>
                       </div>
                     );
                   }
@@ -4325,7 +5059,9 @@ export default function App() {
                       <div key={line.id} className="msg msg-assistant">
                         <div className="msg-assistant-wrap">
                           <div className="msg-body md-body">
-                            <ChatMarkdown>{line.text}</ChatMarkdown>
+                            <ChatMarkdown mediaBases={chatMediaBases}>
+                              {line.text}
+                            </ChatMarkdown>
                             {streaming && (
                               <span className="stream-caret" aria-hidden />
                             )}
@@ -4429,7 +5165,9 @@ export default function App() {
                     return (
                       <div key={line.id} className="msg msg-thought">
                         <div className="msg-body md-body thought-md">
-                          <ChatMarkdown>{line.text}</ChatMarkdown>
+                          <ChatMarkdown mediaBases={chatMediaBases}>
+                            {line.text}
+                          </ChatMarkdown>
                         </div>
                       </div>
                     );
@@ -4868,7 +5606,16 @@ export default function App() {
           </main>
 
           {outputsOpen && (
-            <aside className="right">
+            <>
+              <div
+                className="panel-resizer panel-resizer-right"
+                role="separator"
+                aria-orientation="vertical"
+                aria-label="Resize outputs panel"
+                title="Drag to resize outputs"
+                onMouseDown={(e) => onPanelResizeStart("right", e)}
+              />
+              <aside className="right">
               <div className="right-header" onMouseDown={onTitlebarMouseDown}>
                 <h2>Outputs</h2>
               </div>
@@ -4969,6 +5716,114 @@ export default function App() {
                         Temporary workspace under ~/.grokx/tasks/. Project
                         sources via ./project.
                       </p>
+                    </div>
+                  )}
+
+                  {session && (
+                    <div className="card git-card">
+                      <div className="files-card-head">
+                        <h3>Git</h3>
+                        <button
+                          type="button"
+                          className="files-icon-btn"
+                          title="Refresh git status"
+                          disabled={gitLoading}
+                          onClick={() => void refreshGitStatus()}
+                        >
+                          <IconRefresh size={14} />
+                        </button>
+                      </div>
+                      {gitLoading && !gitInfo && (
+                        <p className="muted">Loading…</p>
+                      )}
+                      {gitError && (
+                        <p className="files-error">{gitError}</p>
+                      )}
+                      {gitInfo && !gitInfo.is_repo && (
+                        <p className="muted">
+                          {gitInfo.note || "Not a git repository"}
+                          <br />
+                          <span className="mono" title={gitInfo.path}>
+                            {shortPath(gitInfo.path)}
+                          </span>
+                        </p>
+                      )}
+                      {gitInfo && gitInfo.is_repo && (
+                        <>
+                          <dl className="kv">
+                            <dt>Branch</dt>
+                            <dd className="mono">
+                              {gitInfo.branch || "—"}
+                              {gitInfo.dirty ? (
+                                <span className="git-dirty-pill">dirty</span>
+                              ) : (
+                                <span className="git-clean-pill">clean</span>
+                              )}
+                            </dd>
+                            <dt>HEAD</dt>
+                            <dd className="mono" title={gitInfo.head || ""}>
+                              {gitInfo.head_short || "—"}
+                            </dd>
+                            {gitInfo.upstream && (
+                              <>
+                                <dt>Upstream</dt>
+                                <dd className="mono">{gitInfo.upstream}</dd>
+                              </>
+                            )}
+                            <dt>Changes</dt>
+                            <dd>
+                              {gitInfo.staged +
+                                gitInfo.unstaged +
+                                gitInfo.untracked ===
+                              0
+                                ? "none"
+                                : `${gitInfo.staged} staged · ${gitInfo.unstaged} unstaged · ${gitInfo.untracked} untracked`}
+                            </dd>
+                          </dl>
+                          {gitInfo.changes.length > 0 && (
+                            <div className="git-changes">
+                              <div className="git-section-label">
+                                This working tree
+                              </div>
+                              <ul className="git-change-list">
+                                {gitInfo.changes.map((line) => (
+                                  <li key={line} className="mono">
+                                    {line}
+                                  </li>
+                                ))}
+                              </ul>
+                            </div>
+                          )}
+                          {gitInfo.recent.length > 0 && (
+                            <div className="git-recent">
+                              <div className="git-section-label">
+                                Recent commits
+                              </div>
+                              <ul className="git-commit-list">
+                                {gitInfo.recent.map((c) => (
+                                  <li key={c.hash}>
+                                    <span className="git-hash mono">
+                                      {c.short}
+                                    </span>
+                                    <span
+                                      className="git-subject"
+                                      title={c.subject}
+                                    >
+                                      {c.subject}
+                                    </span>
+                                    <span className="git-meta muted">
+                                      {c.relative}
+                                    </span>
+                                  </li>
+                                ))}
+                              </ul>
+                            </div>
+                          )}
+                        </>
+                      )}
+                      {!session.project_root && !session.work_path && (
+                        <p className="muted">No project path for git.</p>
+                      )}
                     </div>
                   )}
 
@@ -5116,6 +5971,7 @@ export default function App() {
                 </div>
               )}
             </aside>
+            </>
           )}
         </>
       )}

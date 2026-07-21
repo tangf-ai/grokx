@@ -947,6 +947,177 @@ fn list_directory(
     Ok(entries)
 }
 
+#[derive(Debug, Serialize)]
+struct GitCommitRow {
+    hash: String,
+    short: String,
+    subject: String,
+    author: String,
+    relative: String,
+}
+
+#[derive(Debug, Serialize)]
+struct GitStatusInfo {
+    /// Absolute path that was queried (repo root or project/task path).
+    path: String,
+    /// True when `path` is inside a git work tree.
+    is_repo: bool,
+    branch: Option<String>,
+    /// Short HEAD sha (7 chars) when available.
+    head_short: Option<String>,
+    /// Full HEAD sha when available.
+    head: Option<String>,
+    /// Upstream tracking ref if configured.
+    upstream: Option<String>,
+    /// Working tree dirty (any unstaged/untracked/staged changes).
+    dirty: bool,
+    /// Counts from `git status --porcelain`.
+    staged: u32,
+    unstaged: u32,
+    untracked: u32,
+    /// First few porcelain lines for UI (path status).
+    changes: Vec<String>,
+    /// Recent commits on the current branch.
+    recent: Vec<GitCommitRow>,
+    /// Human-readable error if git failed (not a hard command error).
+    note: Option<String>,
+}
+
+fn run_git(cwd: &std::path::Path, args: &[&str]) -> Result<String, String> {
+    let out = std::process::Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .map_err(|e| format!("git: {e}"))?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        return Err(if err.is_empty() {
+            format!("git {:?} failed", args)
+        } else {
+            err
+        });
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// Git summary for the Outputs panel (branch, dirty files, recent commits).
+#[tauri::command]
+fn git_status(path: String) -> Result<GitStatusInfo, String> {
+    let root = PathBuf::from(path.trim());
+    if root.as_os_str().is_empty() {
+        return Err("empty path".into());
+    }
+    // Prefer directory; if a file was passed, use parent.
+    let cwd = if root.is_file() {
+        root.parent().map(|p| p.to_path_buf()).unwrap_or(root.clone())
+    } else {
+        root.clone()
+    };
+    if !cwd.exists() {
+        return Err(format!("path does not exist: {}", cwd.display()));
+    }
+
+    let is_repo = run_git(&cwd, &["rev-parse", "--is-inside-work-tree"])
+        .map(|s| s == "true")
+        .unwrap_or(false);
+
+    if !is_repo {
+        return Ok(GitStatusInfo {
+            path: cwd.display().to_string(),
+            is_repo: false,
+            branch: None,
+            head_short: None,
+            head: None,
+            upstream: None,
+            dirty: false,
+            staged: 0,
+            unstaged: 0,
+            untracked: 0,
+            changes: vec![],
+            recent: vec![],
+            note: Some("Not a git repository".into()),
+        });
+    }
+
+    let branch = run_git(&cwd, &["rev-parse", "--abbrev-ref", "HEAD"]).ok();
+    let head = run_git(&cwd, &["rev-parse", "HEAD"]).ok();
+    let head_short = head
+        .as_ref()
+        .map(|h| h.chars().take(7).collect::<String>());
+    let upstream = run_git(
+        &cwd,
+        &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"],
+    )
+    .ok();
+
+    let porcelain = run_git(&cwd, &["status", "--porcelain", "-uall"]).unwrap_or_default();
+    let mut staged = 0u32;
+    let mut unstaged = 0u32;
+    let mut untracked = 0u32;
+    let mut changes = Vec::new();
+    for line in porcelain.lines() {
+        if line.len() < 2 {
+            continue;
+        }
+        let x = line.as_bytes()[0] as char;
+        let y = line.as_bytes()[1] as char;
+        if x == '?' && y == '?' {
+            untracked += 1;
+        } else {
+            if x != ' ' && x != '?' {
+                staged += 1;
+            }
+            if y != ' ' && y != '?' {
+                unstaged += 1;
+            }
+        }
+        if changes.len() < 12 {
+            changes.push(line.to_string());
+        }
+    }
+    let dirty = staged + unstaged + untracked > 0;
+
+    let log = run_git(
+        &cwd,
+        &[
+            "log",
+            "-8",
+            "--pretty=format:%H%x09%h%x09%s%x09%an%x09%ar",
+        ],
+    )
+    .unwrap_or_default();
+    let mut recent = Vec::new();
+    for line in log.lines() {
+        let parts: Vec<&str> = line.splitn(5, '\t').collect();
+        if parts.len() < 5 {
+            continue;
+        }
+        recent.push(GitCommitRow {
+            hash: parts[0].to_string(),
+            short: parts[1].to_string(),
+            subject: parts[2].to_string(),
+            author: parts[3].to_string(),
+            relative: parts[4].to_string(),
+        });
+    }
+
+    Ok(GitStatusInfo {
+        path: cwd.display().to_string(),
+        is_repo: true,
+        branch,
+        head_short,
+        head,
+        upstream,
+        dirty,
+        staged,
+        unstaged,
+        untracked,
+        changes,
+        recent,
+        note: None,
+    })
+}
+
 /// Open a file or folder with the OS default app (Finder / Explorer / …).
 #[tauri::command]
 fn open_path(path: String) -> Result<(), String> {
@@ -1082,6 +1253,7 @@ pub fn run() {
             list_live_sessions,
             list_directory,
             open_path,
+            git_status,
         ])
         .run(tauri::generate_context!())
         .expect("error while running grokx desktop");
