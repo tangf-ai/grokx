@@ -18,6 +18,7 @@ use domain::{
 };
 use permissions::{PermissionBroker, Policy};
 use session_store::{ProjectListItem, SessionListItem, SessionStore};
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::{mpsc, Mutex, RwLock};
 use tracing::warn;
@@ -53,8 +54,37 @@ struct LiveAgent {
     /// App-level session id this agent belongs to (same as map key).
     #[allow(dead_code)]
     app_session_id: SessionId,
+    /// OS pid of the `grok agent stdio` process (parent of tool shells).
+    agent_pid: u32,
     /// True while a prompt/turn is in flight for this agent only.
     turn_busy: AtomicBool,
+    /// Processes we restarted (re-parented under the app, not the agent).
+    /// Entries: (pid, command).
+    managed_extra: Mutex<Vec<(u32, String)>>,
+}
+
+/// A process started under the session agent (tool shells, servers, etc.).
+#[derive(Debug, Clone, Serialize)]
+pub struct SessionProcessInfo {
+    pub pid: u32,
+    pub ppid: u32,
+    pub command: String,
+    pub etime: String,
+    pub state: String,
+    pub cpu: String,
+    pub mem: String,
+    /// Depth under the agent (1 = direct child).
+    pub depth: u32,
+    /// Working directory when available (macOS `lsof` / Linux `/proc`).
+    pub cwd: Option<String>,
+    pub paused: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RestartedProcessInfo {
+    pub pid: u32,
+    pub command: String,
+    pub cwd: Option<String>,
 }
 
 pub struct AppCore {
@@ -225,6 +255,214 @@ impl AppCore {
     /// Session ids with a live agent (for UI multi-task indicators).
     pub async fn live_session_ids(&self) -> Vec<SessionId> {
         self.live.lock().await.keys().cloned().collect()
+    }
+
+    /// List processes related to this task:
+    /// 1) descendants of the live agent (tool shells still attached)
+    /// 2) managed extras we restarted from Outputs
+    /// 3) "orphan" servers whose cwd/command match the task workspace or project
+    ///    (common after app restart when PPID reparents to launchd)
+    pub async fn list_session_processes(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Vec<SessionProcessInfo>, CoreError> {
+        let (agent_pid, extras, work_path, project_root) = {
+            let live = self.live.lock().await;
+            if let Some(agent) = live.get(session_id) {
+                let extras = agent.managed_extra.lock().await.clone();
+                (
+                    Some(agent.agent_pid),
+                    extras,
+                    agent.work_path.clone(),
+                    agent.project_root.clone(),
+                )
+            } else {
+                // Agent not live — still surface orphans from stored meta paths.
+                let store = self.store.lock().await;
+                let meta = store
+                    .get_session(session_id)
+                    .map_err(|e| CoreError::Message(e.to_string()))?;
+                let work = if meta.work_path.is_empty() {
+                    AppPaths::tasks_root().join(session_id.0.to_string())
+                } else {
+                    PathBuf::from(&meta.work_path)
+                };
+                let project = store
+                    .get_project(&meta.project_id)
+                    .ok()
+                    .map(|p| PathBuf::from(&p.root_path))
+                    .unwrap_or_else(|| work.clone());
+                (None, Vec::new(), work, project)
+            }
+        };
+
+        let mut out: Vec<SessionProcessInfo> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+
+        if let Some(pid) = agent_pid.filter(|p| *p != 0) {
+            for p in list_descendant_processes(pid) {
+                if seen.insert(p.pid) {
+                    out.push(p);
+                }
+            }
+        }
+
+        // Managed extras (restarted processes re-parented under the app).
+        let mut still = Vec::new();
+        for (pid, cmd) in extras {
+            if !process_exists(pid) {
+                continue;
+            }
+            still.push((pid, cmd.clone()));
+            if seen.contains(&pid) {
+                continue;
+            }
+            if let Some(info) = snap_to_info(pid, Some(cmd), 1) {
+                seen.insert(pid);
+                out.push(info);
+            }
+        }
+        if let Some(agent) = self.live.lock().await.get(session_id) {
+            *agent.managed_extra.lock().await = still;
+        }
+
+        // Orphans: match work_path / project_root (cwd or command line).
+        // Skip the agent binary itself and our desktop shell.
+        let skip_pids: std::collections::HashSet<u32> = agent_pid.into_iter().collect();
+        for p in find_related_orphans(&work_path, &project_root, &skip_pids) {
+            if seen.insert(p.pid) {
+                out.push(p);
+            }
+        }
+
+        out.sort_by(|a, b| a.depth.cmp(&b.depth).then(a.pid.cmp(&b.pid)));
+        Ok(out)
+    }
+
+    /// Stop a process that belongs to the session agent tree (SIGTERM, then SIGKILL).
+    pub async fn stop_session_process(
+        &self,
+        session_id: &SessionId,
+        pid: u32,
+    ) -> Result<(), CoreError> {
+        self.ensure_pid_under_session(session_id, pid).await?;
+        signal_process_tree(pid, "term")?;
+        // Brief grace, then force-kill leftovers.
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        if process_exists(pid) {
+            let _ = signal_process_tree(pid, "kill");
+        }
+        // Drop from managed extras if present.
+        if let Some(agent) = self.live.lock().await.get(session_id) {
+            agent
+                .managed_extra
+                .lock()
+                .await
+                .retain(|(p, _)| *p != pid);
+        }
+        Ok(())
+    }
+
+    /// Pause (SIGSTOP) a process under the session agent.
+    pub async fn pause_session_process(
+        &self,
+        session_id: &SessionId,
+        pid: u32,
+    ) -> Result<(), CoreError> {
+        self.ensure_pid_under_session(session_id, pid).await?;
+        signal_process(pid, "stop")
+    }
+
+    /// Resume (SIGCONT) a paused process under the session agent.
+    pub async fn resume_session_process(
+        &self,
+        session_id: &SessionId,
+        pid: u32,
+    ) -> Result<(), CoreError> {
+        self.ensure_pid_under_session(session_id, pid).await?;
+        signal_process(pid, "cont")
+    }
+
+    /// Restart a process: stop it, then re-run the same command in its cwd.
+    pub async fn restart_session_process(
+        &self,
+        session_id: &SessionId,
+        pid: u32,
+    ) -> Result<RestartedProcessInfo, CoreError> {
+        self.ensure_pid_under_session(session_id, pid).await?;
+        let snap = process_snapshot(pid).ok_or_else(|| {
+            CoreError::Message(format!("process {pid} not found"))
+        })?;
+        let cwd_hint = process_cwd(pid);
+        let work_fallback = {
+            let live = self.live.lock().await;
+            live.get(session_id)
+                .map(|a| a.work_path.clone())
+                .ok_or(CoreError::NotConnected)?
+        };
+        let run_cwd = cwd_hint
+            .as_deref()
+            .map(PathBuf::from)
+            .filter(|p| p.is_dir())
+            .unwrap_or(work_fallback);
+
+        signal_process_tree(pid, "term")?;
+        tokio::time::sleep(std::time::Duration::from_millis(350)).await;
+        if process_exists(pid) {
+            let _ = signal_process_tree(pid, "kill");
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        }
+
+        let child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&snap.command)
+            .current_dir(&run_cwd)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map_err(|e| {
+                CoreError::Message(format!("restart failed: {e}"))
+            })?;
+        let new_pid = child.id();
+        // Detach: don't wait; leave running in background.
+        std::mem::forget(child);
+
+        // Track under session so it still appears in Outputs after re-parent.
+        if let Some(agent) = self.live.lock().await.get(session_id) {
+            let mut extra = agent.managed_extra.lock().await;
+            extra.retain(|(p, _)| *p != pid);
+            extra.push((new_pid, snap.command.clone()));
+        }
+
+        Ok(RestartedProcessInfo {
+            pid: new_pid,
+            command: snap.command,
+            cwd: Some(run_cwd.display().to_string()),
+        })
+    }
+
+    async fn ensure_pid_under_session(
+        &self,
+        session_id: &SessionId,
+        pid: u32,
+    ) -> Result<(), CoreError> {
+        // Reuse list logic: if it would appear in Outputs, we may control it.
+        let listed = self.list_session_processes(session_id).await?;
+        if listed.iter().any(|p| p.pid == pid) {
+            // Never allow killing something that is the agent itself.
+            if let Some(agent) = self.live.lock().await.get(session_id) {
+                if pid == agent.agent_pid {
+                    return Err(CoreError::Message(
+                        "refusing to control the agent process itself".into(),
+                    ));
+                }
+            }
+            return Ok(());
+        }
+        Err(CoreError::Message(format!(
+            "pid {pid} is not a process related to this task"
+        )))
     }
 
     /// Remember the project directory chosen in the UI (before connect).
@@ -473,6 +711,86 @@ impl AppCore {
         work_path.join("chat-history.json")
     }
 
+    /// Read chat-history bytes and recover a usable JSON array string.
+    ///
+    /// Handles: invalid UTF-8 mid-file, trailing garbage after a complete
+    /// array (partial second write). Returns `None` only when nothing
+    /// parseable remains.
+    fn recover_chat_history_json(path: &Path, bytes: &[u8]) -> Option<String> {
+        let try_parse = |s: &str| -> Option<String> {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+            // Full clean document.
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) {
+                return serde_json::to_string(&v).ok();
+            }
+            // Trailing garbage after a complete first value (e.g. partial rewrite).
+            let mut de = serde_json::Deserializer::from_str(trimmed);
+            match serde_json::Value::deserialize(&mut de) {
+                Ok(v) => serde_json::to_string(&v).ok(),
+                Err(_) => None,
+            }
+        };
+
+        if let Ok(s) = std::str::from_utf8(bytes) {
+            if let Some(clean) = try_parse(s) {
+                return Some(clean);
+            }
+        }
+
+        // Lossy UTF-8 then first JSON value (illegal mid-file bytes).
+        let lossy = String::from_utf8_lossy(bytes);
+        match try_parse(&lossy) {
+            Some(clean) => {
+                warn!(
+                    path = %path.display(),
+                    "recovered chat history after corrupt/invalid bytes"
+                );
+                Some(clean)
+            }
+            None => {
+                warn!(path = %path.display(), "chat history unrecoverable");
+                None
+            }
+        }
+    }
+
+    fn read_chat_history_file(path: &Path) -> Result<Option<String>, CoreError> {
+        if !path.is_file() {
+            return Ok(None);
+        }
+        let bytes = std::fs::read(path).map_err(|e| {
+            CoreError::Message(format!("read chat history {}: {e}", path.display()))
+        })?;
+        if bytes.is_empty() {
+            return Ok(None);
+        }
+        match Self::recover_chat_history_json(path, &bytes) {
+            Some(clean) => {
+                // If we had to repair, rewrite so future loads are clean.
+                let original_ok = std::str::from_utf8(&bytes)
+                    .ok()
+                    .and_then(|s| {
+                        let t = s.trim();
+                        serde_json::from_str::<serde_json::Value>(t)
+                            .ok()
+                            .map(|_| t == clean || s == clean)
+                    })
+                    .unwrap_or(false);
+                if !original_ok {
+                    let tmp = path.with_extension("json.repair-tmp");
+                    if std::fs::write(&tmp, clean.as_bytes()).is_ok() {
+                        let _ = std::fs::rename(&tmp, path);
+                    }
+                }
+                Ok(Some(clean))
+            }
+            None => Ok(None),
+        }
+    }
+
     /// Persist UI chat transcript for a task (JSON array of chat lines).
     /// Prefer `work_path` when known so history is not lost if store is mid-update.
     pub async fn save_chat_history(
@@ -481,6 +799,20 @@ impl AppCore {
         json: impl AsRef<str>,
         work_path: Option<String>,
     ) -> Result<(), CoreError> {
+        let raw = json.as_ref();
+        // Refuse to write non-array / invalid JSON (would brick the transcript).
+        let value: serde_json::Value = serde_json::from_str(raw).map_err(|e| {
+            CoreError::Message(format!("chat history is not valid JSON: {e}"))
+        })?;
+        if !value.is_array() {
+            return Err(CoreError::Message(
+                "chat history must be a JSON array".into(),
+            ));
+        }
+        // Canonical UTF-8 (no lone surrogates / odd escapes from the webview).
+        let canonical = serde_json::to_string(&value)
+            .map_err(|e| CoreError::Message(format!("serialize chat history: {e}")))?;
+
         let work = if let Some(w) = work_path
             .as_deref()
             .map(str::trim)
@@ -505,7 +837,7 @@ impl AppCore {
         let path = Self::chat_history_path(&work);
         // Atomic-ish write: write temp then rename.
         let tmp = work.join("chat-history.json.tmp");
-        std::fs::write(&tmp, json.as_ref()).map_err(|e| {
+        std::fs::write(&tmp, canonical.as_bytes()).map_err(|e| {
             CoreError::Message(format!("write chat history {}: {e}", tmp.display()))
         })?;
         std::fs::rename(&tmp, &path).map_err(|e| {
@@ -542,23 +874,19 @@ impl AppCore {
             }
         };
         let path = Self::chat_history_path(&work);
-        if !path.is_file() {
-            // Also try conventional location if hint differed.
-            let fallback = AppPaths::tasks_root()
-                .join(session_id.0.to_string())
-                .join("chat-history.json");
-            if fallback.is_file() && fallback != path {
-                let raw = std::fs::read_to_string(&fallback).map_err(|e| {
-                    CoreError::Message(format!("read chat history {}: {e}", fallback.display()))
-                })?;
+        if let Some(raw) = Self::read_chat_history_file(&path)? {
+            return Ok(Some(raw));
+        }
+        // Also try conventional location if hint differed.
+        let fallback = AppPaths::tasks_root()
+            .join(session_id.0.to_string())
+            .join("chat-history.json");
+        if fallback != path {
+            if let Some(raw) = Self::read_chat_history_file(&fallback)? {
                 return Ok(Some(raw));
             }
-            return Ok(None);
         }
-        let raw = std::fs::read_to_string(&path).map_err(|e| {
-            CoreError::Message(format!("read chat history {}: {e}", path.display()))
-        })?;
-        Ok(Some(raw))
+        Ok(None)
     }
 
     /// Start a **new** task under a project.
@@ -768,6 +1096,7 @@ impl AppCore {
                 },
             },
         )?;
+        let agent_pid = child.child.id().unwrap_or(0);
 
         let now = Utc::now();
         let root_str = project_root.display().to_string();
@@ -939,7 +1268,9 @@ impl AppCore {
                 project_root,
                 work_path,
                 app_session_id: app_session_id.clone(),
+                agent_pid,
                 turn_busy: AtomicBool::new(false),
+                managed_extra: Mutex::new(Vec::new()),
             },
         );
         *self.active_session.write().await = Some(app_session_id.clone());
@@ -1311,3 +1642,369 @@ mod tests {
         let _ = std::fs::remove_dir_all(&work);
     }
 }
+
+// ─── Session process tree (agent tool children) ─────────────────────────────
+
+#[derive(Debug, Clone)]
+struct ProcSnap {
+    pid: u32,
+    ppid: u32,
+    etime: String,
+    cpu: String,
+    mem: String,
+    state: String,
+    command: String,
+}
+
+fn process_exists(pid: u32) -> bool {
+    std::path::Path::new(&format!("/proc/{pid}")).exists()
+        || std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+}
+
+fn process_snapshot(pid: u32) -> Option<ProcSnap> {
+    let out = std::process::Command::new("ps")
+        .args([
+            "-p",
+            &pid.to_string(),
+            "-o",
+            "pid=,ppid=,etime=,pcpu=,pmem=,state=,command=",
+        ])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_ps_line(&String::from_utf8_lossy(&out.stdout))
+}
+
+fn parse_ps_line(line: &str) -> Option<ProcSnap> {
+    let line = line.trim();
+    if line.is_empty() {
+        return None;
+    }
+    let mut parts = line.split_whitespace();
+    let pid: u32 = parts.next()?.parse().ok()?;
+    let ppid: u32 = parts.next()?.parse().ok()?;
+    let etime = parts.next()?.to_string();
+    let cpu = parts.next()?.to_string();
+    let mem = parts.next()?.to_string();
+    let state = parts.next()?.to_string();
+    let command = parts.collect::<Vec<_>>().join(" ");
+    if command.is_empty() {
+        return None;
+    }
+    Some(ProcSnap {
+        pid,
+        ppid,
+        etime,
+        cpu,
+        mem,
+        state,
+        command,
+    })
+}
+
+fn process_cwd(pid: u32) -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        return std::fs::read_link(format!("/proc/{pid}/cwd"))
+            .ok()
+            .map(|p| p.display().to_string());
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let out = std::process::Command::new("lsof")
+            .args(["-a", "-p", &pid.to_string(), "-d", "cwd", "-Fn"])
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            if let Some(rest) = line.strip_prefix('n') {
+                if !rest.is_empty() {
+                    return Some(rest.to_string());
+                }
+            }
+        }
+        None
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+fn list_all_processes() -> Vec<ProcSnap> {
+    let out = match std::process::Command::new("ps")
+        .args(["-axo", "pid=,ppid=,etime=,pcpu=,pmem=,state=,command="])
+        .output()
+    {
+        Ok(o) if o.status.success() => o,
+        _ => return Vec::new(),
+    };
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(parse_ps_line)
+        .collect()
+}
+
+fn snap_to_info(pid: u32, command_fallback: Option<String>, depth: u32) -> Option<SessionProcessInfo> {
+    let snap = process_snapshot(pid);
+    let command = snap
+        .as_ref()
+        .map(|s| s.command.clone())
+        .or(command_fallback)?;
+    let paused = snap
+        .as_ref()
+        .map(|s| s.state.starts_with('T'))
+        .unwrap_or(false);
+    Some(SessionProcessInfo {
+        pid,
+        ppid: snap.as_ref().map(|s| s.ppid).unwrap_or(0),
+        command,
+        etime: snap
+            .as_ref()
+            .map(|s| s.etime.clone())
+            .unwrap_or_else(|| "—".into()),
+        state: snap
+            .as_ref()
+            .map(|s| s.state.clone())
+            .unwrap_or_else(|| "?".into()),
+        cpu: snap
+            .as_ref()
+            .map(|s| s.cpu.clone())
+            .unwrap_or_else(|| "0".into()),
+        mem: snap
+            .as_ref()
+            .map(|s| s.mem.clone())
+            .unwrap_or_else(|| "0".into()),
+        depth,
+        cwd: process_cwd(pid),
+        paused,
+    })
+}
+
+fn list_descendant_processes(agent_pid: u32) -> Vec<SessionProcessInfo> {
+    if agent_pid == 0 {
+        return Vec::new();
+    }
+    let all = list_all_processes();
+    let mut by_ppid: std::collections::HashMap<u32, Vec<&ProcSnap>> =
+        std::collections::HashMap::new();
+    for p in &all {
+        by_ppid.entry(p.ppid).or_default().push(p);
+    }
+    let mut out = Vec::new();
+    let mut stack: Vec<(u32, u32)> = vec![(agent_pid, 0)];
+    while let Some((parent, depth)) = stack.pop() {
+        if let Some(children) = by_ppid.get(&parent) {
+            for c in children {
+                // depth 0 is the agent itself — only collect descendants.
+                let d = depth + 1;
+                let paused = c.state.starts_with('T');
+                out.push(SessionProcessInfo {
+                    pid: c.pid,
+                    ppid: c.ppid,
+                    command: c.command.clone(),
+                    etime: c.etime.clone(),
+                    state: c.state.clone(),
+                    cpu: c.cpu.clone(),
+                    mem: c.mem.clone(),
+                    depth: d,
+                    cwd: process_cwd(c.pid),
+                    paused,
+                });
+                stack.push((c.pid, d));
+            }
+        }
+    }
+    // Stable-ish: shallower first, then pid.
+    out.sort_by(|a, b| a.depth.cmp(&b.depth).then(a.pid.cmp(&b.pid)));
+    out
+}
+
+/// Find long-lived processes that look like they belong to this task/project
+/// even when no longer parented under the agent (PPID=1 after agent restart).
+fn find_related_orphans(
+    work_path: &Path,
+    project_root: &Path,
+    skip_pids: &std::collections::HashSet<u32>,
+) -> Vec<SessionProcessInfo> {
+    let work_s = work_path.display().to_string();
+    let proj_s = project_root.display().to_string();
+    // Avoid matching everything when paths are empty / too short.
+    if work_s.len() < 8 && proj_s.len() < 8 {
+        return Vec::new();
+    }
+    let work_norm = work_s.trim_end_matches('/').to_string();
+    let proj_norm = proj_s.trim_end_matches('/').to_string();
+    let self_pid = std::process::id();
+
+    let mut out = Vec::new();
+    for p in list_all_processes() {
+        if skip_pids.contains(&p.pid) || p.pid == self_pid {
+            continue;
+        }
+        // Never list our own shell / UI tooling as "task processes".
+        let cmd = &p.command;
+        if cmd.contains("grokx-desktop")
+            || cmd.contains("tauri.js")
+            || cmd.contains("vite")
+            || cmd.contains("/grok agent")
+            || cmd.contains("runtime/grok")
+        {
+            continue;
+        }
+        // Skip system / unrelated noise.
+        if cmd.starts_with("/System/")
+            || cmd.starts_with("/usr/libexec/")
+            || cmd.starts_with("/sbin/")
+            || cmd.contains("cloudflared")
+            || cmd.contains("Cursor Helper")
+            || cmd.contains("Google Chrome")
+        {
+            continue;
+        }
+
+        let cwd = process_cwd(p.pid);
+        let cwd_match = cwd
+            .as_deref()
+            .map(|c| {
+                let c = c.trim_end_matches('/');
+                (!work_norm.is_empty()
+                    && (c == work_norm || c.starts_with(&format!("{work_norm}/"))))
+                    || (!proj_norm.is_empty()
+                        && (c == proj_norm || c.starts_with(&format!("{proj_norm}/"))))
+            })
+            .unwrap_or(false);
+
+        let cmd_match = (!work_norm.is_empty() && cmd.contains(&work_norm))
+            || (!proj_norm.is_empty() && cmd.contains(&proj_norm));
+
+        // Also catch `uv run mykg …` when project leaf name is distinctive and
+        // cwd is under project (already covered) OR command includes project venv.
+        if !cwd_match && !cmd_match {
+            continue;
+        }
+
+        // Prefer root-ish processes (not every python helper under the server).
+        // Include if: listening-style long runners OR direct match on work/project.
+        let looks_like_server = cmd.contains(" web ")
+            || cmd.contains(" serve")
+            || cmd.contains("uvicorn")
+            || cmd.contains("flask")
+            || cmd.contains("django")
+            || cmd.contains("next ")
+            || cmd.contains("vite")
+            || cmd.contains("--port")
+            || cmd.contains("0.0.0.0")
+            || cmd.contains("127.0.0.1")
+            || cmd.contains("mykg web")
+            || cmd.contains("npm run")
+            || cmd.contains("pnpm ")
+            || cmd.contains("yarn ");
+
+        // Include parent shells (`uv run …`) and actual servers.
+        if !looks_like_server && !cmd_match {
+            // cwd-only match: only keep if it still looks like a user tool.
+            if !(cmd.contains("python")
+                || cmd.contains("node")
+                || cmd.contains("uv ")
+                || cmd.contains("cargo ")
+                || cmd.contains("ruby")
+                || cmd.contains("java"))
+            {
+                continue;
+            }
+        }
+
+        out.push(SessionProcessInfo {
+            pid: p.pid,
+            ppid: p.ppid,
+            command: p.command.clone(),
+            etime: p.etime.clone(),
+            state: p.state.clone(),
+            cpu: p.cpu.clone(),
+            mem: p.mem.clone(),
+            // depth 1 for orphans so they show as top-level task processes.
+            depth: 1,
+            cwd,
+            paused: p.state.starts_with('T'),
+        });
+    }
+    out
+}
+
+fn signal_process(pid: u32, kind: &str) -> Result<(), CoreError> {
+    let flag = match kind {
+        "term" => "-TERM",
+        "kill" => "-KILL",
+        "stop" => "-STOP",
+        "cont" => "-CONT",
+        other => {
+            return Err(CoreError::Message(format!("unknown signal {other}")));
+        }
+    };
+    let status = std::process::Command::new("kill")
+        .args([flag, &pid.to_string()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map_err(|e| CoreError::Message(format!("kill {pid}: {e}")))?;
+    if status.success() || kind == "kill" {
+        Ok(())
+    } else {
+        // ESRCH / already gone is fine for stop/kill paths.
+        if !process_exists(pid) {
+            return Ok(());
+        }
+        Err(CoreError::Message(format!(
+            "kill {flag} {pid} failed ({status})"
+        )))
+    }
+}
+
+/// Signal a process and its descendants (deepest first for TERM/KILL).
+fn signal_process_tree(root: u32, kind: &str) -> Result<(), CoreError> {
+    let mut pids: Vec<u32> = list_descendant_processes(root)
+        .into_iter()
+        .map(|p| p.pid)
+        .collect();
+    pids.push(root);
+    // Deepest first so children die before parents when terminating.
+    pids.reverse();
+    let mut last_err: Option<CoreError> = None;
+    for pid in pids {
+        if let Err(e) = signal_process(pid, kind) {
+            last_err = Some(e);
+        }
+    }
+    if process_exists(root) {
+        if let Some(e) = last_err {
+            return Err(e);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod session_process_tests {
+    use super::*;
+
+    #[test]
+    fn parse_ps_line_basic() {
+        let s = parse_ps_line(" 123  1 01:02 0.1 0.2 S /bin/sleep 10").unwrap();
+        assert_eq!(s.pid, 123);
+        assert_eq!(s.ppid, 1);
+        assert_eq!(s.command, "/bin/sleep 10");
+    }
+}
+

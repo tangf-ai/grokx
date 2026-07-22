@@ -481,6 +481,334 @@ async fn save_settings(
         .map_err(|e| e.to_string())
 }
 
+/// Read the raw Grok engine config (`~/.grok/config.toml`) for the Settings editor.
+#[tauri::command]
+fn read_grok_config() -> Result<GrokConfigFile, String> {
+    let path = app_config::AppPaths::grok_cli_config();
+    let path_str = path.display().to_string();
+    if !path.exists() {
+        return Ok(GrokConfigFile {
+            path: path_str,
+            content: String::new(),
+            exists: false,
+        });
+    }
+    let content =
+        std::fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    Ok(GrokConfigFile {
+        path: path_str,
+        content,
+        exists: true,
+    })
+}
+
+/// Write the raw Grok engine config. Only allows the standard `~/.grok/config.toml` path.
+#[tauri::command]
+fn write_grok_config(content: String) -> Result<GrokConfigFile, String> {
+    let path = app_config::AppPaths::grok_cli_config();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("create {}: {e}", parent.display()))?;
+    }
+    // Basic sanity: reject NULs which break most editors / TOML parsers.
+    if content.contains('\0') {
+        return Err("config content must not contain null bytes".into());
+    }
+    std::fs::write(&path, content.as_bytes())
+        .map_err(|e| format!("write {}: {e}", path.display()))?;
+    Ok(GrokConfigFile {
+        path: path.display().to_string(),
+        content,
+        exists: true,
+    })
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct GrokConfigFile {
+    path: String,
+    content: String,
+    exists: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProbeEndpointArgs {
+    /// Base URL from the form, e.g. `http://host:port/v1`
+    base_url: String,
+    /// Optional key typed in the form (takes precedence over saved settings).
+    api_key: Option<String>,
+    /// Optional env var name to read the key from when form key is empty.
+    env_key: Option<String>,
+    /// When form key is blank, use the key stored in app settings.
+    use_saved_key: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct EndpointProbeResult {
+    ok: bool,
+    status: u16,
+    message: String,
+    models_url: String,
+    latency_ms: u64,
+    model_count: Option<usize>,
+    /// First few model ids for a quick glance.
+    sample_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RemoteModelInfo {
+    id: String,
+    name: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct FetchModelsResult {
+    ok: bool,
+    status: u16,
+    message: String,
+    models_url: String,
+    models: Vec<RemoteModelInfo>,
+}
+
+fn normalize_openai_base(raw: &str) -> Result<String, String> {
+    let mut s = raw.trim().to_string();
+    if s.is_empty() {
+        return Err("Base URL is empty".into());
+    }
+    // Accept host without scheme.
+    if !s.contains("://") {
+        s = format!("http://{s}");
+    }
+    while s.ends_with('/') {
+        s.pop();
+    }
+    Ok(s)
+}
+
+fn models_url_from_base(base: &str) -> String {
+    // base is expected like …/v1 (or …/v1/ already trimmed)
+    if base.ends_with("/models") {
+        base.to_string()
+    } else {
+        format!("{base}/models")
+    }
+}
+
+async fn resolve_probe_api_key(
+    core: &CoreState,
+    form_key: Option<&str>,
+    env_key: Option<&str>,
+    use_saved: bool,
+) -> Option<String> {
+    let form = form_key.map(str::trim).filter(|s| !s.is_empty());
+    if let Some(k) = form {
+        return Some(k.to_string());
+    }
+    if use_saved {
+        let settings = core.0.public_settings().await;
+        // public view masks the key — need full key from internal settings.
+        // Fall through to env / internal via a dedicated helper below.
+        let _ = settings;
+    }
+    // Read full settings via update path is not ideal; use engine_env style.
+    // Access through a small core method would be cleaner; for now re-load file.
+    if use_saved {
+        if let Ok(full) = app_config::UserSettings::load(&core.0.paths.config_file) {
+            if let Some(k) = full
+                .endpoint
+                .api_key
+                .as_ref()
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+            {
+                return Some(k.to_string());
+            }
+            if let Some(ek) = full
+                .endpoint
+                .env_key
+                .as_ref()
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+            {
+                if let Ok(v) = std::env::var(ek) {
+                    if !v.trim().is_empty() {
+                        return Some(v);
+                    }
+                }
+            }
+        }
+    }
+    if let Some(ek) = env_key.map(str::trim).filter(|s| !s.is_empty()) {
+        if let Ok(v) = std::env::var(ek) {
+            if !v.trim().is_empty() {
+                return Some(v);
+            }
+        }
+    }
+    None
+}
+
+async fn http_get_models(
+    models_url: &str,
+    api_key: Option<&str>,
+) -> Result<(u16, String, u64), String> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(12))
+        .build()
+        .map_err(|e| format!("http client: {e}"))?;
+    let mut req = client.get(models_url);
+    if let Some(k) = api_key.map(str::trim).filter(|s| !s.is_empty()) {
+        req = req.header("Authorization", format!("Bearer {k}"));
+    }
+    let started = std::time::Instant::now();
+    let resp = req.send().await.map_err(|e| format!("request failed: {e}"))?;
+    let status = resp.status().as_u16();
+    let body = resp
+        .text()
+        .await
+        .map_err(|e| format!("read body: {e}"))?;
+    let latency_ms = started.elapsed().as_millis() as u64;
+    Ok((status, body, latency_ms))
+}
+
+fn parse_models_list(body: &str) -> Vec<RemoteModelInfo> {
+    let mut out = Vec::new();
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
+        return out;
+    };
+    let arr = if let Some(a) = v.get("data").and_then(|d| d.as_array()) {
+        a.clone()
+    } else if let Some(a) = v.as_array() {
+        a.clone()
+    } else if let Some(a) = v.get("models").and_then(|d| d.as_array()) {
+        a.clone()
+    } else {
+        return out;
+    };
+    for item in arr {
+        let id = item
+            .get("id")
+            .and_then(|x| x.as_str())
+            .or_else(|| item.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if id.is_empty() {
+            continue;
+        }
+        // Prefer display_name; `name` is often JSON null on OpenAI-compatible APIs.
+        let name = ["display_name", "name", "title", "id"]
+            .into_iter()
+            .find_map(|k| {
+                item.get(k)
+                    .and_then(|x| x.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string())
+            })
+            .unwrap_or_else(|| id.clone());
+        out.push(RemoteModelInfo { id, name });
+    }
+    out
+}
+
+/// GET `{base}/models` — validates endpoint + key without sending a chat.
+#[tauri::command]
+async fn test_endpoint(
+    core: State<'_, CoreState>,
+    args: ProbeEndpointArgs,
+) -> Result<EndpointProbeResult, String> {
+    let base = normalize_openai_base(&args.base_url)?;
+    let models_url = models_url_from_base(&base);
+    let key = resolve_probe_api_key(
+        &core,
+        args.api_key.as_deref(),
+        args.env_key.as_deref(),
+        args.use_saved_key.unwrap_or(true),
+    )
+    .await;
+    if key.is_none() {
+        return Ok(EndpointProbeResult {
+            ok: false,
+            status: 0,
+            message: "No API key (type one, or save a key first / set env key)".into(),
+            models_url,
+            latency_ms: 0,
+            model_count: None,
+            sample_ids: vec![],
+        });
+    }
+    let (status, body, latency_ms) =
+        http_get_models(&models_url, key.as_deref()).await?;
+    let models = parse_models_list(&body);
+    let ok = (200..300).contains(&status);
+    let message = if ok {
+        format!(
+            "OK · HTTP {status} · {} model(s) · {latency_ms} ms",
+            models.len()
+        )
+    } else {
+        let snippet: String = body.chars().take(180).collect();
+        format!("HTTP {status} · {snippet}")
+    };
+    let sample_ids: Vec<String> = models.iter().take(8).map(|m| m.id.clone()).collect();
+    Ok(EndpointProbeResult {
+        ok,
+        status,
+        message,
+        models_url,
+        latency_ms,
+        model_count: if ok { Some(models.len()) } else { None },
+        sample_ids,
+    })
+}
+
+/// GET `{base}/models` and return the full list for the Settings form.
+#[tauri::command]
+async fn fetch_remote_models(
+    core: State<'_, CoreState>,
+    args: ProbeEndpointArgs,
+) -> Result<FetchModelsResult, String> {
+    let base = normalize_openai_base(&args.base_url)?;
+    let models_url = models_url_from_base(&base);
+    let key = resolve_probe_api_key(
+        &core,
+        args.api_key.as_deref(),
+        args.env_key.as_deref(),
+        args.use_saved_key.unwrap_or(true),
+    )
+    .await;
+    if key.is_none() {
+        return Ok(FetchModelsResult {
+            ok: false,
+            status: 0,
+            message: "No API key (type one, or save a key first / set env key)".into(),
+            models_url,
+            models: vec![],
+        });
+    }
+    let (status, body, _ms) = http_get_models(&models_url, key.as_deref()).await?;
+    let models = parse_models_list(&body);
+    let ok = (200..300).contains(&status) && !models.is_empty();
+    let message = if (200..300).contains(&status) {
+        if models.is_empty() {
+            "HTTP OK but no models in response".into()
+        } else {
+            format!("Fetched {} model(s)", models.len())
+        }
+    } else {
+        let snippet: String = body.chars().take(180).collect();
+        format!("HTTP {status} · {snippet}")
+    };
+    Ok(FetchModelsResult {
+        ok,
+        status,
+        message,
+        models_url,
+        models,
+    })
+}
+
 /// Guess mime when mime_guess is weak (Office Open XML, etc.).
 fn mime_from_path_or_name(path: &std::path::Path, name: &str) -> Option<String> {
     if let Some(m) = mime_guess::from_path(path).first() {
@@ -871,6 +1199,71 @@ async fn list_live_sessions(core: State<'_, CoreState>) -> Result<Vec<String>, S
         .collect())
 }
 
+/// Processes the agent has spawned for a task (tool shells / servers).
+#[tauri::command]
+async fn list_session_processes(
+    core: State<'_, CoreState>,
+    session_id: String,
+) -> Result<Vec<app_core::SessionProcessInfo>, String> {
+    let sid = parse_session_id(&session_id)?;
+    core.0
+        .list_session_processes(&sid)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn stop_session_process(
+    core: State<'_, CoreState>,
+    session_id: String,
+    pid: u32,
+) -> Result<(), String> {
+    let sid = parse_session_id(&session_id)?;
+    core.0
+        .stop_session_process(&sid, pid)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn pause_session_process(
+    core: State<'_, CoreState>,
+    session_id: String,
+    pid: u32,
+) -> Result<(), String> {
+    let sid = parse_session_id(&session_id)?;
+    core.0
+        .pause_session_process(&sid, pid)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn resume_session_process(
+    core: State<'_, CoreState>,
+    session_id: String,
+    pid: u32,
+) -> Result<(), String> {
+    let sid = parse_session_id(&session_id)?;
+    core.0
+        .resume_session_process(&sid, pid)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn restart_session_process(
+    core: State<'_, CoreState>,
+    session_id: String,
+    pid: u32,
+) -> Result<app_core::RestartedProcessInfo, String> {
+    let sid = parse_session_id(&session_id)?;
+    core.0
+        .restart_session_process(&sid, pid)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 #[derive(Debug, Serialize)]
 struct DirEntryInfo {
     name: String,
@@ -1241,6 +1634,10 @@ pub fn run() {
             list_efforts,
             get_settings,
             save_settings,
+            test_endpoint,
+            fetch_remote_models,
+            read_grok_config,
+            write_grok_config,
             pick_attachments,
             save_pasted_attachment,
             read_clipboard_image,
@@ -1251,6 +1648,11 @@ pub fn run() {
             is_session_live,
             is_session_busy,
             list_live_sessions,
+            list_session_processes,
+            stop_session_process,
+            pause_session_process,
+            resume_session_process,
+            restart_session_process,
             list_directory,
             open_path,
             git_status,

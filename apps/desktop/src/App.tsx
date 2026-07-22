@@ -6,6 +6,7 @@ import {
   useState,
   type CSSProperties,
   type MouseEvent as ReactMouseEvent,
+  type ReactNode,
 } from "react";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
@@ -23,6 +24,7 @@ import {
   IconFile,
   IconFolder,
   IconGithub,
+  IconGoal,
   IconInfo,
   IconPaperclip,
   IconPen,
@@ -35,7 +37,10 @@ import {
   IconTool,
   IconTrash,
 } from "./icons";
-import { onTitlebarMouseDown } from "./windowDrag";
+import {
+  onTitlebarDoubleClick,
+  onTitlebarMouseDown,
+} from "./windowDrag";
 import {
   detectVerbalOnlyCompletion,
   VERBAL_COMPLETION_NUDGE,
@@ -319,6 +324,81 @@ function formatBytes(n?: number | null): string {
   if (n < 1024) return `${n} B`;
   if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
   return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+/** Compact label for process rows (basename + key args, not full path). */
+function shortProcessLabel(command: string): string {
+  const raw = (command || "").trim().replace(/\s+/g, " ");
+  if (!raw) return "process";
+  const mykg = raw.match(/\bmykg\s+(\w+)/i);
+  if (mykg) {
+    const port = raw.match(/--port\s+(\d+)/);
+    return port ? `mykg ${mykg[1]} :${port[1]}` : `mykg ${mykg[1]}`;
+  }
+  if (/\b(uvicorn|gunicorn)\b/i.test(raw)) {
+    const m = raw.match(/\b(uvicorn|gunicorn)\b/i);
+    return m ? m[1].toLowerCase() : "server";
+  }
+  if (/\b(vite|next|webpack-dev-server)\b/i.test(raw)) {
+    const m = raw.match(/\b(vite|next|webpack-dev-server)\b/i);
+    return m ? m[1] : "dev-server";
+  }
+  const parts = raw.split(" ");
+  let bin = parts[0] || "process";
+  bin = bin.split("/").pop() || bin;
+  if (bin === "uv" && parts[1] === "run" && parts[2]) {
+    return shortProcessLabel(parts.slice(2).join(" "));
+  }
+  if (bin === "python" || bin === "python3") {
+    const script = parts.find((p) => p.endsWith(".py"));
+    if (script) return script.split("/").pop() || script;
+  }
+  const tail = parts.slice(1, 3).join(" ");
+  const label = tail ? `${bin} ${tail}` : bin;
+  return label.length > 36 ? `${label.slice(0, 33)}…` : label;
+}
+
+type SessionProcLike = {
+  pid: number;
+  ppid: number;
+  command: string;
+  etime: string;
+  state: string;
+  cpu: string;
+  mem: string;
+  depth: number;
+  cwd?: string | null;
+  paused: boolean;
+};
+
+type SessionProcNode = SessionProcLike & { children: SessionProcNode[] };
+
+/**
+ * Build parent→child trees so `uv run …` + its python worker show as one
+ * expandable root instead of two identical flat rows.
+ */
+function buildProcessTree(procs: SessionProcLike[]): SessionProcNode[] {
+  if (procs.length === 0) return [];
+  const byPid = new Map<number, SessionProcNode>();
+  for (const p of procs) {
+    byPid.set(p.pid, { ...p, children: [] });
+  }
+  const roots: SessionProcNode[] = [];
+  for (const node of byPid.values()) {
+    const parent = byPid.get(node.ppid);
+    if (parent && parent.pid !== node.pid) {
+      parent.children.push(node);
+    } else {
+      roots.push(node);
+    }
+  }
+  // Prefer shallower / older-looking roots first.
+  const sortNodes = (nodes: SessionProcNode[]) => {
+    nodes.sort((a, b) => a.pid - b.pid);
+    for (const n of nodes) sortNodes(n.children);
+  };
+  sortNodes(roots);
+  return roots;
 }
 
 /** True for image attachments (mime or extension). */
@@ -875,6 +955,21 @@ export default function App() {
   const [expandedProjectIds, setExpandedProjectIds] = useState<Set<string>>(
     () => new Set(),
   );
+  /** Sidebar section fold: Projects / Tasks lists (label click). */
+  const [projectsSectionOpen, setProjectsSectionOpen] = useState(() => {
+    try {
+      return localStorage.getItem("grokx.sidebar.projectsOpen") !== "0";
+    } catch {
+      return true;
+    }
+  });
+  const [tasksSectionOpen, setTasksSectionOpen] = useState(() => {
+    try {
+      return localStorage.getItem("grokx.sidebar.tasksOpen") !== "0";
+    } catch {
+      return true;
+    }
+  });
   const [sessions, setSessions] = useState<SessionListRow[]>([]);
   const [renamingId, setRenamingId] = useState<string | null>(null);
   const [renameDraft, setRenameDraft] = useState("");
@@ -891,12 +986,25 @@ export default function App() {
    */
   const [draftForMeter, setDraftForMeter] = useState("");
   const [composerHasText, setComposerHasText] = useState(false);
+  /** Composer Goal menu (Grok Build `/goal` slash command). */
+  const [goalMenuOpen, setGoalMenuOpen] = useState(false);
+  const goalMenuRef = useRef<HTMLDivElement | null>(null);
   /** Edit a past user bubble, then re-send from that point. */
   const [editingUserId, setEditingUserId] = useState<string | null>(null);
   const [editDraft, setEditDraft] = useState("");
   const editTextareaRef = useRef<HTMLTextAreaElement | null>(null);
   /** Busy for the *focused* task (composer / status pill). */
   const [busy, setBusy] = useState(false);
+  /**
+   * Shown when Working lasts a long time (often a foreground server / hang).
+   * Cleared when the turn ends or the user dismisses / stops.
+   */
+  const [longRunNotice, setLongRunNotice] = useState<{
+    elapsedSec: number;
+    toolHint: string | null;
+  } | null>(null);
+  /** User hid the long-run banner for the current turn. */
+  const longRunDismissedRef = useRef(false);
   /**
    * Per-task busy map so sidebar shows Working on background agents.
    * Multiple tasks can stream in parallel; only the active one's chat is shown.
@@ -932,6 +1040,14 @@ export default function App() {
   const [view, setView] = useState<"workspace" | "settings">("workspace");
   /** Right Outputs rail — collapsible to free chat space. */
   const [outputsOpen, setOutputsOpen] = useState(true);
+  /** Left Projects/Tasks rail — collapsible (persisted). */
+  const [sidebarOpen, setSidebarOpen] = useState(() => {
+    try {
+      return localStorage.getItem("grokx.sidebarOpen") !== "0";
+    } catch {
+      return true;
+    }
+  });
   /** Draggable column widths (px); persisted across restarts. */
   const [sidebarWidth, setSidebarWidth] = useState(() =>
     readStoredWidth("grokx.sidebarWidth", 248, SIDEBAR_W_MIN, SIDEBAR_W_MAX),
@@ -985,6 +1101,33 @@ export default function App() {
   const [gitInfo, setGitInfo] = useState<GitStatusInfo | null>(null);
   const [gitLoading, setGitLoading] = useState(false);
   const [gitError, setGitError] = useState<string | null>(null);
+  type SessionProc = {
+    pid: number;
+    ppid: number;
+    command: string;
+    etime: string;
+    state: string;
+    cpu: string;
+    mem: string;
+    depth: number;
+    cwd?: string | null;
+    paused: boolean;
+  };
+  const [sessionProcs, setSessionProcs] = useState<SessionProc[]>([]);
+  const [procsLoading, setProcsLoading] = useState(false);
+  const [procsError, setProcsError] = useState<string | null>(null);
+  const [procActionPid, setProcActionPid] = useState<number | null>(null);
+  /** Whole Processes card collapsed by default to keep Outputs quiet. */
+  const [procsSectionOpen, setProcsSectionOpen] = useState(false);
+  /** Per-pid expanded detail rows. */
+  const [expandedProcPids, setExpandedProcPids] = useState<Set<number>>(
+    () => new Set(),
+  );
+  /** Parent→child trees for Outputs Processes (uv + worker = one root). */
+  const processTree = useMemo(
+    () => buildProcessTree(sessionProcs),
+    [sessionProcs],
+  );
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   /** Full-screen preview for a pending composer image attachment. */
   const [attachmentPreview, setAttachmentPreview] = useState<{
@@ -1022,6 +1165,22 @@ export default function App() {
   const [cfgHasKey, setCfgHasKey] = useState(false);
   const [cfgKeyHint, setCfgKeyHint] = useState<string | null>(null);
   const [cfgGrokPath, setCfgGrokPath] = useState("~/.grok/config.toml");
+  /** Settings → Test connection / Fetch models */
+  const [endpointProbeBusy, setEndpointProbeBusy] = useState(false);
+  const [fetchedRemoteModels, setFetchedRemoteModels] = useState<
+    Array<{ id: string; name: string }>
+  >([]);
+  /** Settings left-nav section (directory → detail). */
+  const [settingsSection, setSettingsSection] = useState<
+    "model" | "toml" | "engine"
+  >("model");
+  /** Raw ~/.grok/config.toml editor (Settings). */
+  const [grokToml, setGrokToml] = useState("");
+  const [grokTomlPath, setGrokTomlPath] = useState("");
+  const [grokTomlExists, setGrokTomlExists] = useState(false);
+  const [grokTomlDirty, setGrokTomlDirty] = useState(false);
+  const [grokTomlMsg, setGrokTomlMsg] = useState<string | null>(null);
+  const [savingGrokToml, setSavingGrokToml] = useState(false);
   const bottomRef = useRef<HTMLDivElement | null>(null);
   const composerRef = useRef<ComposerInputHandle | null>(null);
   const chatScrollRef = useRef<HTMLDivElement | null>(null);
@@ -1096,6 +1255,60 @@ export default function App() {
     sessionIdRef.current = session?.session_id ?? null;
     workPathRef.current = session?.work_path ?? null;
   }, [session?.session_id, session?.work_path]);
+
+  /**
+   * After ~90s of continuous Working, surface a sticky hint: the agent may be
+   * blocked on a long-lived shell (e.g. `mykg web`, dev servers) rather than
+   * looping in the UI. Offers one-click Stop.
+   */
+  useEffect(() => {
+    if (!busy) {
+      setLongRunNotice(null);
+      longRunDismissedRef.current = false;
+      return;
+    }
+    const LONG_RUN_MS = 90_000;
+    const tick = () => {
+      if (!busyRef.current || longRunDismissedRef.current) {
+        setLongRunNotice(null);
+        return;
+      }
+      const started = turnStartedAtRef.current;
+      if (started == null) return;
+      const elapsedMs = Date.now() - started;
+      if (elapsedMs < LONG_RUN_MS) {
+        setLongRunNotice(null);
+        return;
+      }
+      // Prefer the latest tool line that looks like a foreground shell.
+      let toolHint: string | null = null;
+      const chat = linesRef.current;
+      for (let i = chat.length - 1; i >= 0; i--) {
+        const l = chat[i];
+        if (l.kind !== "tool" && l.kind !== "system") continue;
+        const t = l.text || "";
+        if (
+          /run_terminal|terminal_command|Execute `|uv run|npm (run|start)|pnpm |yarn |python |mykg web|uvicorn|flask|django|next dev|vite|webpack|serve |--port |0\.0\.0\.0|127\.0\.0\.1/i.test(
+            t,
+          )
+        ) {
+          toolHint = t.length > 140 ? `${t.slice(0, 137)}…` : t;
+          break;
+        }
+        if (l.kind === "tool" && /running/i.test(t) && (l.count ?? 1) >= 8) {
+          toolHint = t;
+          break;
+        }
+      }
+      setLongRunNotice({
+        elapsedSec: Math.floor(elapsedMs / 1000),
+        toolHint,
+      });
+    };
+    tick();
+    const id = window.setInterval(tick, 4000);
+    return () => window.clearInterval(id);
+  }, [busy]);
 
   /** Update busy for one task; sync focused `busy` when that task is active. */
   const setSessionBusyState = useCallback((sid: string, nextBusy: boolean) => {
@@ -1354,14 +1567,21 @@ export default function App() {
           workPath: workPath || null,
         });
         if (!raw) return [] as ChatLine[];
-        const parsed = JSON.parse(raw) as ChatLine[];
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(raw);
+        } catch (e) {
+          console.warn("load_chat_history: invalid JSON", sessionId, e);
+          return [] as ChatLine[];
+        }
         if (!Array.isArray(parsed)) return [] as ChatLine[];
-        const filtered = parsed.filter(
+        const filtered = (parsed as ChatLine[]).filter(
           (l) => l && l.kind && l.kind !== "waiting" && !isConnectionNoise(l),
         );
         // Older histories may still have expanded thought/tool rows — fold them.
         return collapseAllTurnsInHistory(filtered);
-      } catch {
+      } catch (e) {
+        console.warn("load_chat_history failed", sessionId, e);
         return [] as ChatLine[];
       }
     },
@@ -1809,6 +2029,73 @@ export default function App() {
       return prev;
     });
   }, []);
+
+  /**
+   * Stuck-Working watchdog: UI may stay Working after a missed turn_finished
+   * (soft timeout / reconnect race). If chat is idle and backend reports not
+   * busy, clear Working so the user is not stuck.
+   */
+  const lastChatFingerprintRef = useRef("");
+  const lastChatChangeAtRef = useRef(Date.now());
+  useEffect(() => {
+    if (!busy) return;
+    const sid = session?.session_id;
+    if (!sid) return;
+
+    const fingerprint = () => {
+      const chat = linesRef.current;
+      const last = chat[chat.length - 1];
+      return `${chat.length}:${last?.id ?? ""}:${last?.kind ?? ""}:${
+        last && "text" in last ? String(last.text ?? "").length : 0
+      }`;
+    };
+    lastChatFingerprintRef.current = fingerprint();
+    lastChatChangeAtRef.current = Date.now();
+
+    const id = window.setInterval(() => {
+      if (!busyRef.current) return;
+      if (sessionIdRef.current !== sid) return;
+      if (pendingPerm) return;
+
+      const fp = fingerprint();
+      if (fp !== lastChatFingerprintRef.current) {
+        lastChatFingerprintRef.current = fp;
+        lastChatChangeAtRef.current = Date.now();
+        return;
+      }
+
+      const idleMs = Date.now() - lastChatChangeAtRef.current;
+      // Short streaming pauses are normal; only probe after real idle.
+      if (idleMs < 12_000) return;
+
+      void invoke<boolean>("is_session_busy", { sessionId: sid })
+        .then((stillBusy) => {
+          if (sessionIdRef.current !== sid) return;
+          if (!busyRef.current) return;
+          if (stillBusy) return;
+          console.warn(
+            "busy watchdog: backend idle, clearing stuck Working",
+            sid,
+          );
+          setSessionBusyState(sid, false);
+          setLongRunNotice(null);
+          clearWaiting();
+          finishTurnCollapse(false);
+        })
+        .catch(() => {
+          /* ignore */
+        });
+    }, 5000);
+
+    return () => window.clearInterval(id);
+  }, [
+    busy,
+    session?.session_id,
+    pendingPerm,
+    setSessionBusyState,
+    finishTurnCollapse,
+    clearWaiting,
+  ]);
 
   const lastUserMessage = useMemo(() => {
     for (let i = lines.length - 1; i >= 0; i--) {
@@ -2401,14 +2688,63 @@ export default function App() {
     [applyPublicSettings],
   );
 
+  const loadGrokConfigToml = useCallback(async () => {
+    try {
+      const file = await invoke<{
+        path: string;
+        content: string;
+        exists: boolean;
+      }>("read_grok_config");
+      setGrokToml(file.content);
+      setGrokTomlPath(file.path);
+      setGrokTomlExists(file.exists);
+      setGrokTomlDirty(false);
+      setGrokTomlMsg(
+        file.exists
+          ? null
+          : "File not found yet — save to create ~/.grok/config.toml",
+      );
+      // Prefill Base URL from engine config when app settings left it empty.
+      setCfgBaseUrl((prev) => {
+        if (prev.trim()) return prev;
+        const m = file.content.match(/base_url\s*=\s*"([^"]+)"/i);
+        return m?.[1]?.trim() || prev;
+      });
+    } catch (e) {
+      setGrokTomlMsg(String(e));
+    }
+  }, []);
+
   const loadSettings = useCallback(async () => {
     try {
       const s = await invoke<PublicSettings>("get_settings");
       applyPublicSettings(s);
+      await loadGrokConfigToml();
     } catch (e) {
       setSettingsMsg(String(e));
     }
-  }, [applyPublicSettings]);
+  }, [applyPublicSettings, loadGrokConfigToml]);
+
+  const onSaveGrokConfigToml = async () => {
+    setSavingGrokToml(true);
+    setGrokTomlMsg(null);
+    try {
+      const file = await invoke<{
+        path: string;
+        content: string;
+        exists: boolean;
+      }>("write_grok_config", { content: grokToml });
+      setGrokToml(file.content);
+      setGrokTomlPath(file.path);
+      setGrokTomlExists(true);
+      setGrokTomlDirty(false);
+      setGrokTomlMsg("Saved. Reconnect the agent to apply engine config.");
+    } catch (e) {
+      setGrokTomlMsg(String(e));
+    } finally {
+      setSavingGrokToml(false);
+    }
+  };
 
   const onSaveSettings = async () => {
     setSavingSettings(true);
@@ -2469,6 +2805,105 @@ export default function App() {
       setSettingsMsg(String(e));
     } finally {
       setSavingSettings(false);
+    }
+  };
+
+  const probeArgs = useCallback(
+    () => ({
+      baseUrl: cfgBaseUrl.trim(),
+      apiKey: cfgApiKey.trim() || null,
+      envKey: cfgEnvKey.trim() || null,
+      useSavedKey: true,
+    }),
+    [cfgBaseUrl, cfgApiKey, cfgEnvKey],
+  );
+
+  const settingsMsgIsError = (msg: string) =>
+    /fail|error|required|invalid|denied|unauthorized|forbidden|timeout|not found|http [45]/i.test(
+      msg,
+    );
+
+  /** GET {base}/models — validates URL + key. */
+  const onTestEndpoint = async () => {
+    if (!cfgBaseUrl.trim()) {
+      setSettingsMsg("Base URL is required to test.");
+      return;
+    }
+    setEndpointProbeBusy(true);
+    setSettingsMsg(null);
+    try {
+      const r = await invoke<{
+        ok: boolean;
+        status: number;
+        message: string;
+        models_url: string;
+        latency_ms: number;
+        model_count?: number | null;
+        sample_ids: string[];
+      }>("test_endpoint", { args: probeArgs() });
+      const sample =
+        r.sample_ids?.length > 0
+          ? ` · e.g. ${r.sample_ids.slice(0, 4).join(", ")}`
+          : "";
+      setSettingsMsg(
+        r.ok
+          ? `${r.message}${sample}`
+          : `Test failed · ${r.message}`,
+      );
+    } catch (e) {
+      setSettingsMsg(`Test failed · ${String(e)}`);
+    } finally {
+      setEndpointProbeBusy(false);
+    }
+  };
+
+  /** Apply a model id + always sync Display name from the list entry. */
+  const applySelectedModel = useCallback(
+    (
+      id: string,
+      list: Array<{ id: string; name: string }> = fetchedRemoteModels,
+    ) => {
+      const hit = list.find((m) => m.id === id);
+      setCfgModelId(id);
+      // Always update display name when picking from a known list.
+      setCfgName((hit?.name || id).trim() || id);
+    },
+    [fetchedRemoteModels],
+  );
+
+  /** Fetch model ids from the endpoint and fill the Model ID picker. */
+  const onFetchRemoteModels = async () => {
+    if (!cfgBaseUrl.trim()) {
+      setSettingsMsg("Base URL is required to fetch models.");
+      return;
+    }
+    setEndpointProbeBusy(true);
+    setSettingsMsg(null);
+    try {
+      const r = await invoke<{
+        ok: boolean;
+        status: number;
+        message: string;
+        models: Array<{ id: string; name: string }>;
+      }>("fetch_remote_models", { args: probeArgs() });
+      if (!r.ok || !r.models?.length) {
+        setSettingsMsg(`Fetch models failed · ${r.message}`);
+        setFetchedRemoteModels([]);
+        return;
+      }
+      setFetchedRemoteModels(r.models);
+      // Keep current id if still listed; otherwise first. Always refresh name.
+      const nextId = r.models.some((m) => m.id === cfgModelId)
+        ? cfgModelId
+        : r.models[0].id;
+      applySelectedModel(nextId, r.models);
+      setSettingsMsg(
+        `${r.message}. Pick a Model ID below, then Save settings.`,
+      );
+    } catch (e) {
+      setSettingsMsg(`Fetch models failed · ${String(e)}`);
+    } finally {
+      setEndpointProbeBusy(false);
     }
   };
 
@@ -2710,6 +3145,12 @@ export default function App() {
           }
           case "turn_finished":
             markBusy(evSid || activeSid, false);
+            // Always clear focused Working even if session id was missing on the event.
+            if (!isBackground) {
+              busyRef.current = false;
+              setBusy(false);
+              setLongRunNotice(null);
+            }
             // Turn completed off-screen / other task → unread (green dock badge).
             {
               const finishedSid = evSid || activeSid;
@@ -3903,6 +4344,96 @@ export default function App() {
     }
   };
 
+  /**
+   * Grok Build `/goal` helpers.
+   * - Set goal: put `/goal ` (or `/goal <draft>`) in the composer for the user to send
+   * - status / pause / resume / clear: send the slash command immediately
+   */
+  const sendGoalCommand = useCallback(
+    async (cmd: "status" | "pause" | "resume" | "clear") => {
+      setGoalMenuOpen(false);
+      if (!session || busy) return;
+      const text = `/goal ${cmd}`;
+      turnStartedAtRef.current = Date.now();
+      longRunDismissedRef.current = false;
+      setLongRunNotice(null);
+      verbalNudgeUsedRef.current = true; // slash meta — no verbal nudge
+      const sid = sessionIdRef.current;
+      if (sid) userStoppedSessionRef.current = null;
+      if (sid) setSessionBusyState(sid, true);
+      else setBusy(true);
+      enableAutoScroll();
+      push({
+        kind: "user",
+        text,
+        at: new Date().toISOString(),
+      });
+      push({ kind: "waiting", text: "Grokx is thinking…" });
+      try {
+        await invoke("send_prompt_rich", {
+          payload: {
+            text,
+            attachments: [],
+            model: modelId || null,
+            effort: effortId || null,
+          },
+        });
+      } catch (e) {
+        if (sid) setSessionBusyState(sid, false);
+        else setBusy(false);
+        clearWaiting();
+        push({ kind: "error", text: String(e) });
+        finishTurnCollapse(true);
+      }
+    },
+    [
+      session,
+      busy,
+      modelId,
+      effortId,
+      setSessionBusyState,
+      enableAutoScroll,
+      push,
+      clearWaiting,
+      finishTurnCollapse,
+    ],
+  );
+
+  const onGoalSetClick = useCallback(() => {
+    setGoalMenuOpen(false);
+    const cur = (composerRef.current?.getValue() ?? "").trim();
+    if (!cur) {
+      composerRef.current?.setValue("/goal ");
+    } else if (/^\/goal(\s|$)/i.test(cur)) {
+      // Already a goal command — leave as-is.
+      composerRef.current?.focus();
+      return;
+    } else {
+      composerRef.current?.setValue(`/goal ${cur}`);
+    }
+    setComposerHasText(true);
+    composerRef.current?.focus();
+  }, []);
+
+  useEffect(() => {
+    if (!goalMenuOpen) return;
+    const onDoc = (e: MouseEvent) => {
+      const el = goalMenuRef.current;
+      if (el && !el.contains(e.target as Node)) {
+        setGoalMenuOpen(false);
+      }
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setGoalMenuOpen(false);
+    };
+    document.addEventListener("mousedown", onDoc);
+    window.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onDoc);
+      window.removeEventListener("keydown", onKey);
+    };
+  }, [goalMenuOpen]);
+
   const onSend = async () => {
     // If editing a past message, that flow owns send.
     if (editingUserId) {
@@ -3915,6 +4446,8 @@ export default function App() {
     clearComposer();
     setAttachments([]);
     turnStartedAtRef.current = Date.now();
+    longRunDismissedRef.current = false;
+    setLongRunNotice(null);
     // Fresh user turn: allow one auto-nudge again if the model only talks.
     verbalNudgeUsedRef.current = false;
     const sid = sessionIdRef.current;
@@ -3988,6 +4521,8 @@ export default function App() {
     verbalNudgeUsedRef.current = true;
     autoNudgeInFlightRef.current = false;
     if (sid) userStoppedSessionRef.current = sid;
+    setLongRunNotice(null);
+    longRunDismissedRef.current = true;
 
     // Optimistic UI: stop spinner / dock badge before RPC returns.
     if (sid) setSessionBusyState(sid, false);
@@ -4166,6 +4701,79 @@ export default function App() {
     return () => window.clearTimeout(t);
   }, [busy, view, outputsTab, session?.session_id, refreshGitStatus]);
 
+  const refreshSessionProcesses = useCallback(async () => {
+    const sid = session?.session_id;
+    if (!sid) {
+      setSessionProcs([]);
+      setProcsError(null);
+      return;
+    }
+    setProcsLoading(true);
+    setProcsError(null);
+    try {
+      const rows = await invoke<SessionProc[]>("list_session_processes", {
+        sessionId: sid,
+      });
+      setSessionProcs(rows);
+    } catch (e) {
+      setSessionProcs([]);
+      setProcsError(String(e));
+    } finally {
+      setProcsLoading(false);
+    }
+  }, [session?.session_id]);
+
+  /** Stop a process tree (root + children). Only control exposed in Outputs. */
+  const stopSessionProcess = useCallback(
+    async (pid: number) => {
+      const sid = session?.session_id;
+      if (!sid) return;
+      setProcActionPid(pid);
+      setProcsError(null);
+      try {
+        await invoke("stop_session_process", { sessionId: sid, pid });
+        await new Promise((r) => setTimeout(r, 200));
+        await refreshSessionProcesses();
+      } catch (e) {
+        setProcsError(String(e));
+      } finally {
+        setProcActionPid(null);
+      }
+    },
+    [session?.session_id, refreshSessionProcesses],
+  );
+
+  // Poll agent-spawned processes while Outputs overview is open.
+  useEffect(() => {
+    if (view !== "workspace" || !outputsOpen) return;
+    if (outputsTab !== "overview") return;
+    if (!session?.session_id) {
+      setSessionProcs([]);
+      return;
+    }
+    void refreshSessionProcesses();
+    const id = window.setInterval(() => {
+      void refreshSessionProcesses();
+    }, 4000);
+    return () => window.clearInterval(id);
+  }, [
+    view,
+    outputsOpen,
+    outputsTab,
+    session?.session_id,
+    refreshSessionProcesses,
+  ]);
+
+  // After turn activity, refresh sooner (new tool shells often appear then).
+  useEffect(() => {
+    if (!session?.session_id) return;
+    if (outputsTab !== "overview") return;
+    const t = window.setTimeout(() => {
+      void refreshSessionProcesses();
+    }, 800);
+    return () => window.clearTimeout(t);
+  }, [busy, session?.session_id, outputsTab, refreshSessionProcesses]);
+
   const loadFilesDir = useCallback(
     async (path: string) => {
       setFilesLoading(true);
@@ -4298,35 +4906,84 @@ export default function App() {
     "New task";
 
   const layoutStyle = {
-    ["--sidebar-w" as string]: `${sidebarWidth}px`,
+    ["--sidebar-w" as string]: sidebarOpen
+      ? `${sidebarWidth}px`
+      : "52px",
     ["--right-w" as string]: `${rightWidth}px`,
   } as CSSProperties;
+
+  const toggleSidebar = useCallback(() => {
+    setSidebarOpen((v) => {
+      const next = !v;
+      try {
+        localStorage.setItem("grokx.sidebarOpen", next ? "1" : "0");
+      } catch {
+        /* ignore */
+      }
+      return next;
+    });
+  }, []);
 
   return (
     <div
       className={`layout${outputsOpen ? "" : " layout-outputs-collapsed"}${
-        view === "settings" ? " layout-settings" : ""
-      }`}
+        sidebarOpen ? "" : " layout-sidebar-collapsed"
+      }${view === "settings" ? " layout-settings" : ""}`}
       style={layoutStyle}
     >
-      <aside className="sidebar">
+      {view !== "settings" && (
+      <aside className={`sidebar${sidebarOpen ? "" : " sidebar-collapsed"}`}>
         {/* Full sidebar chrome under traffic lights — drag to move the window. */}
         <div
           className="sidebar-titlebar"
           onMouseDown={onTitlebarMouseDown}
+          onDoubleClick={onTitlebarDoubleClick}
         >
           <div className="brand-row">
-            <button
-              type="button"
-              className="brand brand-btn"
-              title="Back to workspace"
-              onClick={() => setView("workspace")}
-            >
-              Grokx
-            </button>
+            {sidebarOpen ? (
+              <>
+                <button
+                  type="button"
+                  className="brand brand-btn"
+                  title="Back to workspace"
+                  onClick={() => setView("workspace")}
+                >
+                  Grokx
+                </button>
+                <button
+                  type="button"
+                  className="icon-btn sidebar-collapse-btn"
+                  title="Collapse sidebar"
+                  aria-label="Collapse sidebar"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    toggleSidebar();
+                  }}
+                  onMouseDown={(e) => e.stopPropagation()}
+                >
+                  <IconChevronLeft size={16} />
+                </button>
+              </>
+            ) : (
+              <button
+                type="button"
+                className="icon-btn sidebar-expand-btn"
+                title="Expand sidebar"
+                aria-label="Expand sidebar"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  toggleSidebar();
+                }}
+                onMouseDown={(e) => e.stopPropagation()}
+              >
+                <IconChevronRight size={16} />
+              </button>
+            )}
           </div>
         </div>
 
+        {sidebarOpen && (
+        <>
         <nav className="nav">
           <button
             className="nav-item"
@@ -4345,7 +5002,41 @@ export default function App() {
           Tasks = temporary sessions (default sandbox) only.
         */}
         <div className="section-label-row">
-          <span className="section-label">Projects</span>
+          <button
+            type="button"
+            className={`section-label-btn${
+              projectsSectionOpen ? "" : " collapsed"
+            }`}
+            aria-expanded={projectsSectionOpen}
+            title={
+              projectsSectionOpen
+                ? "Collapse Projects"
+                : "Expand Projects"
+            }
+            onClick={() => {
+              setProjectsSectionOpen((v) => {
+                const next = !v;
+                try {
+                  localStorage.setItem(
+                    "grokx.sidebar.projectsOpen",
+                    next ? "1" : "0",
+                  );
+                } catch {
+                  /* ignore */
+                }
+                return next;
+              });
+            }}
+          >
+            <span className="section-chevron" aria-hidden>
+              {projectsSectionOpen ? (
+                <IconChevronDown size={14} />
+              ) : (
+                <IconChevronRight size={14} />
+              )}
+            </span>
+            <span className="section-label">Projects</span>
+          </button>
           <button
             type="button"
             className="session-add-btn"
@@ -4356,6 +5047,7 @@ export default function App() {
             <IconPlus size={16} />
           </button>
         </div>
+        {projectsSectionOpen && (
         <div className="project-list">
           {projects.length === 0 && (
             <div className="session-empty">
@@ -4579,10 +5271,43 @@ export default function App() {
             );
           })}
         </div>
+        )}
 
         {/* Temporary tasks only (not bound to a user Project) */}
         <div className="section-label-row">
-          <span className="section-label">Tasks</span>
+          <button
+            type="button"
+            className={`section-label-btn${
+              tasksSectionOpen ? "" : " collapsed"
+            }`}
+            aria-expanded={tasksSectionOpen}
+            title={
+              tasksSectionOpen ? "Collapse Tasks" : "Expand Tasks"
+            }
+            onClick={() => {
+              setTasksSectionOpen((v) => {
+                const next = !v;
+                try {
+                  localStorage.setItem(
+                    "grokx.sidebar.tasksOpen",
+                    next ? "1" : "0",
+                  );
+                } catch {
+                  /* ignore */
+                }
+                return next;
+              });
+            }}
+          >
+            <span className="section-chevron" aria-hidden>
+              {tasksSectionOpen ? (
+                <IconChevronDown size={14} />
+              ) : (
+                <IconChevronRight size={14} />
+              )}
+            </span>
+            <span className="section-label">Tasks</span>
+          </button>
           <button
             type="button"
             className="session-add-btn"
@@ -4593,6 +5318,7 @@ export default function App() {
             <IconPlus size={16} />
           </button>
         </div>
+        {tasksSectionOpen && (
         <div className="session-list">
           {temporarySessions.length === 0 && (
             <div className="session-empty">
@@ -4688,16 +5414,16 @@ export default function App() {
             );
           })}
         </div>
+        )}
 
         <div className="sidebar-bottom">
           <button
             type="button"
-            className={`nav-item sidebar-settings-btn${
-              view === "settings" ? " active" : ""
-            }`}
+            className="nav-item sidebar-settings-btn"
             title="Settings · model, API key, engine"
             onClick={() => {
               setView("settings");
+              setSettingsSection("model");
               void loadSettings();
             }}
           >
@@ -4723,283 +5449,554 @@ export default function App() {
             </button>
           </div>
         </div>
+        </>
+        )}
       </aside>
+      )}
 
-      <div
-        className="panel-resizer panel-resizer-sidebar"
-        role="separator"
-        aria-orientation="vertical"
-        aria-label="Resize sidebar"
-        title="Drag to resize sidebar"
-        onMouseDown={(e) => onPanelResizeStart("sidebar", e)}
-      />
+      {view !== "settings" &&
+        (sidebarOpen ? (
+          <div
+            className="panel-resizer panel-resizer-sidebar"
+            role="separator"
+            aria-orientation="vertical"
+            aria-label="Resize sidebar"
+            title="Drag to resize sidebar"
+            onMouseDown={(e) => onPanelResizeStart("sidebar", e)}
+          />
+        ) : (
+          <div className="panel-resizer panel-resizer-sidebar panel-resizer-sidebar-collapsed" />
+        ))}
 
       {view === "settings" ? (
-        <main className="main settings-main">
-          <header className="topbar settings-topbar" onMouseDown={onTitlebarMouseDown}>
-            <div className="topbar-main">
-              <h1 className="topbar-title">Settings</h1>
-              <p className="topbar-sub">
-                System · model and engine (set once)
-              </p>
-            </div>
-            <div className="topbar-actions">
+        <div className="settings-shell">
+          <aside
+            className="settings-rail"
+            onMouseDown={onTitlebarMouseDown}
+            onDoubleClick={onTitlebarDoubleClick}
+          >
+            <div className="settings-rail-top">
               <button
                 type="button"
-                className="btn"
+                className="settings-back-btn"
                 onClick={() => setView("workspace")}
+                onMouseDown={(e) => e.stopPropagation()}
               >
-                Back to workspace
+                <IconChevronLeft size={16} />
+                Back to app
               </button>
             </div>
-          </header>
+            <nav className="settings-rail-nav" aria-label="Settings">
+              <div className="settings-rail-group">Configuration</div>
+              <button
+                type="button"
+                className={`settings-rail-item${
+                  settingsSection === "model" ? " active" : ""
+                }`}
+                onClick={() => setSettingsSection("model")}
+                onMouseDown={(e) => e.stopPropagation()}
+              >
+                <IconSettings size={15} />
+                Model
+              </button>
+              <button
+                type="button"
+                className={`settings-rail-item${
+                  settingsSection === "toml" ? " active" : ""
+                }`}
+                onClick={() => setSettingsSection("toml")}
+                onMouseDown={(e) => e.stopPropagation()}
+              >
+                <IconFile size={15} />
+                Engine config
+              </button>
+              <button
+                type="button"
+                className={`settings-rail-item${
+                  settingsSection === "engine" ? " active" : ""
+                }`}
+                onClick={() => setSettingsSection("engine")}
+                onMouseDown={(e) => e.stopPropagation()}
+              >
+                <IconTool size={15} />
+                Project & engine
+              </button>
+            </nav>
+          </aside>
 
-          <div className="settings-page">
-            <div className="settings-grid">
-              <section className="card settings-card">
-                <h3>Model</h3>
-                <p className="muted" style={{ marginBottom: 12 }}>
-                  Configure API endpoint, key, and default model. Daily chat does
-                  not need this page; after save
-                  {cfgSyncGrok ? " it syncs to the engine config," : ""} reconnect
-                  to apply.
-                </p>
-                {settingsMsg && (
-                  <div
-                    className={
-                      settingsMsg.toLowerCase().includes("fail") ||
-                      settingsMsg.toLowerCase().includes("error")
-                        ? "error-banner"
-                        : "settings-ok"
-                    }
-                  >
-                    {settingsMsg}
-                  </div>
-                )}
-                <div className="settings-form-grid">
-                  <div className="field">
-                    <label>Model ID</label>
-                    <input
-                      value={cfgModelId}
-                      onChange={(e) => setCfgModelId(e.target.value)}
-                      placeholder="grok-4.5"
-                    />
-                  </div>
-                  <div className="field">
-                    <label>Display name</label>
-                    <input
-                      value={cfgName}
-                      onChange={(e) => setCfgName(e.target.value)}
-                      placeholder="Grok 4.5"
-                    />
-                  </div>
-                  <div className="field field-span-2">
-                    <label>Base URL</label>
-                    <input
-                      value={cfgBaseUrl}
-                      onChange={(e) => setCfgBaseUrl(e.target.value)}
-                      placeholder="https://api.x.ai/v1 or http://host:port/v1"
-                    />
-                  </div>
-                  <div className="field field-span-2">
-                    <label>
-                      API Key
-                      {cfgHasKey && cfgKeyHint
-                        ? ` (saved ${cfgKeyHint})`
-                        : ""}
-                    </label>
-                    <input
-                      type="password"
-                      value={cfgApiKey}
-                      onChange={(e) => setCfgApiKey(e.target.value)}
-                      placeholder={
-                        cfgHasKey
-                          ? "Leave blank to keep current key"
-                          : "sk-..."
+          <main className="settings-content">
+            <div className="settings-content-scroll">
+              {settingsSection === "model" && (
+                <>
+                  <h1 className="settings-page-title">Model</h1>
+                  <p className="settings-page-lead muted">
+                    API endpoint, key, and default model. After save
+                    {cfgSyncGrok ? " syncs to the engine config;" : ""} reconnect
+                    a task to apply.
+                  </p>
+                  {settingsMsg && (
+                    <div
+                      className={
+                        settingsMsgIsError(settingsMsg)
+                          ? "error-banner"
+                          : "settings-ok"
                       }
-                      autoComplete="off"
-                    />
-                  </div>
-                  <div className="field">
-                    <label>Env key (optional)</label>
-                    <input
-                      value={cfgEnvKey}
-                      onChange={(e) => setCfgEnvKey(e.target.value)}
-                      placeholder="XAI_API_KEY"
-                    />
-                  </div>
-                  <div className="field">
-                    <label>API Backend</label>
-                    <select
-                      className="settings-select"
-                      value={cfgBackend}
-                      onChange={(e) => setCfgBackend(e.target.value)}
                     >
-                      <option value="chat_completions">chat_completions</option>
-                      <option value="responses">responses</option>
-                      <option value="anthropic_messages">
-                        anthropic_messages
-                      </option>
-                    </select>
+                      {settingsMsg}
+                    </div>
+                  )}
+
+                  <h2 className="settings-group-title">Connection</h2>
+                  <div className="settings-group-card">
+                    <div className="settings-row settings-row-stack">
+                      <div className="settings-row-text">
+                        <div className="settings-row-label">Base URL</div>
+                        <div className="settings-row-desc">
+                          OpenAI-compatible root, e.g. https://api.x.ai/v1
+                        </div>
+                      </div>
+                      <input
+                        className="settings-row-input"
+                        value={cfgBaseUrl}
+                        onChange={(e) => setCfgBaseUrl(e.target.value)}
+                        placeholder="https://api.x.ai/v1 or http://host:port/v1"
+                      />
+                    </div>
+                    <div className="settings-row settings-row-stack">
+                      <div className="settings-row-text">
+                        <div className="settings-row-label">
+                          API Key
+                          {cfgHasKey && cfgKeyHint
+                            ? ` · saved ${cfgKeyHint}`
+                            : ""}
+                        </div>
+                        <div className="settings-row-desc">
+                          Leave blank to keep the saved key
+                        </div>
+                      </div>
+                      <input
+                        className="settings-row-input"
+                        type="password"
+                        value={cfgApiKey}
+                        onChange={(e) => setCfgApiKey(e.target.value)}
+                        placeholder={
+                          cfgHasKey
+                            ? "Leave blank to keep current key"
+                            : "sk-..."
+                        }
+                        autoComplete="off"
+                      />
+                    </div>
+                    <div className="settings-row">
+                      <div className="settings-row-text">
+                        <div className="settings-row-label">Probe endpoint</div>
+                        <div className="settings-row-desc">
+                          Test connection or load model ids from the server
+                        </div>
+                      </div>
+                      <div className="btn-row settings-probe-row">
+                        <button
+                          type="button"
+                          className="btn"
+                          disabled={endpointProbeBusy || savingSettings}
+                          onClick={() => void onTestEndpoint()}
+                        >
+                          {endpointProbeBusy ? "Testing…" : "Test connection"}
+                        </button>
+                        <button
+                          type="button"
+                          className="btn"
+                          disabled={endpointProbeBusy || savingSettings}
+                          onClick={() => void onFetchRemoteModels()}
+                        >
+                          {endpointProbeBusy ? "Fetching…" : "Fetch models"}
+                        </button>
+                      </div>
+                    </div>
                   </div>
-                  <div className="field">
-                    <label>Context window</label>
-                    <input
-                      value={cfgContext}
-                      onChange={(e) => setCfgContext(e.target.value)}
-                      placeholder="500000"
-                    />
-                  </div>
-                  <div className="field">
-                    <label>Default effort</label>
-                    <select
-                      className="settings-select"
-                      value={
-                        efforts.some((e) => e.id === cfgEffort)
-                          ? cfgEffort
-                          : "medium"
-                      }
-                      onChange={(e) => setCfgEffort(e.target.value)}
-                      title="Reasoning effort for Grok (Low · Medium · High · Extra high)"
-                    >
-                      {(efforts.length
-                        ? efforts
-                        : [
-                            { id: "low", label: "Low" },
-                            { id: "medium", label: "Medium" },
-                            { id: "high", label: "High" },
-                            { id: "xhigh", label: "Extra high" },
-                          ]
-                      ).map((e) => (
-                        <option key={e.id} value={e.id}>
-                          {e.label}
+
+                  <h2 className="settings-group-title">Model</h2>
+                  <div className="settings-group-card">
+                    <div className="settings-row">
+                      <div className="settings-row-text">
+                        <div className="settings-row-label">Model ID</div>
+                        <div className="settings-row-desc">
+                          {fetchedRemoteModels.length > 0
+                            ? `${fetchedRemoteModels.length} models loaded — pick one`
+                            : "Type an id, or Fetch models to choose"}
+                        </div>
+                      </div>
+                      {fetchedRemoteModels.length > 0 ? (
+                        <select
+                          className="settings-select settings-row-control"
+                          value={
+                            fetchedRemoteModels.some((m) => m.id === cfgModelId)
+                              ? cfgModelId
+                              : fetchedRemoteModels[0]?.id || cfgModelId
+                          }
+                          onChange={(e) => {
+                            applySelectedModel(e.target.value);
+                          }}
+                        >
+                          {fetchedRemoteModels.map((m) => (
+                            <option key={m.id} value={m.id}>
+                              {m.name && m.name !== m.id
+                                ? `${m.name} (${m.id})`
+                                : m.id}
+                            </option>
+                          ))}
+                        </select>
+                      ) : (
+                        <input
+                          className="settings-row-input settings-row-control"
+                          value={cfgModelId}
+                          onChange={(e) => {
+                            const id = e.target.value;
+                            setCfgModelId(id);
+                            // Manual typing: keep display name in sync when empty
+                            // or still equal to the previous id.
+                            setCfgName((prev) => {
+                              const p = prev.trim();
+                              if (!p || p === cfgModelId) return id;
+                              return prev;
+                            });
+                          }}
+                          placeholder="grok-4.5"
+                          list="settings-model-suggestions"
+                        />
+                      )}
+                      {fetchedRemoteModels.length === 0 && (
+                        <datalist id="settings-model-suggestions">
+                          {(models.length
+                            ? models
+                            : [{ id: "grok-4.5", name: "Grok 4.5" }]
+                          ).map((m) => (
+                            <option key={m.id} value={m.id}>
+                              {m.name}
+                            </option>
+                          ))}
+                        </datalist>
+                      )}
+                    </div>
+                    <div className="settings-row">
+                      <div className="settings-row-text">
+                        <div className="settings-row-label">Display name</div>
+                        <div className="settings-row-desc">
+                          Shown in the composer model menu
+                        </div>
+                      </div>
+                      <input
+                        className="settings-row-input settings-row-control"
+                        value={cfgName}
+                        onChange={(e) => setCfgName(e.target.value)}
+                        placeholder="Grok 4.5"
+                      />
+                    </div>
+                    <div className="settings-row">
+                      <div className="settings-row-text">
+                        <div className="settings-row-label">API Backend</div>
+                        <div className="settings-row-desc">
+                          Protocol the endpoint speaks
+                        </div>
+                      </div>
+                      <select
+                        className="settings-select settings-row-control"
+                        value={cfgBackend}
+                        onChange={(e) => setCfgBackend(e.target.value)}
+                      >
+                        <option value="chat_completions">chat_completions</option>
+                        <option value="responses">responses</option>
+                        <option value="anthropic_messages">
+                          anthropic_messages
                         </option>
-                      ))}
-                    </select>
+                      </select>
+                    </div>
+                    <div className="settings-row">
+                      <div className="settings-row-text">
+                        <div className="settings-row-label">Default effort</div>
+                        <div className="settings-row-desc">
+                          Reasoning effort for new turns
+                        </div>
+                      </div>
+                      <select
+                        className="settings-select settings-row-control"
+                        value={
+                          efforts.some((e) => e.id === cfgEffort)
+                            ? cfgEffort
+                            : "medium"
+                        }
+                        onChange={(e) => setCfgEffort(e.target.value)}
+                      >
+                        {(efforts.length
+                          ? efforts
+                          : [
+                              { id: "low", label: "Low" },
+                              { id: "medium", label: "Medium" },
+                              { id: "high", label: "High" },
+                              { id: "xhigh", label: "Extra high" },
+                            ]
+                        ).map((e) => (
+                          <option key={e.id} value={e.id}>
+                            {e.label}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                    <div className="settings-row">
+                      <div className="settings-row-text">
+                        <div className="settings-row-label">Context window</div>
+                        <div className="settings-row-desc">
+                          Token budget shown in the composer meter
+                        </div>
+                      </div>
+                      <input
+                        className="settings-row-input settings-row-control"
+                        value={cfgContext}
+                        onChange={(e) => setCfgContext(e.target.value)}
+                        placeholder="500000"
+                      />
+                    </div>
+                    <div className="settings-row">
+                      <div className="settings-row-text">
+                        <div className="settings-row-label">Env key</div>
+                        <div className="settings-row-desc">
+                          Optional env var name if not storing the key in app
+                          settings
+                        </div>
+                      </div>
+                      <input
+                        className="settings-row-input settings-row-control"
+                        value={cfgEnvKey}
+                        onChange={(e) => setCfgEnvKey(e.target.value)}
+                        placeholder="XAI_API_KEY"
+                      />
+                    </div>
                   </div>
-                </div>
-                <label className="check">
-                  <input
-                    type="checkbox"
-                    checked={cfgSyncGrok}
-                    onChange={(e) => setCfgSyncGrok(e.target.checked)}
-                  />
-                  Also write ~/.grok/config.toml
-                </label>
-                <p className="hint mono" style={{ marginTop: 0 }}>
-                  {cfgGrokPath}
-                </p>
-                <div className="btn-row">
-                  <button
-                    className="btn btn-primary"
-                    onClick={() => void onSaveSettings()}
-                    disabled={savingSettings}
-                  >
-                    {savingSettings ? "Saving…" : "Save settings"}
-                  </button>
-                  {cfgHasKey && (
+
+                  <h2 className="settings-group-title">Sync</h2>
+                  <div className="settings-group-card">
+                    <div className="settings-row">
+                      <div className="settings-row-text">
+                        <div className="settings-row-label">
+                          Write ~/.grok/config.toml
+                        </div>
+                        <div className="settings-row-desc mono">{cfgGrokPath}</div>
+                      </div>
+                      <label className="settings-toggle">
+                        <input
+                          type="checkbox"
+                          checked={cfgSyncGrok}
+                          onChange={(e) => setCfgSyncGrok(e.target.checked)}
+                        />
+                        <span className="settings-toggle-ui" />
+                      </label>
+                    </div>
+                  </div>
+
+                  <div className="btn-row settings-save-row">
                     <button
-                      className="btn btn-ghost"
-                      onClick={() => void onClearApiKey()}
+                      className="btn btn-primary"
+                      onClick={() => void onSaveSettings()}
                       disabled={savingSettings}
                     >
-                      Clear key
+                      {savingSettings ? "Saving…" : "Save settings"}
                     </button>
-                  )}
-                  <button
-                    className="btn"
-                    onClick={() => void loadSettings()}
-                    disabled={savingSettings}
-                  >
-                    Reload
-                  </button>
-                </div>
-              </section>
-
-              <section className="card settings-card">
-                <h3>Project & engine</h3>
-                {error && <div className="error-banner">{error}</div>}
-                <p className="muted" style={{ marginBottom: 12 }}>
-                  Open a project folder from the sidebar (+). Each task gets a
-                  temporary workspace under <code>~/.grokx/tasks/</code> with a{" "}
-                  <code>project</code> link to your sources.
-                </p>
-                {selectedProject && (
-                  <dl className="kv">
-                    <dt>Project</dt>
-                    <dd className="mono">{selectedProject.root_path}</dd>
-                    {session?.work_path && (
-                      <>
-                        <dt>Task cwd</dt>
-                        <dd className="mono">{session.work_path}</dd>
-                      </>
+                    {cfgHasKey && (
+                      <button
+                        className="btn btn-ghost"
+                        onClick={() => void onClearApiKey()}
+                        disabled={savingSettings}
+                      >
+                        Clear key
+                      </button>
                     )}
-                  </dl>
-                )}
-                <div className="btn-row">
-                  <button
-                    className="btn btn-primary"
-                    onClick={() => void onOpenProject()}
-                    disabled={connecting}
-                  >
-                    {connecting ? "Opening…" : "Open project…"}
-                  </button>
-                  <button
-                    className="btn"
-                    onClick={() => void onNewTask()}
-                    disabled={connecting}
-                  >
-                    {connecting ? "Connecting…" : "New task"}
-                  </button>
-                </div>
-                <div className="field">
-                  <label>Tool permission (next connect)</label>
-                  <select
-                    className="settings-select"
-                    value={permissionMode}
-                    onChange={(e) =>
-                      void setPermissionModeAndSave(
-                        normalizePermissionMode(e.target.value),
-                      )
-                    }
-                  >
-                    <option value="ask">Needs approval — confirm each tool</option>
-                    <option value="auto">
-                      Auto — engine classifier (fewer prompts)
-                    </option>
-                    <option value="always-approve">
-                      Full trust — always approve all tools
-                    </option>
-                  </select>
-                </div>
-                <div className="field">
-                  <label>Custom engine path (optional)</label>
-                  <input
-                    value={cfgEnginePath}
-                    onChange={(e) => setCfgEnginePath(e.target.value)}
-                    placeholder="/path/to/grok"
-                  />
-                </div>
-                {engine ? (
-                  <dl className="kv">
-                    <dt>Source</dt>
-                    <dd>{engine.source}</dd>
-                    <dt>Binary</dt>
-                    <dd className="mono">{engine.path}</dd>
-                    <dt>Agent</dt>
-                    <dd>{agentStatus}</dd>
-                  </dl>
-                ) : (
-                  !error && <p className="muted">Resolving engine…</p>
-                )}
-              </section>
+                    <button
+                      className="btn"
+                      onClick={() => void loadSettings()}
+                      disabled={savingSettings}
+                    >
+                      Reload
+                    </button>
+                  </div>
+                </>
+              )}
+
+              {settingsSection === "toml" && (
+                <>
+                  <h1 className="settings-page-title">Engine config</h1>
+                  <p className="settings-page-lead muted">
+                    Raw Grok Build config the engine reads on connect. Edit and
+                    save, then reconnect a task to apply.
+                  </p>
+                  <div className="settings-group-card settings-toml-card">
+                    <div className="settings-toml-path mono muted">
+                      {grokTomlPath || cfgGrokPath}
+                      {!grokTomlExists ? " · (missing)" : ""}
+                      {grokTomlDirty ? " · unsaved" : ""}
+                    </div>
+                    {grokTomlMsg && (
+                      <div
+                        className={
+                          /fail|error|must not/i.test(grokTomlMsg)
+                            ? "error-banner"
+                            : "settings-ok"
+                        }
+                        style={{ marginBottom: 8 }}
+                      >
+                        {grokTomlMsg}
+                      </div>
+                    )}
+                    <textarea
+                      className="settings-toml-editor"
+                      value={grokToml}
+                      spellCheck={false}
+                      onChange={(e) => {
+                        setGrokToml(e.target.value);
+                        setGrokTomlDirty(true);
+                      }}
+                      placeholder={"# ~/.grok/config.toml\n"}
+                      rows={20}
+                    />
+                    <div className="btn-row" style={{ marginTop: 12 }}>
+                      <button
+                        className="btn btn-primary"
+                        onClick={() => void onSaveGrokConfigToml()}
+                        disabled={savingGrokToml || !grokTomlDirty}
+                      >
+                        {savingGrokToml ? "Saving…" : "Save config.toml"}
+                      </button>
+                      <button
+                        className="btn"
+                        onClick={() => void loadGrokConfigToml()}
+                        disabled={savingGrokToml}
+                      >
+                        Reload file
+                      </button>
+                    </div>
+                  </div>
+                </>
+              )}
+
+              {settingsSection === "engine" && (
+                <>
+                  <h1 className="settings-page-title">Project & engine</h1>
+                  <p className="settings-page-lead muted">
+                    Permissions, engine binary, and quick project actions.
+                  </p>
+                  {error && <div className="error-banner">{error}</div>}
+
+                  <h2 className="settings-group-title">Permissions</h2>
+                  <div className="settings-group-card">
+                    <div className="settings-row">
+                      <div className="settings-row-text">
+                        <div className="settings-row-label">Tool permission</div>
+                        <div className="settings-row-desc">
+                          Applied on the next connect / new task
+                        </div>
+                      </div>
+                      <select
+                        className="settings-select settings-row-control"
+                        value={permissionMode}
+                        onChange={(e) =>
+                          void setPermissionModeAndSave(
+                            normalizePermissionMode(e.target.value),
+                          )
+                        }
+                      >
+                        <option value="ask">Needs approval</option>
+                        <option value="auto">Auto</option>
+                        <option value="always-approve">Full trust</option>
+                      </select>
+                    </div>
+                  </div>
+
+                  <h2 className="settings-group-title">Engine</h2>
+                  <div className="settings-group-card">
+                    <div className="settings-row settings-row-stack">
+                      <div className="settings-row-text">
+                        <div className="settings-row-label">
+                          Custom engine path
+                        </div>
+                        <div className="settings-row-desc">
+                          Optional override for the bundled grok binary
+                        </div>
+                      </div>
+                      <input
+                        className="settings-row-input"
+                        value={cfgEnginePath}
+                        onChange={(e) => setCfgEnginePath(e.target.value)}
+                        placeholder="/path/to/grok"
+                      />
+                    </div>
+                    {engine && (
+                      <div className="settings-row settings-row-stack">
+                        <div className="settings-row-text">
+                          <div className="settings-row-label">Runtime</div>
+                          <div className="settings-row-desc mono">
+                            {engine.source} · {engine.path}
+                            <br />
+                            Agent: {agentStatus}
+                          </div>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+
+                  <h2 className="settings-group-title">Workspace</h2>
+                  <div className="settings-group-card">
+                    {selectedProject && (
+                      <div className="settings-row settings-row-stack">
+                        <div className="settings-row-text">
+                          <div className="settings-row-label">
+                            Selected project
+                          </div>
+                          <div className="settings-row-desc mono">
+                            {selectedProject.root_path}
+                            {session?.work_path
+                              ? `\nTask cwd: ${session.work_path}`
+                              : ""}
+                          </div>
+                        </div>
+                      </div>
+                    )}
+                    <div className="settings-row">
+                      <div className="settings-row-text">
+                        <div className="settings-row-label">Actions</div>
+                        <div className="settings-row-desc">
+                          Open a project folder or start a temporary task
+                        </div>
+                      </div>
+                      <div className="btn-row">
+                        <button
+                          className="btn btn-primary"
+                          onClick={() => void onOpenProject()}
+                          disabled={connecting}
+                        >
+                          {connecting ? "Opening…" : "Open project…"}
+                        </button>
+                        <button
+                          className="btn"
+                          onClick={() => void onNewTask()}
+                          disabled={connecting}
+                        >
+                          {connecting ? "Connecting…" : "New task"}
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                </>
+              )}
             </div>
-          </div>
-        </main>
+          </main>
+        </div>
       ) : (
         <>
           <main className="main">
-            <header className="topbar" onMouseDown={onTitlebarMouseDown}>
+            <header
+              className="topbar"
+              onMouseDown={onTitlebarMouseDown}
+              onDoubleClick={onTitlebarDoubleClick}
+            >
               <div className="topbar-main">
                 <h1 className="topbar-title">{title}</h1>
                 <p className="topbar-sub">
@@ -5579,6 +6576,44 @@ export default function App() {
             </div>
 
             <div className="composer-dock">
+              {longRunNotice && busy && (
+                <div className="long-run-banner" role="status">
+                  <div className="long-run-banner-text">
+                    <strong>Still working · {longRunNotice.elapsedSec}s</strong>
+                    <span>
+                      {longRunNotice.toolHint
+                        ? " Likely waiting on a long-running command (e.g. a web server) that never exits — not a UI hang."
+                        : " The agent may be blocked on a long-running tool. This is usually not a dead loop in Grokx."}
+                    </span>
+                    {longRunNotice.toolHint && (
+                      <code className="long-run-tool-hint" title={longRunNotice.toolHint}>
+                        {longRunNotice.toolHint}
+                      </code>
+                    )}
+                  </div>
+                  <div className="long-run-banner-actions">
+                    <button
+                      type="button"
+                      className="btn btn-primary long-run-stop"
+                      onClick={() => void onCancel()}
+                      title="Stop this turn"
+                    >
+                      <IconStop size={13} />
+                      Stop
+                    </button>
+                    <button
+                      type="button"
+                      className="btn btn-ghost"
+                      onClick={() => {
+                        longRunDismissedRef.current = true;
+                        setLongRunNotice(null);
+                      }}
+                    >
+                      Dismiss
+                    </button>
+                  </div>
+                </div>
+              )}
               {attachments.length > 0 && (
                 <div className="attach-row">
                   {attachments.map((a) => {
@@ -5679,6 +6714,75 @@ export default function App() {
                   >
                     <IconPaperclip size={16} />
                   </button>
+                  <div className="composer-goal-wrap" ref={goalMenuRef}>
+                    <button
+                      type="button"
+                      className={`composer-plus composer-goal-btn${
+                        goalMenuOpen ? " active" : ""
+                      }`}
+                      title="Goal mode (Grok Build /goal)"
+                      aria-label="Goal mode"
+                      aria-haspopup="menu"
+                      aria-expanded={goalMenuOpen}
+                      disabled={!session || busy}
+                      onClick={() => setGoalMenuOpen((v) => !v)}
+                    >
+                      <IconGoal size={16} />
+                    </button>
+                    {goalMenuOpen && (
+                      <div className="composer-goal-menu" role="menu">
+                        <button
+                          type="button"
+                          role="menuitem"
+                          className="composer-goal-item"
+                          onClick={onGoalSetClick}
+                        >
+                          <strong>Set goal…</strong>
+                          <span>Prefix input with /goal</span>
+                        </button>
+                        <button
+                          type="button"
+                          role="menuitem"
+                          className="composer-goal-item"
+                          disabled={busy}
+                          onClick={() => void sendGoalCommand("status")}
+                        >
+                          <strong>Status</strong>
+                          <span>/goal status</span>
+                        </button>
+                        <button
+                          type="button"
+                          role="menuitem"
+                          className="composer-goal-item"
+                          disabled={busy}
+                          onClick={() => void sendGoalCommand("pause")}
+                        >
+                          <strong>Pause</strong>
+                          <span>/goal pause</span>
+                        </button>
+                        <button
+                          type="button"
+                          role="menuitem"
+                          className="composer-goal-item"
+                          disabled={busy}
+                          onClick={() => void sendGoalCommand("resume")}
+                        >
+                          <strong>Resume</strong>
+                          <span>/goal resume</span>
+                        </button>
+                        <button
+                          type="button"
+                          role="menuitem"
+                          className="composer-goal-item danger"
+                          disabled={busy}
+                          onClick={() => void sendGoalCommand("clear")}
+                        >
+                          <strong>Clear</strong>
+                          <span>/goal clear</span>
+                        </button>
+                      </div>
+                    )}
+                  </div>
                   <select
                     className={`composer-select access-select access-mode-${permissionMode}`}
                     value={permissionMode}
@@ -5802,7 +6906,11 @@ export default function App() {
                 onMouseDown={(e) => onPanelResizeStart("right", e)}
               />
               <aside className="right">
-              <div className="right-header" onMouseDown={onTitlebarMouseDown}>
+              <div
+                className="right-header"
+                onMouseDown={onTitlebarMouseDown}
+                onDoubleClick={onTitlebarDoubleClick}
+              >
                 <h2>Outputs</h2>
               </div>
 
@@ -5902,6 +7010,258 @@ export default function App() {
                         Temporary workspace under ~/.grokx/tasks/. Project
                         sources via ./project.
                       </p>
+                    </div>
+                  )}
+
+                  {session && (
+                    <div
+                      className={`card proc-card${
+                        procsSectionOpen ? " proc-card-open" : " proc-card-collapsed"
+                      }`}
+                    >
+                      <div className="files-card-head proc-card-head">
+                        <button
+                          type="button"
+                          className="proc-section-toggle"
+                          aria-expanded={procsSectionOpen}
+                          title={
+                            procsSectionOpen
+                              ? "Collapse processes"
+                              : "Expand processes"
+                          }
+                          onClick={() => setProcsSectionOpen((v) => !v)}
+                        >
+                          <span className="proc-section-chevron" aria-hidden>
+                            {procsSectionOpen ? (
+                              <IconChevronDown size={16} />
+                            ) : (
+                              <IconChevronRight size={16} />
+                            )}
+                          </span>
+                          <h3>
+                            Processes
+                            {processTree.length > 0
+                              ? ` · ${processTree.length}`
+                              : ""}
+                          </h3>
+                        </button>
+                        <button
+                          type="button"
+                          className="files-icon-btn"
+                          title="Refresh processes started by this task"
+                          disabled={procsLoading}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            void refreshSessionProcesses();
+                          }}
+                        >
+                          <IconRefresh size={14} />
+                        </button>
+                      </div>
+                      {!procsSectionOpen && processTree.length > 0 && (
+                        <div className="proc-collapsed-summary muted">
+                          {processTree.slice(0, 3).map((p) => {
+                            const label = shortProcessLabel(p.command);
+                            const childN = p.children.length;
+                            return (
+                              <span
+                                key={p.pid}
+                                className="proc-chip"
+                                title={
+                                  childN > 0
+                                    ? `${p.command}\n(+${childN} child process${
+                                        childN === 1 ? "" : "es"
+                                      })`
+                                    : p.command
+                                }
+                              >
+                                {label}
+                                {childN > 0 ? ` · +${childN}` : ""}
+                                {p.paused ? " · paused" : ""}
+                              </span>
+                            );
+                          })}
+                          {processTree.length > 3 && (
+                            <span className="proc-chip">
+                              +{processTree.length - 3}
+                            </span>
+                          )}
+                        </div>
+                      )}
+                      {procsSectionOpen && (
+                        <>
+                          <p className="muted proc-hint">
+                            One row per service · expand for details · Stop ends
+                            the whole tree.
+                          </p>
+                          {procsError && (
+                            <p className="files-error">{procsError}</p>
+                          )}
+                          {procsLoading && sessionProcs.length === 0 && (
+                            <p className="muted">Scanning…</p>
+                          )}
+                          {!procsLoading &&
+                            sessionProcs.length === 0 &&
+                            !procsError && (
+                              <p className="muted">
+                                No related processes. Long-lived tools like{" "}
+                                <code>mykg web</code> show up here.
+                              </p>
+                            )}
+                          {processTree.length > 0 && (
+                            <ul className="proc-list">
+                              {processTree.map((root) => {
+                                const renderNode = (
+                                  p: SessionProcNode,
+                                  nest: number,
+                                ): ReactNode => {
+                                  const busyRow = procActionPid === p.pid;
+                                  const rowOpen = expandedProcPids.has(p.pid);
+                                  const label = shortProcessLabel(p.command);
+                                  const childN = p.children.length;
+                                  const tip = [
+                                    p.command,
+                                    p.cwd ? `cwd: ${p.cwd}` : null,
+                                    `pid ${p.pid} · ${p.etime} · ${
+                                      p.paused ? "paused" : p.state
+                                    }`,
+                                    childN > 0
+                                      ? `${childN} child process${
+                                          childN === 1 ? "" : "es"
+                                        } (expand)`
+                                      : null,
+                                  ]
+                                    .filter(Boolean)
+                                    .join("\n");
+                                  return (
+                                    <li
+                                      key={p.pid}
+                                      className={`proc-row${
+                                        p.paused ? " proc-paused" : ""
+                                      }${rowOpen ? " proc-row-open" : ""}${
+                                        nest > 0 ? " proc-row-child" : ""
+                                      }`}
+                                      style={
+                                        nest > 0
+                                          ? {
+                                              marginLeft: Math.min(nest, 3) * 12,
+                                            }
+                                          : undefined
+                                      }
+                                    >
+                                      <button
+                                        type="button"
+                                        className="proc-row-summary"
+                                        title={tip}
+                                        aria-expanded={rowOpen}
+                                        onClick={() => {
+                                          setExpandedProcPids((prev) => {
+                                            const next = new Set(prev);
+                                            if (next.has(p.pid))
+                                              next.delete(p.pid);
+                                            else next.add(p.pid);
+                                            return next;
+                                          });
+                                        }}
+                                      >
+                                        <span
+                                          className="proc-row-chevron"
+                                          aria-hidden
+                                        >
+                                          {rowOpen ? (
+                                            <IconChevronDown size={14} />
+                                          ) : (
+                                            <IconChevronRight size={14} />
+                                          )}
+                                        </span>
+                                        <span className="proc-label">
+                                          {label}
+                                          {nest === 0 && childN > 0 && (
+                                            <span className="proc-child-count muted">
+                                              {" "}
+                                              · {childN + 1} procs
+                                            </span>
+                                          )}
+                                          {nest > 0 && (
+                                            <span className="proc-child-tag muted">
+                                              {" "}
+                                              child
+                                            </span>
+                                          )}
+                                        </span>
+                                        <span
+                                          className={`proc-status-pill${
+                                            p.paused ? " paused" : ""
+                                          }`}
+                                        >
+                                          {p.paused ? "paused" : "running"}
+                                        </span>
+                                        <span className="proc-pid muted">
+                                          {p.pid}
+                                        </span>
+                                      </button>
+                                      {rowOpen && (
+                                        <div className="proc-row-detail">
+                                          <div
+                                            className="proc-cmd mono"
+                                            title={p.command}
+                                          >
+                                            {p.command}
+                                          </div>
+                                          <div className="proc-meta muted">
+                                            <span>pid {p.pid}</span>
+                                            <span>·</span>
+                                            <span>ppid {p.ppid}</span>
+                                            <span>·</span>
+                                            <span>{p.etime}</span>
+                                            <span>·</span>
+                                            <span>
+                                              {p.paused ? "paused" : p.state}
+                                            </span>
+                                            {p.cwd && (
+                                              <>
+                                                <span>·</span>
+                                                <span title={p.cwd}>
+                                                  {shortPath(p.cwd)}
+                                                </span>
+                                              </>
+                                            )}
+                                          </div>
+                                          {/* Controls only on the root service row. */}
+                                          {nest === 0 && (
+                                            <div className="proc-actions">
+                                              <button
+                                                type="button"
+                                                className="btn btn-ghost proc-btn proc-btn-danger"
+                                                disabled={busyRow}
+                                                title="Stop this service and its child processes"
+                                                onClick={() =>
+                                                  void stopSessionProcess(p.pid)
+                                                }
+                                              >
+                                                <IconStop size={12} />
+                                                Stop
+                                              </button>
+                                            </div>
+                                          )}
+                                          {p.children.length > 0 && (
+                                            <ul className="proc-list proc-list-nested">
+                                              {p.children.map((c) =>
+                                                renderNode(c, nest + 1),
+                                              )}
+                                            </ul>
+                                          )}
+                                        </div>
+                                      )}
+                                    </li>
+                                  );
+                                };
+                                return renderNode(root, 0);
+                              })}
+                            </ul>
+                          )}
+                        </>
+                      )}
                     </div>
                   )}
 

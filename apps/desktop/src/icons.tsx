@@ -166,6 +166,16 @@ export function IconStop(props: IconProps) {
   );
 }
 
+/** Goal / objective (flag) — Grok Build `/goal` mode. */
+export function IconGoal(props: IconProps) {
+  return (
+    <Svg {...props}>
+      <path d="M4 21V4" />
+      <path d="M4 4h10l-1.5 3.5L14 11H4" />
+    </Svg>
+  );
+}
+
 export function IconBrand(props: IconProps) {
   return (
     <Svg {...props} size={props.size ?? 20}>
