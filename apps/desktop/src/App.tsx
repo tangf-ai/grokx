@@ -540,36 +540,41 @@ function nextLineId(kind: string): string {
   return `${kind}-${Date.now()}-${chatLineSeq}`;
 }
 
-/** Rough row height for windowed chat (px). Prefer overscan over perfect accuracy. */
+/**
+ * Rough row height for windowing (px). Prefer slight over-estimate so
+ * scrollHeight is never shorter than reality (under-estimate blocks bottom).
+ * VirtualChatList corrects with ResizeObserver once rows mount.
+ */
 function estimateChatLineHeight(line: ChatLine): number {
   switch (line.kind) {
     case "tool":
     case "system":
-      return 36;
-    case "waiting":
       return 40;
+    case "waiting":
+      return 44;
     case "error":
-      return 56;
+      return 64;
     case "trace": {
-      const base = 44;
+      const base = 48;
       if (!line.expanded) return base;
-      return base + Math.min(480, line.items.length * 36);
+      return base + Math.min(800, line.items.length * 40);
     }
     case "thought": {
-      const lines = Math.ceil((line.text?.length ?? 0) / 90);
-      return Math.min(320, 48 + lines * 18);
+      const lines = Math.ceil((line.text?.length ?? 0) / 70);
+      return Math.min(600, 56 + lines * 22);
     }
     case "assistant": {
-      const lines = Math.ceil((line.text?.length ?? 0) / 80);
-      return Math.min(900, 56 + lines * 20);
+      // Markdown + spacing is taller than plain char estimates.
+      const lines = Math.ceil((line.text?.length ?? 0) / 55);
+      return Math.max(80, Math.min(6000, 72 + lines * 24));
     }
     case "user": {
-      const textLines = Math.ceil((line.text?.length ?? 0) / 60);
+      const textLines = Math.ceil((line.text?.length ?? 0) / 48);
       const atts = line.attachments?.length ?? 0;
-      return Math.min(420, 52 + textLines * 18 + (atts > 0 ? 72 : 0));
+      return Math.min(800, 56 + textLines * 22 + (atts > 0 ? 88 : 0));
     }
     default:
-      return 64;
+      return 72;
   }
 }
 
@@ -981,6 +986,11 @@ export default function App() {
   const [gitLoading, setGitLoading] = useState(false);
   const [gitError, setGitError] = useState<string | null>(null);
   const [attachments, setAttachments] = useState<Attachment[]>([]);
+  /** Full-screen preview for a pending composer image attachment. */
+  const [attachmentPreview, setAttachmentPreview] = useState<{
+    src: string;
+    name: string;
+  } | null>(null);
   const [models, setModels] = useState<ModelOption[]>([]);
   const [modelId, setModelId] = useState<string>("grok-4.5");
   const [efforts, setEfforts] = useState<EffortOption[]>([]);
@@ -1973,19 +1983,30 @@ export default function App() {
   const jumpToBottom = useCallback(() => {
     const el = chatScrollRef.current;
     if (!el) return;
-    lastProgrammaticScrollRef.current = performance.now() + 500;
-    el.scrollTo({
-      top: Math.max(0, el.scrollHeight - el.clientHeight),
-      behavior: "smooth",
-    });
-    // Resume live follow after manual jump to the edge.
+    // Resume live follow; keep programmatic guard long enough for measure passes.
+    lastProgrammaticScrollRef.current = performance.now() + 900;
     autoScrollEnabledRef.current = true;
     userScrollIntentRef.current = false;
     setShowScrollToBottom(false);
+    const snap = () => {
+      const root = chatScrollRef.current;
+      if (!root) return;
+      root.scrollTop = Math.max(0, root.scrollHeight - root.clientHeight);
+    };
+    // Instant snap first so virtual window expands to the tail (end = n).
+    snap();
+    requestAnimationFrame(() => {
+      snap();
+      requestAnimationFrame(snap);
+    });
+    // After ResizeObserver height corrections, snap again.
+    window.setTimeout(snap, 40);
+    window.setTimeout(snap, 120);
     window.setTimeout(() => {
+      snap();
       updateScrollToBottomVisible();
       scheduleStickyUser();
-    }, 400);
+    }, 320);
   }, [scheduleStickyUser, updateScrollToBottomVisible]);
 
   // When chat content grows, ease toward bottom only if auto-follow is on.
@@ -3735,6 +3756,29 @@ export default function App() {
       return prev.filter((a) => a.path !== path);
     });
   };
+
+  const openAttachmentPreview = useCallback((a: Attachment) => {
+    if (!isImageAttachment(a)) return;
+    let src = a.previewUrl || "";
+    if (!src && a.path) {
+      try {
+        src = convertFileSrc(a.path);
+      } catch {
+        src = "";
+      }
+    }
+    if (!src) return;
+    setAttachmentPreview({ src, name: attachmentDisplayName(a) });
+  }, []);
+
+  useEffect(() => {
+    if (!attachmentPreview) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setAttachmentPreview(null);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [attachmentPreview]);
 
   const onModelChange = async (id: string) => {
     setModelId(id);
@@ -5540,21 +5584,44 @@ export default function App() {
                   {attachments.map((a) => {
                     const label = attachmentDisplayName(a);
                     const isImg = isImageAttachment(a);
+                    const thumbSrc =
+                      isImg && (a.previewUrl || a.path)
+                        ? a.previewUrl ||
+                          (a.path ? convertFileSrc(a.path) : "")
+                        : "";
                     return (
                       <div
                         key={a.path}
                         className={`attach-chip${
                           isImg ? " attach-chip-image" : ""
-                        }`}
-                        title={label}
+                        }${isImg && thumbSrc ? " attach-chip-clickable" : ""}`}
+                        title={
+                          isImg && thumbSrc
+                            ? `Click to preview · ${label}`
+                            : label
+                        }
+                        role={isImg && thumbSrc ? "button" : undefined}
+                        tabIndex={isImg && thumbSrc ? 0 : undefined}
+                        onClick={
+                          isImg && thumbSrc
+                            ? () => openAttachmentPreview(a)
+                            : undefined
+                        }
+                        onKeyDown={
+                          isImg && thumbSrc
+                            ? (e) => {
+                                if (e.key === "Enter" || e.key === " ") {
+                                  e.preventDefault();
+                                  openAttachmentPreview(a);
+                                }
+                              }
+                            : undefined
+                        }
                       >
-                        {isImg && (a.previewUrl || a.path) ? (
+                        {isImg && thumbSrc ? (
                           <img
                             className="attach-thumb"
-                            src={
-                              a.previewUrl ||
-                              (a.path ? convertFileSrc(a.path) : "")
-                            }
+                            src={thumbSrc}
                             alt={label}
                           />
                         ) : (
@@ -5571,7 +5638,10 @@ export default function App() {
                         <button
                           type="button"
                           className="attach-remove"
-                          onClick={() => removeAttachment(a.path)}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            removeAttachment(a.path);
+                          }}
                           aria-label="Remove attachment"
                         >
                           ×
@@ -6090,6 +6160,40 @@ export default function App() {
             </>
           )}
         </>
+      )}
+
+      {attachmentPreview && (
+        <div
+          className="attach-preview-overlay"
+          role="dialog"
+          aria-modal="true"
+          aria-label={`Preview ${attachmentPreview.name}`}
+          onClick={() => setAttachmentPreview(null)}
+        >
+          <div
+            className="attach-preview-panel"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="attach-preview-bar">
+              <span className="attach-preview-name" title={attachmentPreview.name}>
+                {attachmentPreview.name}
+              </span>
+              <button
+                type="button"
+                className="attach-preview-close"
+                onClick={() => setAttachmentPreview(null)}
+                aria-label="Close preview"
+              >
+                ×
+              </button>
+            </div>
+            <img
+              className="attach-preview-img"
+              src={attachmentPreview.src}
+              alt={attachmentPreview.name}
+            />
+          </div>
+        </div>
       )}
     </div>
   );

@@ -1,11 +1,13 @@
 /**
- * Lightweight windowed chat list: only mount rows near the viewport.
- * Variable-height items use estimated sizes + overscan; no extra deps.
+ * Windowed chat list with measured row heights.
+ * Estimates only bootstrap; ResizeObserver corrects pads so scroll can
+ * always reach the true bottom (and jump-to-bottom works).
  */
 import {
   memo,
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -16,7 +18,7 @@ import {
 
 export type VirtualItem = {
   id: string;
-  /** Rough height hint (px) for windowing math. */
+  /** Rough height hint (px) until measured. */
   estimateHeight: number;
 };
 
@@ -31,10 +33,32 @@ type Props<T extends VirtualItem> = {
   className?: string;
 };
 
-type WindowRange = { start: number; end: number; topPad: number; bottomPad: number };
+type WindowRange = {
+  start: number;
+  end: number;
+  topPad: number;
+  bottomPad: number;
+};
+
+/** Full render below this count — measurement cost is fine, avoids pad bugs. */
+const FULL_RENDER_LIMIT = 48;
+
+function heightsFor(
+  items: VirtualItem[],
+  measured: Map<string, number>,
+): number[] {
+  const n = items.length;
+  const out = new Array<number>(n);
+  for (let i = 0; i < n; i++) {
+    const m = measured.get(items[i].id);
+    out[i] = Math.max(24, m ?? (items[i].estimateHeight || 64));
+  }
+  return out;
+}
 
 function computeWindow(
   items: VirtualItem[],
+  measured: Map<string, number>,
   scrollTop: number,
   viewportH: number,
   overscanPx: number,
@@ -44,14 +68,11 @@ function computeWindow(
     return { start: 0, end: 0, topPad: 0, bottomPad: 0 };
   }
 
-  // Prefix heights
-  const heights = new Array<number>(n);
-  let total = 0;
-  for (let i = 0; i < n; i++) {
-    const h = Math.max(24, items[i].estimateHeight || 64);
-    heights[i] = h;
-    total += h;
+  if (n <= FULL_RENDER_LIMIT) {
+    return { start: 0, end: n, topPad: 0, bottomPad: 0 };
   }
+
+  const heights = heightsFor(items, measured);
 
   const viewStart = Math.max(0, scrollTop - overscanPx);
   const viewEnd = scrollTop + viewportH + overscanPx;
@@ -76,9 +97,16 @@ function computeWindow(
     if (span >= viewEnd) break;
   }
 
-  // Always keep a reasonable minimum window for short lists.
-  if (n <= 40) {
-    return { start: 0, end: n, topPad: 0, bottomPad: 0 };
+  // Always keep the last few rows mounted so true bottom height is real,
+  // not a short estimate that blocks scrolling / jump-to-bottom.
+  const TAIL_KEEP = 12;
+  end = Math.max(end, n - TAIL_KEEP);
+
+  // Near the bottom: mount everything to the end (expand window downward).
+  const total = heights.reduce((a, b) => a + b, 0);
+  const distFromBottom = total - (scrollTop + viewportH);
+  if (distFromBottom < viewportH * 2) {
+    end = n;
   }
 
   let topPad = 0;
@@ -86,19 +114,17 @@ function computeWindow(
   let bottomPad = 0;
   for (let i = end; i < n; i++) bottomPad += heights[i];
 
-  // Guard: if estimates are way off, fall back to full list for tiny remaining.
-  if (end - start >= n - 2) {
+  if (end - start >= n - 2 || bottomPad === 0 && start === 0) {
     return { start: 0, end: n, topPad: 0, bottomPad: 0 };
   }
 
-  void total;
   return { start, end, topPad, bottomPad };
 }
 
 function VirtualChatListInner<T extends VirtualItem>({
   items,
   scrollerRef,
-  overscanPx = 900,
+  overscanPx = 1200,
   renderItem,
   footer,
   className,
@@ -109,13 +135,28 @@ function VirtualChatListInner<T extends VirtualItem>({
     topPad: 0,
     bottomPad: 0,
   });
+  /** Measured row heights by id — drives pad correction. */
+  const measuredRef = useRef<Map<string, number>>(new Map());
+  const [measureTick, setMeasureTick] = useState(0);
   const rafRef = useRef<number | null>(null);
+  const measureRafRef = useRef<number | null>(null);
+  const rowElsRef = useRef<Map<string, HTMLDivElement>>(new Map());
+  const roRef = useRef<ResizeObserver | null>(null);
+
+  const bumpMeasure = useCallback(() => {
+    if (measureRafRef.current != null) return;
+    measureRafRef.current = requestAnimationFrame(() => {
+      measureRafRef.current = null;
+      setMeasureTick((t) => t + 1);
+    });
+  }, []);
 
   const recompute = useCallback(() => {
     const el = scrollerRef.current;
     if (!el) return;
     const next = computeWindow(
       items,
+      measuredRef.current,
       el.scrollTop,
       el.clientHeight,
       overscanPx,
@@ -131,11 +172,21 @@ function VirtualChatListInner<T extends VirtualItem>({
       }
       return next;
     });
-  }, [items, scrollerRef, overscanPx]);
+  }, [items, scrollerRef, overscanPx, measureTick]);
 
+  // Drop measurements for removed messages; recompute when list changes.
   useEffect(() => {
+    const live = new Set(items.map((i) => i.id));
+    let pruned = false;
+    for (const id of measuredRef.current.keys()) {
+      if (!live.has(id)) {
+        measuredRef.current.delete(id);
+        pruned = true;
+      }
+    }
+    if (pruned) bumpMeasure();
     recompute();
-  }, [recompute, items.length]);
+  }, [items, recompute, bumpMeasure]);
 
   useEffect(() => {
     const el = scrollerRef.current;
@@ -156,13 +207,75 @@ function VirtualChatListInner<T extends VirtualItem>({
     };
   }, [scrollerRef, recompute]);
 
+  // Observe mounted rows; correct height map when markdown finishes layout.
+  useLayoutEffect(() => {
+    if (typeof ResizeObserver === "undefined") return;
+    const ro = new ResizeObserver((entries) => {
+      let changed = false;
+      for (const entry of entries) {
+        const node = entry.target as HTMLElement;
+        const id = node.dataset.vrowId;
+        if (!id) continue;
+        const h = Math.ceil(entry.contentRect.height);
+        if (h <= 0) continue;
+        const prev = measuredRef.current.get(id);
+        // Ignore sub-pixel noise.
+        if (prev != null && Math.abs(prev - h) < 2) continue;
+        measuredRef.current.set(id, h);
+        changed = true;
+      }
+      if (changed) bumpMeasure();
+    });
+    roRef.current = ro;
+    for (const [, node] of rowElsRef.current) {
+      ro.observe(node);
+    }
+    return () => {
+      ro.disconnect();
+      roRef.current = null;
+    };
+  }, [range.start, range.end, items, bumpMeasure]);
+
+  const setRowRef = useCallback(
+    (id: string, node: HTMLDivElement | null) => {
+      const prev = rowElsRef.current.get(id);
+      if (prev && prev !== node) {
+        roRef.current?.unobserve(prev);
+        rowElsRef.current.delete(id);
+      }
+      if (node) {
+        node.dataset.vrowId = id;
+        rowElsRef.current.set(id, node);
+        roRef.current?.observe(node);
+        // Immediate measure so first paint after jump isn't short.
+        const h = Math.ceil(node.getBoundingClientRect().height);
+        if (h > 0) {
+          const old = measuredRef.current.get(id);
+          if (old == null || Math.abs(old - h) >= 2) {
+            measuredRef.current.set(id, h);
+            bumpMeasure();
+          }
+        }
+      }
+    },
+    [bumpMeasure],
+  );
+
   const slice = useMemo(
     () => items.slice(range.start, range.end),
     [items, range.start, range.end],
   );
 
-  const topStyle: CSSProperties = { height: range.topPad, flexShrink: 0 };
-  const bottomStyle: CSSProperties = { height: range.bottomPad, flexShrink: 0 };
+  const topStyle: CSSProperties = {
+    height: range.topPad,
+    flexShrink: 0,
+    pointerEvents: "none",
+  };
+  const bottomStyle: CSSProperties = {
+    height: range.bottomPad,
+    flexShrink: 0,
+    pointerEvents: "none",
+  };
 
   return (
     <div className={className}>
@@ -170,7 +283,11 @@ function VirtualChatListInner<T extends VirtualItem>({
         <div style={topStyle} aria-hidden className="chat-virtual-pad" />
       )}
       {slice.map((item, i) => (
-        <div key={item.id} className="chat-virtual-item">
+        <div
+          key={item.id}
+          className="chat-virtual-item"
+          ref={(node) => setRowRef(item.id, node)}
+        >
           {renderItem(item, range.start + i)}
         </div>
       ))}
@@ -182,4 +299,6 @@ function VirtualChatListInner<T extends VirtualItem>({
   );
 }
 
-export const VirtualChatList = memo(VirtualChatListInner) as typeof VirtualChatListInner;
+export const VirtualChatList = memo(
+  VirtualChatListInner,
+) as typeof VirtualChatListInner;

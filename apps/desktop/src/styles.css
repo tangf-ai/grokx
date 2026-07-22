@@ -942,6 +942,17 @@ button.status-pill:disabled {
   margin: 0 auto;
 }
 
+/* Virtual list rows: let natural height drive measurement. */
+.chat-virtual-item {
+  display: block;
+}
+
+.chat-virtual-pad {
+  display: block;
+  width: 100%;
+  overflow: hidden;
+}
+
 /* Overlay user prompt — right-aligned like chat user bubbles. */
 .user-sticky-bar {
   position: absolute;
@@ -1846,6 +1857,20 @@ button.msg-user-file-chip:hover {
   padding: 4px 8px 4px 4px;
 }
 
+.attach-chip-clickable {
+  cursor: zoom-in;
+}
+
+.attach-chip-clickable:hover {
+  background: #ebebef;
+  border-color: #d0d0d6;
+}
+
+.attach-chip-clickable:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
 .attach-thumb {
   width: 36px;
   height: 36px;
@@ -1853,6 +1878,84 @@ button.msg-user-file-chip:hover {
   object-fit: cover;
   flex-shrink: 0;
   background: #e8e8ec;
+}
+
+/* Composer image attachment lightbox */
+.attach-preview-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 2000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 28px;
+  background: rgba(20, 20, 24, 0.55);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+  cursor: zoom-out;
+}
+
+.attach-preview-panel {
+  display: flex;
+  flex-direction: column;
+  max-width: min(920px, 100%);
+  max-height: min(88vh, 100%);
+  background: #fff;
+  border-radius: 16px;
+  box-shadow: 0 24px 80px rgba(0, 0, 0, 0.28);
+  overflow: hidden;
+  cursor: default;
+}
+
+.attach-preview-bar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 12px 10px 16px;
+  border-bottom: 1px solid var(--border-soft);
+  flex-shrink: 0;
+}
+
+.attach-preview-name {
+  flex: 1;
+  min-width: 0;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.attach-preview-close {
+  width: 32px;
+  height: 32px;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 20px;
+  line-height: 1;
+  display: grid;
+  place-items: center;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.attach-preview-close:hover {
+  background: rgba(0, 0, 0, 0.06);
+  color: var(--text);
+}
+
+.attach-preview-img {
+  display: block;
+  max-width: 100%;
+  max-height: calc(88vh - 56px);
+  width: auto;
+  height: auto;
+  object-fit: contain;
+  background: #f6f6f8;
+  margin: 0 auto;
 }
 
 .attach-icon {
