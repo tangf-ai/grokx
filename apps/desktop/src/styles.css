@@ -8,11 +8,13 @@
     "Segoe UI",
     sans-serif;
   --bg: #f4f4f5;
-  --sidebar: #f0f0f2;
+  --sidebar: #f7f7f8;
   --main: #ffffff;
   --panel: #ffffff;
   --border: #e5e5ea;
   --border-soft: #ececf0;
+  --sidebar-hover: rgba(0, 0, 0, 0.045);
+  --sidebar-active: rgba(0, 0, 0, 0.07);
   --text: #1d1d1f;
   --muted: #6e6e73;
   --muted-2: #8e8e93;
@@ -113,16 +115,27 @@ button {
   left: 50%;
   width: 1px;
   transform: translateX(-50%);
-  background: var(--border);
-  opacity: 0.85;
+  background: rgba(0, 0, 0, 0.06);
+  opacity: 1;
   transition: background 0.12s ease, width 0.12s ease, opacity 0.12s ease;
+}
+
+/* Sidebar | main: nearly invisible divider until hover (Codex-like) */
+.panel-resizer-sidebar::after {
+  background: transparent;
 }
 
 .panel-resizer:hover::after,
 body.resizing-panels .panel-resizer:hover::after {
   width: 2px;
   background: var(--text);
-  opacity: 0.35;
+  opacity: 0.28;
+}
+
+.panel-resizer-sidebar:hover::after,
+body.resizing-panels .panel-resizer-sidebar::after {
+  background: rgba(0, 0, 0, 0.18);
+  opacity: 1;
 }
 
 body.resizing-panels {
@@ -136,14 +149,14 @@ body.resizing-panels * {
   cursor: col-resize !important;
 }
 
-/* ─── Sidebar ─── */
+/* ─── Sidebar (Codex-like: flat list, minimal chrome) ─── */
 .sidebar {
   display: flex;
   flex-direction: column;
   min-height: 0;
   background: var(--sidebar);
-  border-right: 1px solid var(--border);
-  padding: 0 12px 14px;
+  border-right: 1px solid transparent;
+  padding: 0 10px 12px;
 }
 
 /* Top chrome under traffic lights: entire strip is a window drag region.
@@ -167,7 +180,7 @@ html.platform-mac .sidebar-titlebar {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 4px 8px 18px;
+  padding: 4px 8px 14px;
 }
 
 html.platform-mac .brand-row {
@@ -178,8 +191,8 @@ html.platform-mac .brand-row {
 .brand {
   display: flex;
   align-items: center;
-  font-weight: 700;
-  font-size: 17px;
+  font-weight: 650;
+  font-size: 16px;
   letter-spacing: -0.02em;
   color: var(--text);
 }
@@ -230,8 +243,8 @@ html.platform-mac .brand-row {
 .nav {
   display: flex;
   flex-direction: column;
-  gap: 2px;
-  margin-bottom: 16px;
+  gap: 1px;
+  margin-bottom: 10px;
 }
 
 .nav-item {
@@ -243,18 +256,18 @@ html.platform-mac .brand-row {
   border: none;
   background: transparent;
   color: var(--text);
-  border-radius: 10px;
-  padding: 9px 12px;
+  border-radius: 8px;
+  padding: 8px 10px;
   font-size: 14px;
   font-weight: 500;
 }
 
 .nav-item:hover {
-  background: rgba(0, 0, 0, 0.04);
+  background: var(--sidebar-hover);
 }
 
 .nav-item.active {
-  background: rgba(0, 0, 0, 0.06);
+  background: var(--sidebar-active);
 }
 
 .nav-item:disabled {
@@ -280,29 +293,29 @@ html.platform-mac .brand-row {
   align-items: center;
   justify-content: space-between;
   gap: 8px;
-  padding: 4px 4px 4px 0;
+  padding: 10px 4px 2px 2px;
 }
 
 .section-label {
   font-size: 12px;
-  font-weight: 600;
+  font-weight: 500;
   color: var(--muted-2);
-  padding: 8px 12px 6px;
-  letter-spacing: 0.01em;
+  padding: 4px 8px;
+  letter-spacing: 0;
 }
 
 .section-label-row .section-label {
-  padding: 8px 4px 6px 12px;
+  padding: 4px 4px 4px 8px;
 }
 
 .session-add-btn {
-  width: 28px;
-  height: 28px;
-  margin-right: 8px;
+  width: 26px;
+  height: 26px;
+  margin-right: 4px;
   border: none;
-  border-radius: 8px;
+  border-radius: 6px;
   background: transparent;
-  color: var(--muted);
+  color: var(--muted-2);
   font-size: 18px;
   line-height: 1;
   display: grid;
@@ -311,7 +324,7 @@ html.platform-mac .brand-row {
 }
 
 .session-add-btn:hover:not(:disabled) {
-  background: rgba(0, 0, 0, 0.06);
+  background: var(--sidebar-hover);
   color: var(--text);
 }
 
@@ -325,69 +338,67 @@ html.platform-mac .brand-row {
   max-height: 48%;
   overflow: auto;
   min-height: 0;
-  padding-bottom: 6px;
+  padding-bottom: 4px;
   flex-shrink: 0;
 }
 
 .project-list::-webkit-scrollbar {
-  width: 8px;
+  width: 6px;
 }
 
 .project-list::-webkit-scrollbar-thumb {
-  background: #d5d5da;
+  background: rgba(0, 0, 0, 0.12);
   border-radius: 8px;
 }
 
 .project-block {
-  margin-bottom: 6px;
+  margin-bottom: 1px;
 }
 
-/* Project = heavier “folder” card */
+/* Project = flat folder row (no card / border) */
 .project-row {
   display: block;
   width: 100%;
   text-align: left;
-  background: #e9e9ee;
-  border: 1px solid rgba(0, 0, 0, 0.06);
-  border-radius: 12px;
+  background: transparent;
+  border: none;
+  border-radius: 8px;
   color: var(--text);
-  padding: 9px 10px 9px 10px;
+  padding: 7px 8px 7px 10px;
   margin-bottom: 0;
   cursor: pointer;
 }
 
 .project-row:hover {
-  background: #e2e2e8;
-  border-color: rgba(0, 0, 0, 0.08);
+  background: var(--sidebar-hover);
 }
 
 .project-row.active {
-  background: #dedee5;
-  border-color: rgba(255, 90, 31, 0.35);
-  box-shadow: inset 3px 0 0 var(--accent);
+  background: var(--sidebar-active);
+  box-shadow: none;
 }
 
 .project-row-main {
   display: flex;
   align-items: center;
-  gap: 7px;
+  gap: 8px;
   min-width: 0;
 }
 
 .project-icon {
   flex-shrink: 0;
-  width: 22px;
-  height: 22px;
-  border-radius: 7px;
-  background: rgba(255, 255, 255, 0.7);
-  color: #5c5c66;
+  width: 18px;
+  height: 18px;
+  border-radius: 0;
+  background: transparent;
+  color: var(--muted);
   display: grid;
   place-items: center;
 }
 
 .project-row.active .project-icon {
-  background: var(--accent-soft);
-  color: var(--accent);
+  background: transparent;
+  color: var(--text);
 }
 
 .project-title {
@@ -396,8 +407,8 @@ html.platform-mac .brand-row {
   display: flex;
   align-items: center;
   gap: 6px;
-  font-size: 13px;
-  font-weight: 700;
+  font-size: 13.5px;
+  font-weight: 500;
   letter-spacing: -0.01em;
   white-space: nowrap;
   overflow: hidden;
@@ -406,26 +417,29 @@ html.platform-mac .brand-row {
 
 .project-count {
   flex-shrink: 0;
-  min-width: 18px;
-  height: 18px;
-  padding: 0 5px;
-  border-radius: 9px;
-  background: rgba(255, 255, 255, 0.65);
-  color: var(--muted);
-  font-size: 11px;
-  font-weight: 650;
+  min-width: 0;
+  height: auto;
+  padding: 0 2px;
+  border-radius: 0;
+  background: transparent;
+  color: var(--muted-2);
+  font-size: 12px;
+  font-weight: 500;
   display: grid;
   place-items: center;
 }
 
 .project-row.active .project-count {
-  background: rgba(255, 255, 255, 0.85);
-  color: var(--text);
+  background: transparent;
+  color: var(--muted);
 }
 
 .project-row.working:not(.active) {
-  background: rgba(255, 90, 31, 0.06);
-  border-color: rgba(255, 90, 31, 0.12);
+  background: transparent;
+}
+
+.project-row.working:not(.active):hover {
+  background: var(--sidebar-hover);
 }
 
 .project-working-spin {
@@ -433,7 +447,7 @@ html.platform-mac .brand-row {
 }
 
 .project-count-working {
-  background: rgba(255, 90, 31, 0.14);
+  background: transparent;
   color: var(--accent);
   font-variant-numeric: tabular-nums;
 }
@@ -452,18 +466,18 @@ html.platform-mac .brand-row {
 
 /* Path under project name is intentionally hidden — keep sidebar clean. */
 
-/* Nested tasks under the selected project */
+/* Nested tasks under project — indent only, no rail line */
 .project-tasks {
-  margin: 4px 0 2px 8px;
-  padding: 4px 0 2px 8px;
-  border-left: 2px solid rgba(0, 0, 0, 0.08);
+  margin: 0 0 2px 0;
+  padding: 0 0 2px 26px;
+  border-left: none;
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: 0;
 }
 
 .session-empty-nested {
-  padding: 6px 10px;
+  padding: 4px 10px;
   font-size: 12px;
 }
 
@@ -471,77 +485,75 @@ html.platform-mac .brand-row {
   flex: 1;
   overflow: auto;
   min-height: 0;
-  padding-bottom: 8px;
+  padding-bottom: 6px;
 }
 
 .session-list::-webkit-scrollbar {
-  width: 8px;
+  width: 6px;
 }
 
 .session-list::-webkit-scrollbar-thumb {
-  background: #d5d5da;
+  background: rgba(0, 0, 0, 0.12);
   border-radius: 8px;
 }
 
 .session-empty {
-  padding: 8px 12px;
+  padding: 6px 10px;
   font-size: 13px;
-  color: var(--muted);
+  color: var(--muted-2);
 }
 
-/* Task = lighter “session” chip (distinct from project folder card) */
+/* Task row — flat text list */
 .session-row,
 .task-row {
   display: block;
   width: 100%;
   text-align: left;
   background: transparent;
-  border: 1px solid transparent;
-  border-radius: 10px;
+  border: none;
+  border-radius: 8px;
   color: var(--text);
-  padding: 8px 10px;
-  margin-bottom: 2px;
+  padding: 7px 8px 7px 10px;
+  margin-bottom: 0;
   cursor: pointer;
 }
 
 .session-row:hover,
 .task-row:hover {
-  background: rgba(255, 255, 255, 0.72);
-  border-color: rgba(0, 0, 0, 0.05);
+  background: var(--sidebar-hover);
 }
 
 .session-row.active,
 .task-row.active {
-  background: #fff;
-  border-color: rgba(255, 90, 31, 0.28);
-  box-shadow: inset 2px 0 0 var(--accent);
+  background: var(--sidebar-active);
+  box-shadow: none;
 }
 
 .session-row.active .session-title,
 .task-row.active .session-title {
   color: var(--text);
-  font-weight: 650;
+  font-weight: 550;
 }
 
 .session-row.nested {
-  padding: 7px 8px 7px 8px;
+  padding: 6px 8px;
   margin-bottom: 0;
-  background: rgba(255, 255, 255, 0.45);
-  border-radius: 9px;
+  background: transparent;
+  border-radius: 8px;
 }
 
 .session-row.nested:hover {
-  background: rgba(255, 255, 255, 0.9);
+  background: var(--sidebar-hover);
 }
 
 .session-row.nested.active {
-  background: #fff;
+  background: var(--sidebar-active);
 }
 
 .task-icon {
   flex-shrink: 0;
-  width: 18px;
-  height: 18px;
+  width: 16px;
+  height: 16px;
   color: var(--muted-2);
   display: grid;
   place-items: center;
@@ -549,22 +561,27 @@ html.platform-mac .brand-row {
 
 .session-row.active .task-icon,
 .task-row.active .task-icon {
-  color: var(--accent);
+  color: var(--muted);
 }
 
 /* Active task is streaming / running tools */
 .session-row.working {
-  background: var(--accent-soft);
+  background: transparent;
+}
+
+.session-row.working:hover {
+  background: var(--sidebar-hover);
 }
 
 .session-row.working.active {
-  box-shadow: inset 3px 0 0 var(--accent);
+  background: var(--sidebar-active);
+  box-shadow: none;
 }
 
 .session-row-main {
   display: flex;
   align-items: center;
-  gap: 4px;
+  gap: 6px;
   min-width: 0;
 }
 
@@ -574,8 +591,9 @@ html.platform-mac .brand-row {
   display: flex;
   align-items: center;
   gap: 6px;
-  font-size: 13px;
-  font-weight: 600;
+  font-size: 13.5px;
+  font-weight: 450;
+  color: #3a3a3c;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -584,24 +602,25 @@ html.platform-mac .brand-row {
 /* Unread activity while task was in the background */
 .session-unread-dot {
   flex-shrink: 0;
-  width: 7px;
-  height: 7px;
+  width: 6px;
+  height: 6px;
   border-radius: 50%;
-  background: #ff5a1f;
-  box-shadow: 0 0 0 2px rgba(255, 90, 31, 0.18);
+  background: var(--accent);
+  box-shadow: none;
 }
 
 .session-row.unread:not(.active) .session-title {
   color: var(--text);
+  font-weight: 500;
 }
 
 /* Compact working indicator: single spinning ring (no second row / badge). */
 .session-working-spin {
   flex-shrink: 0;
-  width: 14px;
-  height: 14px;
+  width: 12px;
+  height: 12px;
   border-radius: 50%;
-  border: 2px solid rgba(255, 90, 31, 0.25);
+  border: 1.5px solid rgba(255, 90, 31, 0.22);
   border-top-color: var(--accent);
   animation: session-working-spin 0.7s linear infinite;
 }
@@ -615,12 +634,12 @@ html.platform-mac .brand-row {
 .session-action-btn,
 .session-rename-btn {
   flex-shrink: 0;
-  width: 24px;
-  height: 24px;
+  width: 22px;
+  height: 22px;
   border: none;
   border-radius: 6px;
   background: transparent;
-  color: var(--muted);
+  color: var(--muted-2);
   font-size: 12px;
   opacity: 0;
   padding: 0;
@@ -653,15 +672,20 @@ html.platform-mac .brand-row {
 
 .session-rename-input {
   width: 100%;
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 6px 8px;
+  border: none;
+  border-radius: 6px;
+  padding: 5px 8px;
   font-size: 13px;
-  font-weight: 600;
-  background: #fff;
+  font-weight: 500;
+  background: rgba(0, 0, 0, 0.04);
   color: var(--text);
   outline: none;
-  box-shadow: 0 0 0 3px rgba(0, 0, 0, 0.04);
+  box-shadow: none;
+}
+
+.session-rename-input:focus {
+  background: #fff;
+  box-shadow: 0 0 0 2px rgba(0, 0, 0, 0.06);
 }
 
 /* Only show meta for live working status; hide paths to reduce clutter. */
@@ -682,8 +706,8 @@ html.platform-mac .brand-row {
 }
 
 .sidebar-bottom {
-  border-top: 1px solid var(--border);
-  padding-top: 10px;
+  border-top: none;
+  padding-top: 6px;
   margin-top: auto;
   flex-shrink: 0;
 }
@@ -1907,32 +1931,22 @@ button.msg-user-file-chip:hover {
   justify-content: flex-end;
 }
 
-.access-toggle {
-  border: none;
-  background: transparent;
-  color: var(--accent);
-  font-size: 13px;
+/* Permission mode dropdown — same shell as model/effort, tinted by mode. */
+.composer-select.access-select {
+  max-width: 148px;
   font-weight: 600;
-  padding: 4px 6px;
-  border-radius: 8px;
-  white-space: nowrap;
 }
 
-.access-toggle:hover {
-  background: var(--accent-soft);
-}
-
-.access-toggle.off,
-.access-toggle.access-mode-ask {
+.composer-select.access-select.access-mode-ask {
   color: var(--muted);
   font-weight: 500;
 }
 
-.access-toggle.access-mode-auto {
+.composer-select.access-select.access-mode-auto {
   color: #b36b00;
 }
 
-.access-toggle.access-mode-always-approve {
+.composer-select.access-select.access-mode-always-approve {
   color: var(--accent);
   font-weight: 700;
 }

@@ -25,6 +25,8 @@ pub enum BridgeError {
     ProcessExited,
     #[error("request timed out waiting for agent response")]
     Timeout,
+    #[error("turn cancelled by user")]
+    Cancelled,
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
     #[error("json error: {0}")]

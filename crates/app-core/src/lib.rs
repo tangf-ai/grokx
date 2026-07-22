@@ -1093,6 +1093,8 @@ impl AppCore {
         ReasoningEffort::menu().to_vec()
     }
 
+    /// Cancel the active session's in-flight turn (Stop button).
+    /// Clears busy immediately even if the engine cancel RPC is slow.
     pub async fn cancel_turn(&self) -> Result<(), CoreError> {
         let (handle, sid) = {
             let live = self.live.lock().await;
@@ -1103,9 +1105,19 @@ impl AppCore {
                 .clone()
                 .ok_or(CoreError::NotConnected)?;
             let agent = live.get(&sid).ok_or(CoreError::NotConnected)?;
+            // Optimistic: UI must leave Working even if cancel races.
+            agent.turn_busy.store(false, Ordering::SeqCst);
             (agent.handle.clone(), sid)
         };
-        handle.cancel().await?;
+        // Bridge emits TurnFinished(Cancelled) and unblocks session/prompt.
+        if let Err(e) = handle.cancel().await {
+            warn!(error = %e, session = %sid.0, "cancel_turn: engine cancel failed");
+            // Still emit cancelled so the UI settles if bridge did not.
+            self.emit(AppEvent::TurnFinished {
+                session_id: sid.clone(),
+                state: TurnState::Cancelled,
+            });
+        }
         if let Some(agent) = self.live.lock().await.get(&sid) {
             agent.turn_busy.store(false, Ordering::SeqCst);
         }

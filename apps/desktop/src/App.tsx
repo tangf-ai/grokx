@@ -40,6 +40,11 @@ import {
   detectVerbalOnlyCompletion,
   VERBAL_COMPLETION_NUDGE,
 } from "./lib/verbalCompletion";
+import {
+  ComposerInput,
+  type ComposerInputHandle,
+} from "./components/ComposerInput";
+import { VirtualChatList } from "./components/VirtualChatList";
 
 /** Public open-source repository (opens in the system browser). */
 const GROKX_GITHUB_URL = "https://github.com/tangf-ai/grokx";
@@ -300,17 +305,6 @@ function normalizePermissionMode(raw?: string | null, legacyAuto?: boolean): Per
   return "ask";
 }
 
-function permissionModeLabel(mode: PermissionMode): string {
-  switch (mode) {
-    case "auto":
-      return "Auto";
-    case "always-approve":
-      return "Full trust";
-    default:
-      return "Needs approval";
-  }
-}
-
 type ChatAttachment = {
   path: string;
   name: string;
@@ -544,6 +538,39 @@ let chatLineSeq = 0;
 function nextLineId(kind: string): string {
   chatLineSeq += 1;
   return `${kind}-${Date.now()}-${chatLineSeq}`;
+}
+
+/** Rough row height for windowed chat (px). Prefer overscan over perfect accuracy. */
+function estimateChatLineHeight(line: ChatLine): number {
+  switch (line.kind) {
+    case "tool":
+    case "system":
+      return 36;
+    case "waiting":
+      return 40;
+    case "error":
+      return 56;
+    case "trace": {
+      const base = 44;
+      if (!line.expanded) return base;
+      return base + Math.min(480, line.items.length * 36);
+    }
+    case "thought": {
+      const lines = Math.ceil((line.text?.length ?? 0) / 90);
+      return Math.min(320, 48 + lines * 18);
+    }
+    case "assistant": {
+      const lines = Math.ceil((line.text?.length ?? 0) / 80);
+      return Math.min(900, 56 + lines * 20);
+    }
+    case "user": {
+      const textLines = Math.ceil((line.text?.length ?? 0) / 60);
+      const atts = line.attachments?.length ?? 0;
+      return Math.min(420, 52 + textLines * 18 + (atts > 0 ? 72 : 0));
+    }
+    default:
+      return 64;
+  }
 }
 
 /** Normalize tool chip text for merge comparison (trim + collapse spaces). */
@@ -851,7 +878,14 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
   const [appVersion, setAppVersion] = useState<string>("0.1.0");
   const [lines, setLines] = useState<ChatLine[]>([]);
-  const [draft, setDraft] = useState("");
+  /**
+   * Composer draft lives in ComposerInput (local state) so typing does not
+   * re-render the full chat. These are cheap parent mirrors only:
+   * - draftForMeter: debounced, for context token estimate
+   * - composerHasText: boolean for Send button enablement
+   */
+  const [draftForMeter, setDraftForMeter] = useState("");
+  const [composerHasText, setComposerHasText] = useState(false);
   /** Edit a past user bubble, then re-send from that point. */
   const [editingUserId, setEditingUserId] = useState<string | null>(null);
   const [editDraft, setEditDraft] = useState("");
@@ -979,7 +1013,7 @@ export default function App() {
   const [cfgKeyHint, setCfgKeyHint] = useState<string | null>(null);
   const [cfgGrokPath, setCfgGrokPath] = useState("~/.grok/config.toml");
   const bottomRef = useRef<HTMLDivElement | null>(null);
-  const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const composerRef = useRef<ComposerInputHandle | null>(null);
   const chatScrollRef = useRef<HTMLDivElement | null>(null);
   const userMsgEls = useRef<Map<string, HTMLDivElement>>(new Map());
   /** Wall-clock start of the in-flight agent turn (for duration on collapse). */
@@ -990,6 +1024,8 @@ export default function App() {
    */
   const verbalNudgeUsedRef = useRef(false);
   const autoNudgeInFlightRef = useRef(false);
+  /** After Stop, ignore late busy events for this session until a new send. */
+  const userStoppedSessionRef = useRef<string | null>(null);
   /** First assistant delta for the in-flight reply (for tok/s). */
   const assistantStreamStartedAtRef = useRef<number | null>(null);
   /** Last assistant delta timestamp for the in-flight reply. */
@@ -2097,8 +2133,7 @@ export default function App() {
   const jumpToUserMessage = useCallback(
     (id: string) => {
       const scroller = chatScrollRef.current;
-      const el = userMsgEls.current.get(id);
-      if (!el || !scroller) return;
+      if (!scroller) return;
 
       // Manual navigation — pause auto-follow so we don't race back to bottom.
       disableAutoScroll();
@@ -2109,6 +2144,17 @@ export default function App() {
       setHighlightUserId(id);
 
       const topPad = 20;
+      // If the row is virtualized out of the DOM, jump via estimated prefix height first.
+      if (!userMsgEls.current.get(id)) {
+        let approx = 0;
+        for (const line of linesRef.current) {
+          if (line.id === id) break;
+          approx += estimateChatLineHeight(line);
+        }
+        lastProgrammaticScrollRef.current = performance.now() + 500;
+        scroller.scrollTop = Math.max(0, approx - topPad);
+      }
+
       const alignToUser = () => {
         const target = userMsgEls.current.get(id);
         const root = chatScrollRef.current;
@@ -2124,8 +2170,9 @@ export default function App() {
 
       // Scroll immediately on click (sticky is overlay — no layout shift).
       alignToUser();
-      // One correction after highlight paint if needed.
+      // Corrections after virtual window remounts the target row.
       requestAnimationFrame(() => alignToUser());
+      window.setTimeout(alignToUser, 50);
 
       window.setTimeout(() => {
         setHighlightUserId((cur) => (cur === id ? null : cur));
@@ -2152,9 +2199,23 @@ export default function App() {
   }, [cfgContext]);
 
   const estimatedContextTokens = useMemo(
-    () => estimateSessionTokens(lines, draft),
-    [lines, draft],
+    () => estimateSessionTokens(lines, draftForMeter),
+    [lines, draftForMeter],
   );
+
+  const clearComposer = useCallback(() => {
+    composerRef.current?.clear();
+    setDraftForMeter("");
+    setComposerHasText(false);
+  }, []);
+
+  const onComposerDraftChange = useCallback((text: string) => {
+    setComposerHasText(Boolean(text.trim()));
+  }, []);
+
+  const onComposerDraftSettled = useCallback((text: string) => {
+    setDraftForMeter(text);
+  }, []);
 
   // Prefer engine total only when it is for the active non-empty context;
   // empty new tasks should show ~0, not a stale process total.
@@ -2319,14 +2380,6 @@ export default function App() {
     [applyPublicSettings],
   );
 
-  /** Cycle ask → auto → full trust → ask. */
-  const cyclePermissionMode = useCallback(() => {
-    const order: PermissionMode[] = ["ask", "auto", "always-approve"];
-    const i = order.indexOf(permissionMode);
-    const next = order[(i + 1) % order.length];
-    void setPermissionModeAndSave(next);
-  }, [permissionMode, setPermissionModeAndSave]);
-
   const loadSettings = useCallback(async () => {
     try {
       const s = await invoke<PublicSettings>("get_settings");
@@ -2441,6 +2494,16 @@ export default function App() {
           Boolean(evSid) && Boolean(activeSid) && evSid !== activeSid;
 
         const markBusy = (sid: string | null | undefined, next: boolean) => {
+          // After user hits Stop, ignore late tool/stream events that would
+          // flip Working back on until the next send.
+          if (
+            next &&
+            sid &&
+            userStoppedSessionRef.current &&
+            userStoppedSessionRef.current === sid
+          ) {
+            return;
+          }
           if (sid) setSessionBusyState(sid, next);
           else if (!isBackground) {
             busyRef.current = next;
@@ -2748,13 +2811,6 @@ export default function App() {
     markSessionUnread,
   ]);
 
-  const resizeTextarea = () => {
-    const el = textareaRef.current;
-    if (!el) return;
-    el.style.height = "auto";
-    el.style.height = `${Math.min(el.scrollHeight, 160)}px`;
-  };
-
   const selectedProject = useMemo(
     () => projects.find((p) => p.project_id === selectedProjectId) ?? null,
     [projects, selectedProjectId],
@@ -2896,7 +2952,7 @@ export default function App() {
         linesRef.current = [];
         setPendingPerm(null);
         setAttachments([]);
-        setDraft("");
+        clearComposer();
         setBusy(false);
         setEngineContextTokens(null);
         setAgentStatus("disconnected");
@@ -2962,7 +3018,7 @@ export default function App() {
       linesRef.current = [];
       setPendingPerm(null);
       setAttachments([]);
-      setDraft("");
+      clearComposer();
       setBusy(false);
       setConnecting(true);
       autoScrollEnabledRef.current = true;
@@ -3021,7 +3077,7 @@ export default function App() {
     linesRef.current = [];
     setPendingPerm(null);
     setAttachments([]);
-    setDraft("");
+    clearComposer();
     setEditingUserId(null);
     setEditDraft("");
     setError(null);
@@ -3153,7 +3209,7 @@ export default function App() {
     setError(null);
     setPendingPerm(null);
     setAttachments([]);
-    setDraft("");
+    clearComposer();
     setEditingUserId(null);
     setEditDraft("");
     // Restore busy for the task we're entering (may still be streaming).
@@ -3389,7 +3445,7 @@ export default function App() {
         linesRef.current = [];
         setPendingPerm(null);
         setAttachments([]);
-        setDraft("");
+        clearComposer();
         setBusy(false);
         setAgentStatus("disconnected");
       }
@@ -3809,18 +3865,17 @@ export default function App() {
       await onResendEditedUser();
       return;
     }
-    const text = draft.trim();
+    const text = (composerRef.current?.getValue() ?? "").trim();
     if ((!text && attachments.length === 0) || busy) return;
     const pendingAttachments = attachments;
-    setDraft("");
+    clearComposer();
     setAttachments([]);
-    if (textareaRef.current) {
-      textareaRef.current.style.height = "auto";
-    }
     turnStartedAtRef.current = Date.now();
     // Fresh user turn: allow one auto-nudge again if the model only talks.
     verbalNudgeUsedRef.current = false;
     const sid = sessionIdRef.current;
+    // New prompt clears Stop guard so this turn can show Working.
+    if (sid) userStoppedSessionRef.current = null;
     if (sid) setSessionBusyState(sid, true);
     else setBusy(true);
     // New user turn: resume gentle auto-follow from the bottom.
@@ -3877,20 +3932,77 @@ export default function App() {
     }
   };
 
+  /**
+   * Stop button: end the active task's in-flight work immediately.
+   * - UI leaves Working right away
+   * - Backend sends session/cancel and unblocks the prompt RPC
+   * - Auto-nudge is suppressed so we do not restart after stop
+   */
   const onCancel = async () => {
     const sid = sessionIdRef.current;
+    // Suppress verbal auto-continue after a user stop.
+    verbalNudgeUsedRef.current = true;
+    autoNudgeInFlightRef.current = false;
+    if (sid) userStoppedSessionRef.current = sid;
+
+    // Optimistic UI: stop spinner / dock badge before RPC returns.
+    if (sid) setSessionBusyState(sid, false);
+    else setBusy(false);
+    setPendingPerm(null);
+    clearWaiting();
+
     try {
       await invoke("cancel_turn");
     } catch (e) {
-      push({ kind: "error", text: String(e) });
+      // Still settle the turn in the transcript.
+      push({
+        kind: "system",
+        text: `Stop requested · ${String(e)}`,
+      });
     } finally {
+      // Collapse thinking/tools and show cancelled end state.
+      finishTurnCollapse(false);
+      // Ensure a cancelled system line is visible if bridge event was missed.
+      setLines((prev) => {
+        const lastUser = (() => {
+          for (let i = prev.length - 1; i >= 0; i--) {
+            if (prev[i].kind === "user") return i;
+          }
+          return -1;
+        })();
+        const tail = lastUser >= 0 ? prev.slice(lastUser + 1) : prev;
+        const hasCancelNote = tail.some(
+          (l) =>
+            (l.kind === "system" || l.kind === "error") &&
+            /cancel|stop|stopped|中止|停止/i.test(l.text),
+        );
+        if (hasCancelNote) return prev;
+        const next: ChatLine[] = [
+          ...prev,
+          {
+            id: nextLineId("system"),
+            kind: "system",
+            text: "Turn stopped",
+          },
+        ];
+        linesRef.current = next;
+        return next;
+      });
       if (sid) setSessionBusyState(sid, false);
       else setBusy(false);
-      setPendingPerm(null);
-      // Still collapse any in-flight process stream.
-      finishTurnCollapse(false);
+      void flushPersistHistory();
     }
   };
+
+  /** Windowed chat rows: same ChatLine plus height estimate for virtualization. */
+  const virtualChatItems = useMemo(
+    () =>
+      lines.map((line) => ({
+        ...line,
+        estimateHeight: estimateChatLineHeight(line),
+      })),
+    [lines],
+  );
 
   /** Drag the vertical split between sidebar ↔ chat or chat ↔ Outputs. */
   const onPanelResizeStart = useCallback(
@@ -4919,8 +5031,8 @@ export default function App() {
                 </button>
               )}
               <div className="chat-scroll" ref={chatScrollRef}>
-              <div className="chat-inner">
-                {lines.length === 0 && (
+              {lines.length === 0 ? (
+                <div className="chat-inner">
                   <div className="empty-state">
                     <h2>Start a task</h2>
                     <p>
@@ -4931,9 +5043,15 @@ export default function App() {
                       folder. Model key: <strong>Settings</strong>.
                     </p>
                   </div>
-                )}
-
-                {lines.map((line, i) => {
+                </div>
+              ) : (
+              <VirtualChatList
+                className="chat-inner"
+                items={virtualChatItems}
+                scrollerRef={chatScrollRef}
+                overscanPx={900}
+                footer={<div ref={bottomRef} />}
+                renderItem={(line, i) => {
                   if (line.kind === "trace") {
                     return (
                       <div key={line.id} className="msg msg-trace">
@@ -5399,9 +5517,9 @@ export default function App() {
                       <div className="msg-body">{line.text}</div>
                     </div>
                   );
-                })}
-                <div ref={bottomRef} />
-              </div>
+                }}
+              />
+              )}
               </div>
               {showScrollToBottom && (
                 <button
@@ -5463,29 +5581,22 @@ export default function App() {
                   })}
                 </div>
               )}
-              <textarea
-                ref={textareaRef}
-                value={draft}
-                rows={1}
-                onChange={(e) => {
-                  setDraft(e.target.value);
-                  resizeTextarea();
-                }}
-                onPaste={(e) => {
-                  void onComposerPaste(e);
-                }}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter" && !e.shiftKey) {
-                    e.preventDefault();
-                    void onSend();
-                  }
-                }}
+              <ComposerInput
+                ref={composerRef}
                 disabled={!session || (busy && !pendingPerm)}
                 placeholder={
                   session
                     ? "Describe what this task should do… (paste text or images)"
                     : "Click Tasks + to create a task and start chatting…"
                 }
+                onPaste={(e) => {
+                  void onComposerPaste(e);
+                }}
+                onSubmit={() => {
+                  void onSend();
+                }}
+                onDraftChange={onComposerDraftChange}
+                onDraftSettled={onComposerDraftSettled}
               />
               <div className="composer-bar">
                 <div className="composer-left">
@@ -5498,22 +5609,27 @@ export default function App() {
                   >
                     <IconPaperclip size={16} />
                   </button>
-                  <button
-                    type="button"
-                    className={`access-toggle access-mode-${permissionMode}${
-                      permissionMode === "ask" ? " off" : ""
-                    }`}
-                    onClick={() => cyclePermissionMode()}
+                  <select
+                    className={`composer-select access-select access-mode-${permissionMode}`}
+                    value={permissionMode}
+                    onChange={(e) =>
+                      void setPermissionModeAndSave(
+                        normalizePermissionMode(e.target.value),
+                      )
+                    }
                     title={
                       permissionMode === "always-approve"
-                        ? "Full trust: all tools auto-approved (saved). Click to cycle. New task/reconnect applies."
+                        ? "Full trust: all tools auto-approved (saved). New task/reconnect applies."
                         : permissionMode === "auto"
-                          ? "Auto: engine may auto-allow low-risk tools (saved). Click to cycle. New task/reconnect applies."
-                          : "Needs approval: confirm each tool (saved). Click to cycle → Auto → Full trust."
+                          ? "Auto: engine may auto-allow low-risk tools (saved). New task/reconnect applies."
+                          : "Needs approval: confirm each tool (saved). New task/reconnect applies."
                     }
+                    aria-label="Tool permission mode"
                   >
-                    {permissionModeLabel(permissionMode)}
-                  </button>
+                    <option value="ask">Needs approval</option>
+                    <option value="auto">Auto</option>
+                    <option value="always-approve">Full trust</option>
+                  </select>
                   {session && (
                     <div
                       className={contextMeterClass}
@@ -5593,7 +5709,7 @@ export default function App() {
                       onClick={() => void onSend()}
                       disabled={
                         !session ||
-                        (!draft.trim() && attachments.length === 0)
+                        (!composerHasText && attachments.length === 0)
                       }
                       title="Send"
                     >

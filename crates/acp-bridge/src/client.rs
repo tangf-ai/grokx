@@ -420,6 +420,10 @@ impl AcpClientHandle {
                 }
                 Ok(())
             }
+            Err(BridgeError::Cancelled) => {
+                // cancel() already emitted TurnFinished(Cancelled).
+                Ok(())
+            }
             Err(err @ BridgeError::Timeout) => {
                 // Keep the turn open: the agent may still be running tools.
                 // Surface a warning but do not mark the turn finished.
@@ -448,18 +452,43 @@ impl AcpClientHandle {
         }
     }
 
+    /// Stop the in-flight turn: tell the engine, fail pending RPCs (so
+    /// `session/prompt` unblocks), clear parked permissions, and mark cancelled.
     pub async fn cancel(&self) -> Result<(), BridgeError> {
-        let engine_session_id = match self.engine_session_id().await {
-            Some(id) => id,
-            None => return Ok(()),
-        };
-        let _ = self
-            .request(
-                "session/cancel",
-                json!({ "sessionId": engine_session_id }),
-            )
-            .await;
         let app_session_id = self.app_session_id().await;
+
+        // 1) Unblock any waiter on session/prompt (and other RPCs).
+        {
+            let mut pending = self.shared.pending.lock().await;
+            for (_, p) in pending.drain() {
+                let _ = p.tx.send(Err(BridgeError::Cancelled));
+            }
+        }
+
+        // 2) Drop parked tool-permission waits so we are not stuck on Allow/Deny.
+        {
+            let mut gate = self.shared.permission_gate.lock().await;
+            for id in gate.pending_ids() {
+                let _ = gate.resolve(&id, PermissionDecision::Deny);
+            }
+        }
+
+        // 3) Best-effort engine cancel (short timeout; do not hang the Stop button).
+        if let Some(engine_session_id) = self.engine_session_id().await {
+            let _ = self
+                .request_with_timeout(
+                    "session/cancel",
+                    json!({ "sessionId": engine_session_id }),
+                    Duration::from_secs(3),
+                )
+                .await;
+        }
+
+        // 4) Always surface cancelled to the UI so Working ends immediately.
+        let _ = self.shared.events.send(AppEvent::TurnState {
+            session_id: app_session_id.clone(),
+            state: TurnState::Cancelled,
+        });
         let _ = self
             .shared
             .events
