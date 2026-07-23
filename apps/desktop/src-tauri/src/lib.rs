@@ -393,6 +393,12 @@ async fn send_prompt(core: State<'_, CoreState>, text: String) -> Result<(), Str
     core.0.send_prompt(text).await.map_err(|e| e.to_string())
 }
 
+/// Side chat / `/btw` — does not write to main session transcript.
+#[tauri::command]
+async fn send_btw(core: State<'_, CoreState>, question: String) -> Result<String, String> {
+    core.0.send_btw(question).await.map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 async fn send_prompt_rich(
     core: State<'_, CoreState>,
@@ -1628,6 +1634,7 @@ pub fn run() {
             reconnect_session,
             send_prompt,
             send_prompt_rich,
+            send_btw,
             list_models,
             current_model,
             set_model,

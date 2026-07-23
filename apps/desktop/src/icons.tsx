@@ -241,6 +241,15 @@ export function IconCheck(props: IconProps) {
 }
 
 /** Official GitHub mark (filled) for open-source / repo links. */
+export function IconSideChat(props: IconProps) {
+  return (
+    <Svg {...props}>
+      <path d="M14 3h6a1 1 0 0 1 1 1v12a1 1 0 0 1-1 1h-4l-3 3v-3H9a1 1 0 0 1-1-1V9" />
+      <path d="M4 3h8a1 1 0 0 1 1 1v8a1 1 0 0 1-1 1H8l-3 3v-3H4a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1z" />
+    </Svg>
+  );
+}
+
 export function IconGithub(props: IconProps) {
   return (
     <svg

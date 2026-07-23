@@ -32,6 +32,7 @@ import {
   IconRefresh,
   IconSend,
   IconSettings,
+  IconSideChat,
   IconStop,
   IconTask,
   IconTool,
@@ -49,7 +50,16 @@ import {
   ComposerInput,
   type ComposerInputHandle,
 } from "./components/ComposerInput";
-import { VirtualChatList } from "./components/VirtualChatList";
+import {
+  VirtualChatList,
+  type VirtualChatListHandle,
+} from "./components/VirtualChatList";
+import { StreamReveal } from "./components/StreamReveal";
+import { SessionOutline } from "./components/SessionOutline";
+import {
+  SideChat,
+  type SideChatMessage,
+} from "./components/SideChat";
 
 /** Public open-source repository (opens in the system browser). */
 const GROKX_GITHUB_URL = "https://github.com/tangf-ai/grokx";
@@ -1038,8 +1048,24 @@ export default function App() {
   const [pendingPerm, setPendingPerm] = useState<PendingPermission | null>(null);
   /** Main view: workspace chat vs full settings page. */
   const [view, setView] = useState<"workspace" | "settings">("workspace");
-  /** Right Outputs rail — collapsible to free chat space. */
+  /** Right rail — collapsible; holds Chat (btw) + Outputs tabs. */
   const [outputsOpen, setOutputsOpen] = useState(true);
+  /** Side chat messages per session (not main transcript). */
+  const [sideChatBySession, setSideChatBySession] = useState<
+    Record<string, SideChatMessage[]>
+  >({});
+  /**
+   * Chat-area session outline (user prompts list).
+   * Default collapsed (dots only, centered); expanded = short text list.
+   */
+  const [sessionOutlineCollapsed, setSessionOutlineCollapsed] = useState(() => {
+    try {
+      // Default collapsed; only expand when user explicitly set "0".
+      return localStorage.getItem("grokx.sessionOutlineCollapsed") !== "0";
+    } catch {
+      return true;
+    }
+  });
   /** Left Projects/Tasks rail — collapsible (persisted). */
   const [sidebarOpen, setSidebarOpen] = useState(() => {
     try {
@@ -1068,8 +1094,21 @@ export default function App() {
     startX: number;
     startW: number;
   } | null>(null);
-  /** Right panel tab: overview (approvals/task) vs session files. */
-  const [outputsTab, setOutputsTab] = useState<"overview" | "files">("overview");
+  /**
+   * Right panel tab: Chat (/btw side Q&A) vs Outputs overview/files.
+   * Persisted so reopen lands on last section.
+   */
+  const [outputsTab, setOutputsTab] = useState<
+    "chat" | "overview" | "files"
+  >(() => {
+    try {
+      const raw = localStorage.getItem("grokx.rightTab");
+      if (raw === "chat" || raw === "overview" || raw === "files") return raw;
+    } catch {
+      /* ignore */
+    }
+    return "overview";
+  });
   /** Which root is listed: task cwd vs project folder. */
   const [filesRootKind, setFilesRootKind] = useState<"task" | "project">("task");
   const [filesBrowsePath, setFilesBrowsePath] = useState<string | null>(null);
@@ -1184,7 +1223,10 @@ export default function App() {
   const bottomRef = useRef<HTMLDivElement | null>(null);
   const composerRef = useRef<ComposerInputHandle | null>(null);
   const chatScrollRef = useRef<HTMLDivElement | null>(null);
+  const virtualChatRef = useRef<VirtualChatListHandle | null>(null);
   const userMsgEls = useRef<Map<string, HTMLDivElement>>(new Map());
+  /** Cancel multi-pass jump alignment when a newer jump starts. */
+  const jumpAlignGenRef = useRef(0);
   /** Wall-clock start of the in-flight agent turn (for duration on collapse). */
   const turnStartedAtRef = useRef<number | null>(null);
   /**
@@ -2104,6 +2146,32 @@ export default function App() {
     return null;
   }, [lines]);
 
+  /** Every user prompt in this session — for the right-edge outline rail. */
+  const sessionOutlineEntries = useMemo(
+    () =>
+      lines
+        .filter(
+          (l): l is Extract<ChatLine, { kind: "user" }> => l.kind === "user",
+        )
+        .map((l) => ({ id: l.id, text: l.text, at: l.at })),
+    [lines],
+  );
+
+  const toggleSessionOutline = useCallback(() => {
+    setSessionOutlineCollapsed((v) => {
+      const next = !v;
+      try {
+        localStorage.setItem(
+          "grokx.sessionOutlineCollapsed",
+          next ? "1" : "0",
+        );
+      } catch {
+        /* ignore */
+      }
+      return next;
+    });
+  }, []);
+
   const distanceFromBottom = useCallback((el: HTMLElement) => {
     return el.scrollHeight - el.scrollTop - el.clientHeight;
   }, []);
@@ -2451,44 +2519,89 @@ export default function App() {
       setStickyUserId(null);
       setHighlightUserId(id);
 
-      const topPad = 20;
-      // If the row is virtualized out of the DOM, jump via estimated prefix height first.
-      if (!userMsgEls.current.get(id)) {
-        let approx = 0;
-        for (const line of linesRef.current) {
-          if (line.id === id) break;
-          approx += estimateChatLineHeight(line);
-        }
-        lastProgrammaticScrollRef.current = performance.now() + 500;
-        scroller.scrollTop = Math.max(0, approx - topPad);
-      }
+      // Small inset so the user bubble isn't flush against the top edge.
+      const topPad = 16;
+      const gen = ++jumpAlignGenRef.current;
 
-      const alignToUser = () => {
+      /**
+       * Prefer measured prefix from VirtualChatList (accounts for real markdown
+       * heights). Fall back to estimateChatLineHeight only if the list handle
+       * is missing or the id is unknown.
+       */
+      const scrollByOffset = () => {
+        const root = chatScrollRef.current;
+        if (!root || jumpAlignGenRef.current !== gen) return;
+        const fromList = virtualChatRef.current?.offsetOf(id);
+        let offset: number;
+        if (fromList != null) {
+          offset = fromList;
+        } else {
+          let approx = 0;
+          for (const line of linesRef.current) {
+            if (line.id === id) break;
+            approx += estimateChatLineHeight(line);
+          }
+          offset = approx;
+        }
+        lastProgrammaticScrollRef.current = performance.now() + 800;
+        root.scrollTop = Math.max(0, offset - topPad);
+      };
+
+      /** Once the row is mounted, pin by getBoundingClientRect (true layout). */
+      const alignToUser = (): boolean => {
+        if (jumpAlignGenRef.current !== gen) return true;
         const target = userMsgEls.current.get(id);
         const root = chatScrollRef.current;
-        if (!target || !root) return;
+        if (!target || !root) return false;
         const rootRect = root.getBoundingClientRect();
         const targetRect = target.getBoundingClientRect();
         const nextTop =
           root.scrollTop + (targetRect.top - rootRect.top) - topPad;
-        // Instant jump — one click must land correctly (smooth was easy to cancel).
-        lastProgrammaticScrollRef.current = performance.now() + 500;
-        root.scrollTop = Math.max(0, nextTop);
+        // Only nudge when meaningfully off — avoids jitter from subpixel noise.
+        if (Math.abs(root.scrollTop - nextTop) > 1) {
+          lastProgrammaticScrollRef.current = performance.now() + 800;
+          root.scrollTop = Math.max(0, nextTop);
+        }
+        return true;
       };
 
-      // Scroll immediately on click (sticky is overlay — no layout shift).
-      alignToUser();
-      // Corrections after virtual window remounts the target row.
-      requestAnimationFrame(() => alignToUser());
-      window.setTimeout(alignToUser, 50);
+      // If the row is already mounted, pin by layout immediately — do not
+      // first apply a coarse offset (estimates can yank away from the truth).
+      const alreadyMounted = Boolean(userMsgEls.current.get(id));
+      if (alreadyMounted) {
+        alignToUser();
+      } else {
+        // Coarse jump so the virtual window mounts the target row.
+        scrollByOffset();
+      }
+
+      // Multi-pass fine alignment while virtual topPad / RO measurements settle.
+      const delays = alreadyMounted
+        ? [0, 16, 48, 120]
+        : [0, 16, 32, 64, 120, 220, 400];
+      for (const ms of delays) {
+        window.setTimeout(() => {
+          if (jumpAlignGenRef.current !== gen) return;
+          if (!alignToUser()) {
+            // Still not mounted — re-apply measured offset (may have updated).
+            scrollByOffset();
+            requestAnimationFrame(() => {
+              if (jumpAlignGenRef.current !== gen) return;
+              if (!alignToUser()) scrollByOffset();
+            });
+          }
+        }, ms);
+      }
 
       window.setTimeout(() => {
+        if (jumpAlignGenRef.current !== gen) return;
         setHighlightUserId((cur) => (cur === id ? null : cur));
       }, 1600);
       window.setTimeout(() => {
+        if (jumpAlignGenRef.current !== gen) return;
         updateStickyUser();
         updateScrollToBottomVisible();
-      }, 200);
+      }, 240);
     },
     [updateStickyUser, updateScrollToBottomVisible, disableAutoScroll],
   );
@@ -4924,6 +5037,52 @@ export default function App() {
     });
   }, []);
 
+  const setRightTab = useCallback((tab: "chat" | "overview" | "files") => {
+    setOutputsTab(tab);
+    try {
+      localStorage.setItem("grokx.rightTab", tab);
+    } catch {
+      /* ignore */
+    }
+  }, []);
+
+  /** Open right rail on Chat tab (or toggle closed if already on Chat). */
+  const openRightChat = useCallback(() => {
+    if (outputsOpen && outputsTab === "chat") {
+      setOutputsOpen(false);
+      return;
+    }
+    setRightTab("chat");
+    setOutputsOpen(true);
+  }, [outputsOpen, outputsTab, setRightTab]);
+
+  /** Open right rail on Outputs (overview), or collapse if already showing outputs. */
+  const openRightOutputs = useCallback(() => {
+    if (outputsOpen && (outputsTab === "overview" || outputsTab === "files")) {
+      setOutputsOpen(false);
+      return;
+    }
+    if (outputsTab === "chat") setRightTab("overview");
+    setOutputsOpen(true);
+  }, [outputsOpen, outputsTab, setRightTab]);
+
+  const sideChatSessionId = session?.session_id ?? null;
+  const sideChatMessages = sideChatSessionId
+    ? (sideChatBySession[sideChatSessionId] ?? [])
+    : [];
+
+  const updateSideChatMessages = useCallback(
+    (updater: (prev: SideChatMessage[]) => SideChatMessage[]) => {
+      const sid = sessionIdRef.current;
+      if (!sid) return;
+      setSideChatBySession((map) => {
+        const prev = map[sid] ?? [];
+        return { ...map, [sid]: updater(prev) };
+      });
+    },
+    [],
+  );
+
   return (
     <div
       className={`layout${outputsOpen ? "" : " layout-outputs-collapsed"}${
@@ -6044,11 +6203,33 @@ export default function App() {
                 </button>
                 <button
                   type="button"
-                  className="icon-btn topbar-outputs-toggle"
-                  title={outputsOpen ? "Hide outputs panel" : "Show outputs panel"}
-                  onClick={() => setOutputsOpen((v) => !v)}
+                  className={`icon-btn topbar-side-chat-toggle${
+                    outputsOpen && outputsTab === "chat" ? " is-active" : ""
+                  }`}
+                  title={
+                    outputsOpen && outputsTab === "chat"
+                      ? "Hide side chat"
+                      : "Side chat (does not add to main context)"
+                  }
+                  aria-pressed={outputsOpen && outputsTab === "chat"}
+                  onClick={openRightChat}
                 >
-                  {outputsOpen ? (
+                  <IconSideChat size={16} />
+                </button>
+                <button
+                  type="button"
+                  className={`icon-btn topbar-outputs-toggle${
+                    outputsOpen && outputsTab !== "chat" ? " is-active" : ""
+                  }`}
+                  title={
+                    outputsOpen && outputsTab !== "chat"
+                      ? "Hide outputs panel"
+                      : "Show outputs panel"
+                  }
+                  aria-pressed={outputsOpen && outputsTab !== "chat"}
+                  onClick={openRightOutputs}
+                >
+                  {outputsOpen && outputsTab !== "chat" ? (
                     <IconChevronRight size={16} />
                   ) : (
                     <IconChevronLeft size={16} />
@@ -6057,7 +6238,15 @@ export default function App() {
               </div>
             </header>
 
-            <div className="chat-pane">
+            <div
+              className={`chat-pane${
+                sessionOutlineEntries.length > 0
+                  ? sessionOutlineCollapsed
+                    ? " has-outline-collapsed"
+                    : " has-outline"
+                  : ""
+              }`}
+            >
               {/* Overlay (not in scroll flow) so show/hide never changes scrollHeight. */}
               {stickyUserId && stickyUserText != null && (
                 <button
@@ -6071,6 +6260,13 @@ export default function App() {
                   <span className="user-sticky-jump">Jump ↑</span>
                 </button>
               )}
+              <SessionOutline
+                entries={sessionOutlineEntries}
+                activeId={highlightUserId || stickyUserId}
+                collapsed={sessionOutlineCollapsed}
+                onToggleCollapsed={toggleSessionOutline}
+                onJump={jumpToUserMessage}
+              />
               <div className="chat-scroll" ref={chatScrollRef}>
               {lines.length === 0 ? (
                 <div className="chat-inner">
@@ -6087,6 +6283,7 @@ export default function App() {
                 </div>
               ) : (
               <VirtualChatList
+                ref={virtualChatRef}
                 className="chat-inner"
                 items={virtualChatItems}
                 scrollerRef={chatScrollRef}
@@ -6216,13 +6413,35 @@ export default function App() {
                       copiedMsg.format === "plain";
                     return (
                       <div key={line.id} className="msg msg-assistant">
-                        <div className="msg-assistant-wrap">
+                        <div
+                          className={`msg-assistant-wrap${
+                            streaming ? " is-streaming" : ""
+                          }`}
+                        >
+                          {streaming && (
+                            <div className="stream-sparkles" aria-hidden>
+                              {Array.from({ length: 14 }, (_, k) => (
+                                <span
+                                  key={k}
+                                  className="stream-sparkle"
+                                  style={
+                                    {
+                                      ["--i" as string]: k,
+                                    } as CSSProperties
+                                  }
+                                />
+                              ))}
+                            </div>
+                          )}
                           <div className="msg-body md-body">
                             <ChatMarkdown mediaBases={chatMediaBases}>
                               {line.text}
                             </ChatMarkdown>
                             {streaming && (
-                              <span className="stream-caret" aria-hidden />
+                              <>
+                                <StreamReveal text={line.text} active />
+                                <span className="stream-caret" aria-hidden />
+                              </>
                             )}
                           </div>
                           {canCopy && (
@@ -6905,16 +7124,36 @@ export default function App() {
                 title="Drag to resize outputs"
                 onMouseDown={(e) => onPanelResizeStart("right", e)}
               />
-              <aside className="right">
+              <aside
+                className={`right${
+                  outputsTab === "chat" ? " right-chat-mode" : ""
+                }`}
+              >
               <div
                 className="right-header"
                 onMouseDown={onTitlebarMouseDown}
                 onDoubleClick={onTitlebarDoubleClick}
               >
-                <h2>Outputs</h2>
+                <h2>{outputsTab === "chat" ? "Side chat" : "Outputs"}</h2>
               </div>
 
-              <div className="outputs-tabs" role="tablist" aria-label="Outputs">
+              <div
+                className="outputs-tabs"
+                role="tablist"
+                aria-label="Right panel"
+              >
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={outputsTab === "chat"}
+                  className={`outputs-tab${
+                    outputsTab === "chat" ? " active" : ""
+                  }`}
+                  onClick={() => setRightTab("chat")}
+                  title="Side chat — does not add to main context"
+                >
+                  Chat
+                </button>
                 <button
                   type="button"
                   role="tab"
@@ -6922,7 +7161,7 @@ export default function App() {
                   className={`outputs-tab${
                     outputsTab === "overview" ? " active" : ""
                   }`}
-                  onClick={() => setOutputsTab("overview")}
+                  onClick={() => setRightTab("overview")}
                 >
                   Overview
                 </button>
@@ -6933,12 +7172,22 @@ export default function App() {
                   className={`outputs-tab${
                     outputsTab === "files" ? " active" : ""
                   }`}
-                  onClick={() => setOutputsTab("files")}
+                  onClick={() => setRightTab("files")}
                   title="Browse this task's workspace and project files"
                 >
                   Files
                 </button>
               </div>
+
+              {outputsTab === "chat" && (
+                <SideChat
+                  sessionId={sideChatSessionId}
+                  connected={connected}
+                  messages={sideChatMessages}
+                  onMessagesChange={updateSideChatMessages}
+                  active={outputsTab === "chat"}
+                />
+              )}
 
               {error && !session && outputsTab === "overview" && (
                 <div className="error-banner" style={{ marginBottom: 12 }}>

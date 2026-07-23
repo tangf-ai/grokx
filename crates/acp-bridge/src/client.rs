@@ -25,6 +25,8 @@ use crate::BridgeError;
 
 /// Default timeout for short ACP RPCs (initialize, set_model, cancel, …).
 const DEFAULT_RPC_TIMEOUT: Duration = Duration::from_secs(120);
+/// Side questions (`x.ai/btw`) are tool-free but still model-bound.
+const BTW_RPC_TIMEOUT: Duration = Duration::from_secs(300);
 /// `session/prompt` can run tools for a long time; do not treat that as a failed turn.
 const PROMPT_RPC_TIMEOUT: Duration = Duration::from_secs(60 * 60 * 6);
 
@@ -323,6 +325,38 @@ impl AcpClientHandle {
         self.shared.current_model.lock().await.clone()
     }
 
+    /// Ask a side question via Grok Build `/btw` (`x.ai/btw` ext method).
+    ///
+    /// Does **not** enqueue a main-session turn, does **not** mutate the
+    /// conversation transcript, and does **not** require `turn_busy` free.
+    /// The engine snapshots the current conversation read-only.
+    pub async fn send_btw(&self, question: &str) -> Result<String, BridgeError> {
+        let question = question.trim();
+        if question.is_empty() {
+            return Err(BridgeError::Message("empty side question".into()));
+        }
+        let engine_session_id = self
+            .engine_session_id()
+            .await
+            .ok_or_else(|| BridgeError::Message("no engine session".into()))?;
+
+        // ACP routes custom methods by a leading `_` on the JSON-RPC method
+        // name (not a nested `ext_method` envelope). The agent strips `_` and
+        // dispatches `x.ai/btw`. Params are the ExtRequest body only.
+        let result = self
+            .request_with_timeout(
+                "_x.ai/btw",
+                json!({
+                    "sessionId": engine_session_id,
+                    "question": question,
+                }),
+                BTW_RPC_TIMEOUT,
+            )
+            .await?;
+
+        parse_btw_answer(&result)
+    }
+
     /// Best-effort model switch for the live session.
     pub async fn set_model(&self, model_id: &str) -> Result<(), BridgeError> {
         let engine_session_id = self
@@ -578,6 +612,45 @@ impl AcpClientHandle {
         stdin.write_all(&line).await?;
         stdin.flush().await?;
         Ok(())
+    }
+}
+
+/// Extract answer text from an `x.ai/btw` ExtResponse / ExtMethodResult payload.
+///
+/// Engine wraps via `ExtMethodResult { result: { answer }, error }` so the
+/// JSON-RPC `result` we receive is typically:
+/// `{ "result": { "answer": "..." } }`.
+/// Also accept a bare `{ "answer": "..." }` for resilience.
+fn parse_btw_answer(result: &Value) -> Result<String, BridgeError> {
+    if let Some(err) = result.get("error").filter(|e| !e.is_null()) {
+        let msg = err
+            .as_str()
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| err.to_string());
+        if !msg.is_empty() {
+            return Err(BridgeError::Message(format!("side question failed: {msg}")));
+        }
+    }
+
+    let answer = result
+        .pointer("/result/answer")
+        .or_else(|| result.get("answer"))
+        .or_else(|| result.pointer("/result/result/answer"))
+        .and_then(|a| a.as_str())
+        .map(|s| s.to_string());
+
+    match answer {
+        Some(s) if !s.is_empty() => Ok(s),
+        Some(_) => Ok("No response".into()),
+        None => {
+            // Last resort: if the whole payload is a plain string.
+            if let Some(s) = result.as_str() {
+                return Ok(s.to_string());
+            }
+            Err(BridgeError::Message(format!(
+                "side question returned no answer: {result}"
+            )))
+        }
     }
 }
 
@@ -844,5 +917,24 @@ mod tests {
         assert_eq!(parse_id(Some(&json!(3))), Some(3));
         assert_eq!(parse_id(Some(&json!("12"))), Some(12));
         assert_eq!(parse_id(Some(&json!(null))), None);
+    }
+
+    #[test]
+    fn parse_btw_answer_from_ext_method_result() {
+        let v = json!({ "result": { "answer": "hello side" } });
+        assert_eq!(parse_btw_answer(&v).unwrap(), "hello side");
+    }
+
+    #[test]
+    fn parse_btw_answer_bare() {
+        let v = json!({ "answer": "plain" });
+        assert_eq!(parse_btw_answer(&v).unwrap(), "plain");
+    }
+
+    #[test]
+    fn parse_btw_answer_error_field() {
+        let v = json!({ "result": null, "error": "boom" });
+        let err = parse_btw_answer(&v).unwrap_err().to_string();
+        assert!(err.contains("boom"), "{err}");
     }
 }

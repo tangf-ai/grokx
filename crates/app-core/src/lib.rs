@@ -1278,6 +1278,32 @@ impl AppCore {
         Ok(app_session_id)
     }
 
+    /// Side question (`/btw` / `x.ai/btw`) on the active session.
+    ///
+    /// Does not set `turn_busy`, does not emit main-chat UserMessage/deltas,
+    /// and may run while a main turn is in progress.
+    pub async fn send_btw(&self, question: String) -> Result<String, CoreError> {
+        let question = question.trim().to_string();
+        if question.is_empty() {
+            return Err(CoreError::Message("empty side question".into()));
+        }
+        let handle = {
+            let live = self.live.lock().await;
+            let sid = self
+                .active_session
+                .read()
+                .await
+                .clone()
+                .ok_or(CoreError::NotConnected)?;
+            let agent = live.get(&sid).ok_or(CoreError::NotConnected)?;
+            agent.handle.clone()
+        };
+        handle
+            .send_btw(&question)
+            .await
+            .map_err(CoreError::from)
+    }
+
     /// Send a user prompt on the active session.
     pub async fn send_prompt(self: &Arc<Self>, text: String) -> Result<(), CoreError> {
         self.send_prompt_request(PromptRequest {

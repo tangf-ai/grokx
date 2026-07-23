@@ -67,6 +67,7 @@ button {
     var(--right-w, 300px);
   height: 100%;
   background: var(--bg);
+  position: relative;
 }
 
 /* Collapsed: no right rail at all (toggle lives in topbar far right). */
@@ -1000,6 +1001,286 @@ button.status-pill:disabled {
   flex-direction: column;
 }
 
+/* Reserve a slim strip so expanded outline doesn't cover message text. */
+.chat-pane.has-outline .chat-scroll {
+  padding-right: 168px;
+}
+
+.chat-pane.has-outline-collapsed .chat-scroll {
+  padding-right: 28px;
+}
+
+/* Right-edge list of user prompts (outline / minimap). */
+.session-outline {
+  position: absolute;
+  top: 0;
+  right: 8px;
+  bottom: 0;
+  z-index: 4;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 148px;
+  pointer-events: none;
+}
+
+/* Collapsed: thin vertical strip, whole rail centered in chat height. */
+.session-outline.is-collapsed {
+  width: 20px;
+  right: 4px;
+}
+
+.session-outline-rail {
+  pointer-events: none;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: calc(100% - 40px);
+  width: 100%;
+}
+
+.session-outline.is-collapsed .session-outline-rail {
+  width: auto;
+  align-items: center;
+  gap: 8px;
+}
+
+.session-outline-toggle {
+  pointer-events: auto;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0;
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.92);
+  box-shadow: var(--shadow-sm);
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.2;
+  cursor: pointer;
+  backdrop-filter: blur(8px);
+}
+
+.session-outline.is-collapsed .session-outline-toggle {
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  justify-content: center;
+  border-radius: 50%;
+  opacity: 0.55;
+}
+
+.session-outline.is-collapsed .session-outline-toggle:hover {
+  opacity: 1;
+}
+
+.session-outline-toggle:hover {
+  color: var(--text);
+  border-color: #d0d0d6;
+  background: #fff;
+}
+
+.session-outline-toggle-icon {
+  font-size: 12px;
+  line-height: 1;
+  color: var(--muted-2);
+}
+
+.session-outline-toggle-label {
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.session-outline-list {
+  pointer-events: auto;
+  flex: 1;
+  min-height: 0;
+  overflow-x: visible;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 2px 0 4px;
+  scrollbar-width: thin;
+}
+
+.session-outline.is-collapsed .session-outline-list {
+  flex: 0 1 auto;
+  align-items: center;
+  gap: 9px;
+  padding: 0;
+  overflow: visible;
+}
+
+.session-outline-item {
+  position: relative;
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  width: 100%;
+  margin: 0;
+  padding: 6px 8px;
+  border: 1px solid transparent;
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.72);
+  color: var(--text);
+  text-align: left;
+  cursor: pointer;
+  transition:
+    background 0.12s ease,
+    border-color 0.12s ease,
+    box-shadow 0.12s ease;
+}
+
+.session-outline.is-collapsed .session-outline-item {
+  width: 14px;
+  height: 14px;
+  padding: 0;
+  border: none;
+  background: transparent;
+  border-radius: 0;
+  align-items: center;
+  justify-content: center;
+}
+
+.session-outline-item:hover {
+  background: #fff;
+  border-color: var(--border);
+  box-shadow: var(--shadow-sm);
+}
+
+.session-outline.is-collapsed .session-outline-item:hover,
+.session-outline.is-collapsed .session-outline-item.is-hover {
+  background: transparent;
+  border-color: transparent;
+  box-shadow: none;
+}
+
+.session-outline-item.is-active {
+  background: var(--accent-soft);
+  border-color: rgba(255, 90, 31, 0.28);
+}
+
+.session-outline.is-collapsed .session-outline-item.is-active {
+  background: transparent;
+  border-color: transparent;
+}
+
+.session-outline-dot {
+  flex-shrink: 0;
+  width: 7px;
+  height: 7px;
+  margin-top: 5px;
+  border-radius: 50%;
+  background: #c7c7cc;
+  box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.9);
+  transition:
+    background 0.12s ease,
+    box-shadow 0.12s ease,
+    transform 0.12s ease;
+}
+
+.session-outline.is-collapsed .session-outline-dot {
+  margin-top: 0;
+  width: 7px;
+  height: 7px;
+}
+
+.session-outline-item:hover .session-outline-dot,
+.session-outline-item.is-hover .session-outline-dot,
+.session-outline-item.is-active .session-outline-dot {
+  background: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+.session-outline.is-collapsed .session-outline-item:hover .session-outline-dot,
+.session-outline.is-collapsed .session-outline-item.is-hover .session-outline-dot {
+  transform: scale(1.25);
+}
+
+/* Hover preview bubble (collapsed mode) — left of the dot. */
+.session-outline-tip {
+  position: absolute;
+  right: calc(100% + 10px);
+  top: 50%;
+  transform: translateY(-50%);
+  z-index: 8;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  width: max-content;
+  max-width: min(280px, 42vw);
+  padding: 8px 11px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.98);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.1);
+  pointer-events: none;
+  text-align: left;
+  white-space: normal;
+}
+
+.session-outline-tip-meta {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  color: var(--accent);
+  line-height: 1.2;
+}
+
+.session-outline-tip-body {
+  font-size: 12px;
+  line-height: 1.4;
+  color: var(--text);
+  display: -webkit-box;
+  -webkit-line-clamp: 4;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  word-break: break-word;
+}
+
+.session-outline-text {
+  min-width: 0;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.session-outline-index {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  color: var(--muted-2);
+  line-height: 1.2;
+}
+
+.session-outline-item.is-active .session-outline-index {
+  color: var(--accent);
+}
+
+.session-outline-preview {
+  font-size: 11.5px;
+  line-height: 1.35;
+  color: var(--muted);
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  word-break: break-word;
+}
+
+.session-outline-item:hover .session-outline-preview,
+.session-outline-item.is-active .session-outline-preview {
+  color: var(--text);
+}
+
 /* Sit just above the floating composer (not on top of it). */
 .scroll-to-bottom-btn {
   position: absolute;
@@ -1087,6 +1368,15 @@ button.status-pill:disabled {
   text-align: right;
   color: var(--text);
   pointer-events: auto;
+}
+
+/* Keep sticky clear of the session outline rail. */
+.chat-pane.has-outline .user-sticky-bar {
+  right: 168px;
+}
+
+.chat-pane.has-outline-collapsed .user-sticky-bar {
+  right: 28px;
 }
 
 .user-sticky-bar:hover {
@@ -1698,6 +1988,161 @@ button.msg-user-file-chip:hover {
 @keyframes caret-blink {
   50% {
     opacity: 0;
+  }
+}
+
+/* Rainbow confetti while assistant is streaming */
+.msg-assistant-wrap {
+  position: relative;
+}
+
+.msg-assistant-wrap.is-streaming .msg-body {
+  /* Soft rainbow shimmer on the text edge while generating */
+  background-image: linear-gradient(
+    100deg,
+    transparent 0%,
+    transparent 40%,
+    rgba(255, 90, 31, 0.04) 50%,
+    transparent 60%,
+    transparent 100%
+  );
+  background-size: 220% 100%;
+  animation: stream-shimmer 2.4s ease-in-out infinite;
+}
+
+@keyframes stream-shimmer {
+  0% {
+    background-position: 100% 0;
+  }
+  100% {
+    background-position: -100% 0;
+  }
+}
+
+.stream-sparkles {
+  pointer-events: none;
+  position: absolute;
+  inset: -8px 0 0 0;
+  overflow: hidden;
+  z-index: 1;
+  border-radius: 8px;
+}
+
+.stream-sparkle {
+  position: absolute;
+  top: -12px;
+  left: calc(6% + (var(--i) * 7.5%));
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  opacity: 0;
+  background: hsl(calc(var(--i) * 30), 90%, 58%);
+  box-shadow:
+    0 0 6px hsl(calc(var(--i) * 30), 95%, 62%),
+    0 0 1px rgba(255, 255, 255, 0.8);
+  animation: stream-sparkle-fall 2.1s linear infinite;
+  animation-delay: calc(var(--i) * -0.17s);
+}
+
+.stream-sparkle:nth-child(3n) {
+  width: 3px;
+  height: 3px;
+  border-radius: 1px;
+  transform: rotate(45deg);
+}
+
+.stream-sparkle:nth-child(4n) {
+  width: 6px;
+  height: 3px;
+  border-radius: 2px;
+}
+
+@keyframes stream-sparkle-fall {
+  0% {
+    opacity: 0;
+    transform: translate3d(0, -8px, 0) rotate(0deg) scale(0.6);
+  }
+  12% {
+    opacity: 0.95;
+  }
+  55% {
+    opacity: 0.75;
+    transform: translate3d(calc((var(--i) % 3 - 1) * 10px), 55px, 0)
+      rotate(120deg) scale(0.9);
+  }
+  100% {
+    opacity: 0;
+    transform: translate3d(calc((var(--i) % 5 - 2) * 8px), 110px, 0)
+      rotate(220deg) scale(0.35);
+  }
+}
+
+/* Live glyphs that “drop in” as each stream delta arrives (near caret) */
+.stream-reveal {
+  display: inline-block;
+  position: relative;
+  width: 0;
+  height: 0;
+  vertical-align: text-bottom;
+  overflow: visible;
+}
+
+.stream-reveal-burst {
+  position: absolute;
+  left: 0;
+  bottom: 0;
+  display: inline-flex;
+  pointer-events: none;
+  white-space: nowrap;
+}
+
+.stream-reveal-char {
+  display: inline-block;
+  margin-left: 1px;
+  font-size: 13px;
+  font-weight: 700;
+  line-height: 1;
+  color: hsl(calc(var(--i) * 36), 92%, 52%);
+  text-shadow:
+    0 0 8px hsl(calc(var(--i) * 36), 95%, 62%),
+    0 1px 0 rgba(255, 255, 255, 0.55);
+  opacity: 0;
+  animation: stream-reveal-drop 0.68s cubic-bezier(0.2, 0.85, 0.25, 1) both;
+  animation-delay: calc(var(--i) * 28ms);
+  will-change: transform, opacity;
+}
+
+@keyframes stream-reveal-drop {
+  0% {
+    opacity: 0;
+    transform: translate3d(0, -18px, 0) scale(1.35) rotate(-12deg);
+    filter: blur(1.5px) saturate(1.4);
+  }
+  35% {
+    opacity: 1;
+    filter: blur(0) saturate(1.2);
+  }
+  70% {
+    opacity: 0.95;
+    transform: translate3d(0, 1px, 0) scale(1.05) rotate(2deg);
+  }
+  100% {
+    opacity: 0;
+    transform: translate3d(0, 10px, 0) scale(0.75) rotate(8deg);
+    filter: blur(0.5px) saturate(1);
+  }
+}
+
+/* Prefer reduced motion: no confetti / shimmer / reveal */
+@media (prefers-reduced-motion: reduce) {
+  .msg-assistant-wrap.is-streaming .msg-body {
+    animation: none;
+    background-image: none;
+  }
+
+  .stream-sparkles,
+  .stream-reveal {
+    display: none !important;
   }
 }
 
@@ -2604,6 +3049,262 @@ button.msg-user-file-chip:hover {
 
 .send-btn.stop {
   background: var(--accent);
+}
+
+/* ─── Side chat embedded in right rail (Chat tab) ─── */
+.right.right-chat-mode {
+  display: flex;
+  flex-direction: column;
+  padding-bottom: 0;
+  overflow: hidden;
+}
+
+.right.right-chat-mode .outputs-tabs {
+  flex-shrink: 0;
+}
+
+.side-chat.side-chat-embedded {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  margin: 0 -4px;
+  background: transparent;
+  border: none;
+  border-radius: 0;
+  box-shadow: none;
+  overflow: hidden;
+}
+
+.side-chat-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-shrink: 0;
+  padding: 4px 4px 8px;
+}
+
+.side-chat-toolbar-hint {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--muted-2);
+  letter-spacing: 0.01em;
+}
+
+.side-chat-toolbar .icon-btn {
+  width: 28px;
+  height: 28px;
+  color: var(--muted);
+}
+
+.side-chat-body {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 4px 4px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.side-chat-empty {
+  margin: auto 0;
+  padding: 8px 4px;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.5;
+  text-align: center;
+}
+
+.side-chat-empty p {
+  margin: 0 0 8px;
+}
+
+.side-chat-empty-hint {
+  font-size: 12px;
+  color: var(--muted-2);
+}
+
+.side-chat-empty code {
+  font-size: 0.92em;
+}
+
+.side-chat-msg {
+  display: flex;
+  max-width: 100%;
+}
+
+.side-chat-msg-user {
+  justify-content: flex-end;
+}
+
+.side-chat-msg-assistant {
+  justify-content: flex-start;
+}
+
+.side-chat-bubble {
+  max-width: 96%;
+  padding: 9px 12px;
+  border-radius: 14px;
+  font-size: 13px;
+  line-height: 1.45;
+  word-break: break-word;
+}
+
+.side-chat-msg-user .side-chat-bubble {
+  background: var(--user-bubble);
+  color: var(--text);
+  border-radius: 14px 14px 4px 14px;
+  white-space: pre-wrap;
+}
+
+.side-chat-msg-assistant .side-chat-bubble {
+  background: #f7f7f8;
+  border: 1px solid var(--border-soft);
+  color: var(--text);
+  border-radius: 14px 14px 14px 4px;
+  /* Markdown owns whitespace; don't force pre-wrap on the bubble. */
+  white-space: normal;
+}
+
+.side-chat-msg.is-pending .side-chat-bubble {
+  color: var(--muted);
+  font-style: italic;
+}
+
+.side-chat-msg.is-error .side-chat-bubble {
+  background: var(--error-bg);
+  border-color: rgba(215, 0, 21, 0.2);
+  color: var(--error);
+  white-space: pre-wrap;
+}
+
+.side-chat-md {
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.side-chat-md > :first-child {
+  margin-top: 0 !important;
+}
+
+.side-chat-md > :last-child {
+  margin-bottom: 0 !important;
+}
+
+.side-chat-md p {
+  margin: 0.35em 0;
+}
+
+.side-chat-md pre {
+  margin: 0.45em 0;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: rgba(0, 0, 0, 0.04);
+  overflow-x: auto;
+  font-size: 12px;
+}
+
+.side-chat-md code {
+  font-size: 0.9em;
+}
+
+.side-chat-md pre code {
+  font-size: 12px;
+}
+
+.side-chat-md ul,
+.side-chat-md ol {
+  margin: 0.35em 0;
+  padding-left: 1.25em;
+}
+
+.side-chat-md table {
+  display: block;
+  max-width: 100%;
+  overflow-x: auto;
+  font-size: 12px;
+  border-collapse: collapse;
+}
+
+.side-chat-md th,
+.side-chat-md td {
+  border: 1px solid var(--border);
+  padding: 4px 8px;
+}
+
+.side-chat-thinking {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.side-chat-msg.is-streaming .side-chat-bubble {
+  font-style: normal;
+  color: var(--text);
+}
+
+.side-chat-composer {
+  flex-shrink: 0;
+  padding: 10px 4px 14px;
+  border-top: 1px solid var(--border-soft);
+  background: transparent;
+}
+
+.side-chat-composer-hint {
+  margin: 0 0 8px;
+  font-size: 11px;
+  color: var(--muted-2);
+}
+
+.side-chat-input {
+  width: 100%;
+  resize: none;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 10px 12px;
+  background: #fff;
+  color: var(--text);
+  outline: none;
+  min-height: 56px;
+  max-height: 140px;
+  line-height: 1.4;
+}
+
+.side-chat-input:focus {
+  border-color: #d0d0d6;
+  box-shadow: 0 0 0 3px rgba(0, 0, 0, 0.04);
+}
+
+.side-chat-input:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.side-chat-composer-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.side-chat-composer-meta {
+  font-size: 11px;
+  color: var(--muted-2);
+  font-weight: 500;
+}
+
+.side-chat-composer-row .send-btn {
+  width: 32px;
+  height: 32px;
+}
+
+.topbar-side-chat-toggle.is-active,
+.topbar-outputs-toggle.is-active {
+  color: var(--accent);
+  background: var(--accent-soft);
 }
 
 /* ─── Right rail ─── */
@@ -3549,5 +4250,59 @@ code {
   /* Keep toggle visible so user can re-open when viewport grows again */
   .topbar-outputs-toggle {
     display: grid;
+  }
+
+  /* Narrow chat: keep outline as centered dots only. */
+  .session-outline:not(.is-collapsed) {
+    width: 20px;
+    right: 4px;
+  }
+
+  .session-outline:not(.is-collapsed) .session-outline-rail {
+    width: auto;
+    align-items: center;
+  }
+
+  .session-outline:not(.is-collapsed) .session-outline-toggle {
+    width: 18px;
+    height: 18px;
+    padding: 0;
+    justify-content: center;
+    border-radius: 50%;
+  }
+
+  .session-outline:not(.is-collapsed) .session-outline-toggle-label,
+  .session-outline:not(.is-collapsed) .session-outline-text {
+    display: none;
+  }
+
+  .session-outline:not(.is-collapsed) .session-outline-list {
+    align-items: center;
+    gap: 9px;
+    overflow: visible;
+  }
+
+  .session-outline:not(.is-collapsed) .session-outline-item {
+    width: 14px;
+    height: 14px;
+    padding: 0;
+    border: none;
+    background: transparent;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .session-outline:not(.is-collapsed) .session-outline-dot {
+    margin-top: 0;
+    width: 7px;
+    height: 7px;
+  }
+
+  .chat-pane.has-outline .chat-scroll {
+    padding-right: 28px;
+  }
+
+  .chat-pane.has-outline .user-sticky-bar {
+    right: 28px;
   }
 }

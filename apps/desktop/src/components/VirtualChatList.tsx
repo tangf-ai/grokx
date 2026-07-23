@@ -4,9 +4,11 @@
  * always reach the true bottom (and jump-to-bottom works).
  */
 import {
+  forwardRef,
   memo,
   useCallback,
   useEffect,
+  useImperativeHandle,
   useLayoutEffect,
   useMemo,
   useRef,
@@ -20,6 +22,17 @@ export type VirtualItem = {
   id: string;
   /** Rough height hint (px) until measured. */
   estimateHeight: number;
+};
+
+/** Imperative helpers for accurate jump-to-row (uses measured heights). */
+export type VirtualChatListHandle = {
+  /**
+   * Pixel offset of the top of `id` from the top of the list content
+   * (sum of heights of preceding rows; measured when available).
+   */
+  offsetOf: (id: string) => number | null;
+  /** Height used for a row (measured or estimate). */
+  heightOf: (id: string) => number | null;
 };
 
 type Props<T extends VirtualItem> = {
@@ -121,14 +134,17 @@ function computeWindow(
   return { start, end, topPad, bottomPad };
 }
 
-function VirtualChatListInner<T extends VirtualItem>({
-  items,
-  scrollerRef,
-  overscanPx = 1200,
-  renderItem,
-  footer,
-  className,
-}: Props<T>) {
+function VirtualChatListInner<T extends VirtualItem>(
+  {
+    items,
+    scrollerRef,
+    overscanPx = 1200,
+    renderItem,
+    footer,
+    className,
+  }: Props<T>,
+  ref: React.ForwardedRef<VirtualChatListHandle>,
+) {
   const [range, setRange] = useState<WindowRange>({
     start: 0,
     end: items.length,
@@ -137,11 +153,37 @@ function VirtualChatListInner<T extends VirtualItem>({
   });
   /** Measured row heights by id — drives pad correction. */
   const measuredRef = useRef<Map<string, number>>(new Map());
+  const itemsRef = useRef(items);
+  itemsRef.current = items;
   const [measureTick, setMeasureTick] = useState(0);
   const rafRef = useRef<number | null>(null);
   const measureRafRef = useRef<number | null>(null);
   const rowElsRef = useRef<Map<string, HTMLDivElement>>(new Map());
   const roRef = useRef<ResizeObserver | null>(null);
+
+  useImperativeHandle(
+    ref,
+    () => ({
+      offsetOf(id: string) {
+        const list = itemsRef.current;
+        let acc = 0;
+        for (const item of list) {
+          if (item.id === id) return acc;
+          const m = measuredRef.current.get(item.id);
+          acc += Math.max(24, m ?? (item.estimateHeight || 64));
+        }
+        return null;
+      },
+      heightOf(id: string) {
+        const list = itemsRef.current;
+        const item = list.find((x) => x.id === id);
+        if (!item) return null;
+        const m = measuredRef.current.get(id);
+        return Math.max(24, m ?? (item.estimateHeight || 64));
+      },
+    }),
+    [],
+  );
 
   const bumpMeasure = useCallback(() => {
     if (measureRafRef.current != null) return;
@@ -299,6 +341,12 @@ function VirtualChatListInner<T extends VirtualItem>({
   );
 }
 
+const VirtualChatListForward = forwardRef(VirtualChatListInner) as <
+  T extends VirtualItem,
+>(
+  props: Props<T> & { ref?: React.Ref<VirtualChatListHandle> },
+) => React.ReactElement | null;
+
 export const VirtualChatList = memo(
-  VirtualChatListInner,
-) as typeof VirtualChatListInner;
+  VirtualChatListForward,
+) as typeof VirtualChatListForward;
