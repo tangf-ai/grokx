@@ -1001,27 +1001,33 @@ button.status-pill:disabled {
   flex-direction: column;
 }
 
-/* Reserve a slim strip so expanded outline doesn't cover message text. */
-.chat-pane.has-outline .chat-scroll {
-  padding-right: 168px;
-}
-
+/*
+ * Outline is always a float overlay — never reserve chat padding for expand.
+ * Collapsed dots only need a thin edge; expanded list sits on top of content.
+ */
+.chat-pane.has-outline .chat-scroll,
 .chat-pane.has-outline-collapsed .chat-scroll {
   padding-right: 28px;
 }
 
-/* Right-edge list of user prompts (outline / minimap). */
+/* Right-edge list of user prompts (outline / minimap) — float above chat. */
 .session-outline {
   position: absolute;
   top: 0;
-  right: 8px;
+  right: 6px;
   bottom: 0;
-  z-index: 4;
+  z-index: 12;
   display: flex;
   align-items: center;
   justify-content: center;
-  width: 148px;
+  width: 20px;
   pointer-events: none;
+}
+
+/* Expanded: wider float panel; still absolute so chat width is unchanged. */
+.session-outline:not(.is-collapsed) {
+  width: 168px;
+  right: 8px;
 }
 
 /* Collapsed: thin vertical strip, whole rail centered in chat height. */
@@ -1037,6 +1043,16 @@ button.status-pill:disabled {
   gap: 6px;
   max-height: calc(100% - 40px);
   width: 100%;
+}
+
+/* Expanded rail: soft floating card so text underneath stays readable. */
+.session-outline:not(.is-collapsed) .session-outline-rail {
+  padding: 8px 6px;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.94);
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.1);
+  backdrop-filter: blur(10px);
 }
 
 .session-outline.is-collapsed .session-outline-rail {
@@ -1055,7 +1071,7 @@ button.status-pill:disabled {
   padding: 4px 8px;
   border: 1px solid var(--border);
   border-radius: 999px;
-  background: rgba(255, 255, 255, 0.92);
+  background: rgba(255, 255, 255, 0.96);
   box-shadow: var(--shadow-sm);
   color: var(--muted);
   font-size: 11px;
@@ -1063,6 +1079,13 @@ button.status-pill:disabled {
   line-height: 1.2;
   cursor: pointer;
   backdrop-filter: blur(8px);
+}
+
+/* Inside the expanded card, toggle doesn't need a second heavy chrome. */
+.session-outline:not(.is-collapsed) .session-outline-toggle {
+  border-color: transparent;
+  background: rgba(0, 0, 0, 0.03);
+  box-shadow: none;
 }
 
 .session-outline.is-collapsed .session-outline-toggle {
@@ -1128,7 +1151,7 @@ button.status-pill:disabled {
   padding: 6px 8px;
   border: 1px solid transparent;
   border-radius: 10px;
-  background: rgba(255, 255, 255, 0.72);
+  background: transparent;
   color: var(--text);
   text-align: left;
   cursor: pointer;
@@ -1136,6 +1159,10 @@ button.status-pill:disabled {
     background 0.12s ease,
     border-color 0.12s ease,
     box-shadow 0.12s ease;
+}
+
+.session-outline:not(.is-collapsed) .session-outline-item {
+  background: transparent;
 }
 
 .session-outline.is-collapsed .session-outline-item {
@@ -1370,11 +1397,8 @@ button.status-pill:disabled {
   pointer-events: auto;
 }
 
-/* Keep sticky clear of the session outline rail. */
-.chat-pane.has-outline .user-sticky-bar {
-  right: 168px;
-}
-
+/* Sticky stays near the edge; outline floats above and may overlap slightly. */
+.chat-pane.has-outline .user-sticky-bar,
 .chat-pane.has-outline-collapsed .user-sticky-bar {
   right: 28px;
 }
@@ -1822,23 +1846,30 @@ button.msg-user-file-chip:hover {
   margin-bottom: 10px;
 }
 
+/* Collapsed: no chip box — just a quiet text row. Expanded: light panel. */
 .trace-panel {
   width: 100%;
   max-width: min(92%, 640px);
-  border: 1px solid var(--border);
-  border-radius: 12px;
-  background: var(--chip, rgba(0, 0, 0, 0.02));
+  border: none;
+  border-radius: 0;
+  background: transparent;
   overflow: hidden;
+}
+
+.trace-panel.is-expanded {
+  border: 1px solid var(--border-soft);
+  border-radius: 12px;
+  background: rgba(0, 0, 0, 0.015);
 }
 
 .trace-summary {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 10px;
   width: 100%;
   border: none;
   background: transparent;
-  padding: 10px 12px;
+  padding: 6px 2px;
   text-align: left;
   color: var(--muted);
   font-size: 13px;
@@ -1846,16 +1877,30 @@ button.msg-user-file-chip:hover {
   cursor: pointer;
 }
 
+.trace-panel.is-expanded .trace-summary {
+  padding: 10px 12px;
+}
+
 .trace-summary:hover {
-  background: rgba(0, 0, 0, 0.03);
   color: var(--text);
 }
 
+.trace-panel.is-expanded .trace-summary:hover {
+  background: rgba(0, 0, 0, 0.025);
+}
+
 .trace-chevron {
-  width: 14px;
+  width: 20px;
   flex-shrink: 0;
-  color: var(--muted-2);
-  font-size: 12px;
+  color: var(--muted);
+  font-size: 16px;
+  font-weight: 700;
+  line-height: 1;
+  text-align: center;
+}
+
+.trace-summary:hover .trace-chevron {
+  color: var(--text);
 }
 
 .trace-label {
@@ -1869,15 +1914,25 @@ button.msg-user-file-chip:hover {
 .trace-duration {
   flex-shrink: 0;
   font-variant-numeric: tabular-nums;
-  font-size: 12px;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--muted);
+  padding: 0;
+  border-radius: 0;
+  background: transparent;
+  letter-spacing: 0.01em;
+  min-width: 2.5em;
+  text-align: right;
+}
+
+.trace-duration.is-unknown {
+  font-weight: 500;
   color: var(--muted-2);
-  padding: 2px 8px;
-  border-radius: 999px;
-  background: rgba(0, 0, 0, 0.04);
+  opacity: 0.7;
 }
 
 .trace-body {
-  border-top: 1px solid var(--border);
+  border-top: 1px solid var(--border-soft);
   padding: 8px 12px 10px;
   max-height: 320px;
   overflow: auto;
@@ -1996,88 +2051,7 @@ button.msg-user-file-chip:hover {
   position: relative;
 }
 
-.msg-assistant-wrap.is-streaming .msg-body {
-  /* Soft rainbow shimmer on the text edge while generating */
-  background-image: linear-gradient(
-    100deg,
-    transparent 0%,
-    transparent 40%,
-    rgba(255, 90, 31, 0.04) 50%,
-    transparent 60%,
-    transparent 100%
-  );
-  background-size: 220% 100%;
-  animation: stream-shimmer 2.4s ease-in-out infinite;
-}
-
-@keyframes stream-shimmer {
-  0% {
-    background-position: 100% 0;
-  }
-  100% {
-    background-position: -100% 0;
-  }
-}
-
-.stream-sparkles {
-  pointer-events: none;
-  position: absolute;
-  inset: -8px 0 0 0;
-  overflow: hidden;
-  z-index: 1;
-  border-radius: 8px;
-}
-
-.stream-sparkle {
-  position: absolute;
-  top: -12px;
-  left: calc(6% + (var(--i) * 7.5%));
-  width: 5px;
-  height: 5px;
-  border-radius: 50%;
-  opacity: 0;
-  background: hsl(calc(var(--i) * 30), 90%, 58%);
-  box-shadow:
-    0 0 6px hsl(calc(var(--i) * 30), 95%, 62%),
-    0 0 1px rgba(255, 255, 255, 0.8);
-  animation: stream-sparkle-fall 2.1s linear infinite;
-  animation-delay: calc(var(--i) * -0.17s);
-}
-
-.stream-sparkle:nth-child(3n) {
-  width: 3px;
-  height: 3px;
-  border-radius: 1px;
-  transform: rotate(45deg);
-}
-
-.stream-sparkle:nth-child(4n) {
-  width: 6px;
-  height: 3px;
-  border-radius: 2px;
-}
-
-@keyframes stream-sparkle-fall {
-  0% {
-    opacity: 0;
-    transform: translate3d(0, -8px, 0) rotate(0deg) scale(0.6);
-  }
-  12% {
-    opacity: 0.95;
-  }
-  55% {
-    opacity: 0.75;
-    transform: translate3d(calc((var(--i) % 3 - 1) * 10px), 55px, 0)
-      rotate(120deg) scale(0.9);
-  }
-  100% {
-    opacity: 0;
-    transform: translate3d(calc((var(--i) % 5 - 2) * 8px), 110px, 0)
-      rotate(220deg) scale(0.35);
-  }
-}
-
-/* Live glyphs that “drop in” as each stream delta arrives (near caret) */
+/* Soft monochrome fall-in as stream deltas arrive (near caret) */
 .stream-reveal {
   display: inline-block;
   position: relative;
@@ -2090,7 +2064,7 @@ button.msg-user-file-chip:hover {
 .stream-reveal-burst {
   position: absolute;
   left: 0;
-  bottom: 0;
+  bottom: 0.15em;
   display: inline-flex;
   pointer-events: none;
   white-space: nowrap;
@@ -2098,49 +2072,41 @@ button.msg-user-file-chip:hover {
 
 .stream-reveal-char {
   display: inline-block;
-  margin-left: 1px;
-  font-size: 13px;
-  font-weight: 700;
+  margin-left: 0.5px;
+  font-size: 14.5px;
+  font-weight: 500;
   line-height: 1;
-  color: hsl(calc(var(--i) * 36), 92%, 52%);
-  text-shadow:
-    0 0 8px hsl(calc(var(--i) * 36), 95%, 62%),
-    0 1px 0 rgba(255, 255, 255, 0.55);
+  /* Same ink as body text — no rainbow */
+  color: var(--text);
   opacity: 0;
-  animation: stream-reveal-drop 0.68s cubic-bezier(0.2, 0.85, 0.25, 1) both;
-  animation-delay: calc(var(--i) * 28ms);
+  /* Slow, smooth settle — readable, not flashy */
+  animation: stream-reveal-drop 1.05s cubic-bezier(0.22, 0.72, 0.18, 1) both;
+  animation-delay: calc(var(--i) * 48ms);
   will-change: transform, opacity;
 }
 
 @keyframes stream-reveal-drop {
   0% {
     opacity: 0;
-    transform: translate3d(0, -18px, 0) scale(1.35) rotate(-12deg);
-    filter: blur(1.5px) saturate(1.4);
+    transform: translate3d(0, -14px, 0);
+    filter: blur(1.2px);
   }
-  35% {
-    opacity: 1;
-    filter: blur(0) saturate(1.2);
+  40% {
+    opacity: 0.85;
+    filter: blur(0.2px);
   }
-  70% {
-    opacity: 0.95;
-    transform: translate3d(0, 1px, 0) scale(1.05) rotate(2deg);
+  72% {
+    opacity: 0.55;
+    transform: translate3d(0, 1px, 0);
+    filter: blur(0);
   }
   100% {
     opacity: 0;
-    transform: translate3d(0, 10px, 0) scale(0.75) rotate(8deg);
-    filter: blur(0.5px) saturate(1);
+    transform: translate3d(0, 4px, 0);
   }
 }
 
-/* Prefer reduced motion: no confetti / shimmer / reveal */
 @media (prefers-reduced-motion: reduce) {
-  .msg-assistant-wrap.is-streaming .msg-body {
-    animation: none;
-    background-image: none;
-  }
-
-  .stream-sparkles,
   .stream-reveal {
     display: none !important;
   }
@@ -4252,57 +4218,19 @@ code {
     display: grid;
   }
 
-  /* Narrow chat: keep outline as centered dots only. */
+  /* Narrow chat: still allow expanded float, slightly narrower. */
   .session-outline:not(.is-collapsed) {
-    width: 20px;
-    right: 4px;
+    width: min(156px, 42vw);
+    right: 6px;
   }
 
-  .session-outline:not(.is-collapsed) .session-outline-rail {
-    width: auto;
-    align-items: center;
-  }
-
-  .session-outline:not(.is-collapsed) .session-outline-toggle {
-    width: 18px;
-    height: 18px;
-    padding: 0;
-    justify-content: center;
-    border-radius: 50%;
-  }
-
-  .session-outline:not(.is-collapsed) .session-outline-toggle-label,
-  .session-outline:not(.is-collapsed) .session-outline-text {
-    display: none;
-  }
-
-  .session-outline:not(.is-collapsed) .session-outline-list {
-    align-items: center;
-    gap: 9px;
-    overflow: visible;
-  }
-
-  .session-outline:not(.is-collapsed) .session-outline-item {
-    width: 14px;
-    height: 14px;
-    padding: 0;
-    border: none;
-    background: transparent;
-    align-items: center;
-    justify-content: center;
-  }
-
-  .session-outline:not(.is-collapsed) .session-outline-dot {
-    margin-top: 0;
-    width: 7px;
-    height: 7px;
-  }
-
-  .chat-pane.has-outline .chat-scroll {
+  .chat-pane.has-outline .chat-scroll,
+  .chat-pane.has-outline-collapsed .chat-scroll {
     padding-right: 28px;
   }
 
-  .chat-pane.has-outline .user-sticky-bar {
+  .chat-pane.has-outline .user-sticky-bar,
+  .chat-pane.has-outline-collapsed .user-sticky-bar {
     right: 28px;
   }
 }

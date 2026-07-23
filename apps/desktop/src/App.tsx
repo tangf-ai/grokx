@@ -6293,7 +6293,11 @@ export default function App() {
                   if (line.kind === "trace") {
                     return (
                       <div key={line.id} className="msg msg-trace">
-                        <div className="trace-panel">
+                        <div
+                          className={`trace-panel${
+                            line.expanded ? " is-expanded" : ""
+                          }`}
+                        >
                           <button
                             type="button"
                             className="trace-summary"
@@ -6306,9 +6310,19 @@ export default function App() {
                             <span className="trace-label">
                               Worked · {summarizeTrace(line.items)}
                             </span>
-                            {line.durationMs > 0 && (
-                              <span className="trace-duration">
+                            {line.durationMs > 0 ? (
+                              <span
+                                className="trace-duration"
+                                title="Total time from answer start to finish"
+                              >
                                 {formatDuration(line.durationMs)}
+                              </span>
+                            ) : (
+                              <span
+                                className="trace-duration is-unknown"
+                                title="Duration unavailable"
+                              >
+                                —
                               </span>
                             )}
                           </button>
@@ -6418,21 +6432,6 @@ export default function App() {
                             streaming ? " is-streaming" : ""
                           }`}
                         >
-                          {streaming && (
-                            <div className="stream-sparkles" aria-hidden>
-                              {Array.from({ length: 14 }, (_, k) => (
-                                <span
-                                  key={k}
-                                  className="stream-sparkle"
-                                  style={
-                                    {
-                                      ["--i" as string]: k,
-                                    } as CSSProperties
-                                  }
-                                />
-                              ))}
-                            </div>
-                          )}
                           <div className="msg-body md-body">
                             <ChatMarkdown mediaBases={chatMediaBases}>
                               {line.text}

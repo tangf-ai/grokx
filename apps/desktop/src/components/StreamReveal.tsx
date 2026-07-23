@@ -1,7 +1,6 @@
 /**
- * Real-time stream flourish: when new assistant text arrives, spawn a
- * short rainbow "fall-in" burst of the latest characters near the caret.
- * Keeps the full markdown body intact; this is a decorative overlay only.
+ * Soft fall-in for newly streamed text: neutral ink, slow settle, easy on eyes.
+ * Decorative only — full markdown body stays intact.
  */
 import {
   memo,
@@ -13,7 +12,6 @@ import {
 
 type Burst = {
   id: number;
-  /** Visible glyphs from the latest delta (capped). */
   glyphs: string[];
 };
 
@@ -25,13 +23,11 @@ type Props = {
 let burstSeq = 0;
 
 function pickGlyphs(chunk: string): string[] {
-  // Prefer non-whitespace; fall back to sparkles if only spaces/newlines.
+  // Prefer readable characters; skip pure whitespace deltas.
   const chars = Array.from(chunk).filter((c) => !/\s/.test(c));
-  if (chars.length === 0) {
-    return ["✦", "✧", "·", "✦", "✧"];
-  }
-  // Keep it light: last up to 10 glyphs of this delta.
-  return chars.slice(-10);
+  if (chars.length === 0) return [];
+  // Last few glyphs of this delta — keep light so fall stays calm.
+  return chars.slice(-6);
 }
 
 export const StreamReveal = memo(function StreamReveal({
@@ -55,11 +51,14 @@ export const StreamReveal = memo(function StreamReveal({
     const chunk = text.slice(prev);
     prevLenRef.current = text.length;
     const glyphs = pickGlyphs(chunk);
+    if (glyphs.length === 0) return;
+
     const id = ++burstSeq;
-    setBursts((b) => [...b.slice(-4), { id, glyphs }]);
+    setBursts((b) => [...b.slice(-3), { id, glyphs }]);
+    // Match CSS animation length (~1.1s) + small tail.
     const t = window.setTimeout(() => {
       setBursts((b) => b.filter((x) => x.id !== id));
-    }, 720);
+    }, 1200);
     return () => window.clearTimeout(t);
   }, [text, active]);
 
