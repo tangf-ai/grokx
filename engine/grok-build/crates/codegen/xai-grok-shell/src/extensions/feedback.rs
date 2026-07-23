@@ -72,9 +72,13 @@ async fn handle_btw(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
         .await
         .map_err(|_| acp::Error::internal_error().data("session failed to respond"))?;
     match result {
-        Ok(answer) => super::to_ext_response(Ok(serde_json::json!({
-            "answer": answer,
-        }))),
+        Ok((answer, thinking)) => {
+            let mut body = serde_json::json!({ "answer": answer });
+            if let Some(t) = thinking.filter(|s| !s.trim().is_empty()) {
+                body["thinking"] = serde_json::Value::String(t);
+            }
+            super::to_ext_response(Ok(body))
+        }
         Err(e) => Err(acp::Error::internal_error().data(e)),
     }
 }

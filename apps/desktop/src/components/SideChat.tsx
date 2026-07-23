@@ -1,10 +1,7 @@
 /**
- * Side chat panel body — Grok Build `/btw` (x.ai/btw).
+ * Side chat — Grok Build `/btw` (x.ai/btw).
  * Local Q&A only; does not write to the main session transcript.
- * Embedded in the right rail under the Chat tab.
- *
- * Assistant text is rendered as Markdown. Engine `/btw` returns a full
- * answer (no token stream), so we progressively reveal it for a live feel.
+ * Message layout + composer dock mirror the main chat where possible.
  */
 import {
   memo,
@@ -12,36 +9,42 @@ import {
   useEffect,
   useRef,
   useState,
-  type KeyboardEvent,
 } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open as openUrl } from "@tauri-apps/plugin-shell";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { IconSend, IconTrash } from "../icons";
+import { IconSend, IconStop, IconTrash } from "../icons";
+import {
+  ComposerInput,
+  type ComposerInputHandle,
+} from "./ComposerInput";
 
 export type SideChatMessage = {
   id: string;
-  role: "user" | "assistant";
+  role: "user" | "assistant" | "thought";
   text: string;
   at: string;
-  /** Waiting for engine (no answer text yet). */
+  /** Waiting for engine (assistant placeholder). */
   pending?: boolean;
-  /** Progressively revealing the final answer. */
-  streaming?: boolean;
   error?: boolean;
+  /** Thought row expanded (default true when just received). */
+  thoughtOpen?: boolean;
 };
 
 type Props = {
   sessionId: string | null;
   connected: boolean;
   messages: SideChatMessage[];
-  /** Append / replace messages for this session (parent owns storage). */
   onMessagesChange: (
     updater: (prev: SideChatMessage[]) => SideChatMessage[],
   ) => void;
-  /** When true, focus the composer (e.g. user switched to Chat tab). */
   active?: boolean;
+};
+
+type BtwResult = {
+  answer: string;
+  thinking?: string | null;
 };
 
 let sideSeq = 0;
@@ -50,7 +53,6 @@ function nextId(prefix: string): string {
   return `${prefix}-${Date.now()}-${sideSeq}`;
 }
 
-/** Open external links outside the webview (same policy as main chat). */
 function openExternal(url: string): void {
   const trimmed = url.trim();
   if (!trimmed || !/^(https?:|mailto:)/i.test(trimmed)) return;
@@ -59,18 +61,8 @@ function openExternal(url: string): void {
   });
 }
 
-const SideMarkdown = memo(function SideMarkdown({
-  text,
-  streaming,
-}: {
-  text: string;
-  streaming?: boolean;
-}) {
-  if (!text.trim()) {
-    return streaming ? (
-      <span className="stream-caret" aria-hidden />
-    ) : null;
-  }
+const SideMarkdown = memo(function SideMarkdown({ text }: { text: string }) {
+  if (!text.trim()) return null;
   return (
     <div className="md-body side-chat-md">
       <ReactMarkdown
@@ -96,106 +88,9 @@ const SideMarkdown = memo(function SideMarkdown({
       >
         {text}
       </ReactMarkdown>
-      {streaming ? <span className="stream-caret" aria-hidden /> : null}
     </div>
   );
 });
-
-/**
- * Reveal `full` into the message id with a typewriter cadence.
- * Uses code-point chunks so CJK doesn't split mid-glyph.
- */
-function useRevealAnswer(
-  onMessagesChange: Props["onMessagesChange"],
-  genRef: React.MutableRefObject<number>,
-) {
-  const timerRef = useRef<number | null>(null);
-
-  useEffect(() => {
-    return () => {
-      if (timerRef.current != null) {
-        window.clearTimeout(timerRef.current);
-        timerRef.current = null;
-      }
-    };
-  }, []);
-
-  const reveal = useCallback(
-    (msgId: string, full: string, gen: number) => {
-      if (timerRef.current != null) {
-        window.clearTimeout(timerRef.current);
-        timerRef.current = null;
-      }
-
-      const chars = Array.from(full);
-      if (chars.length === 0) {
-        onMessagesChange((prev) =>
-          prev.map((m) =>
-            m.id === msgId
-              ? {
-                  id: msgId,
-                  role: "assistant",
-                  text: "No response",
-                  at: new Date().toISOString(),
-                }
-              : m,
-          ),
-        );
-        return;
-      }
-
-      // Adaptive chunk size: short answers feel snappy; long ones finish sooner.
-      const chunk =
-        chars.length < 80 ? 1 : chars.length < 400 ? 2 : chars.length < 1200 ? 4 : 8;
-      // ~30–45 fps feel without flooding React.
-      const intervalMs = 16;
-
-      let i = 0;
-      const tick = () => {
-        if (genRef.current !== gen) return;
-        i = Math.min(chars.length, i + chunk);
-        const partial = chars.slice(0, i).join("");
-        const done = i >= chars.length;
-        onMessagesChange((prev) =>
-          prev.map((m) =>
-            m.id === msgId
-              ? {
-                  id: msgId,
-                  role: "assistant" as const,
-                  text: partial,
-                  at: new Date().toISOString(),
-                  streaming: !done,
-                }
-              : m,
-          ),
-        );
-        if (!done) {
-          timerRef.current = window.setTimeout(tick, intervalMs);
-        } else {
-          timerRef.current = null;
-        }
-      };
-      // Start with empty streaming bubble so first paint isn't a freeze.
-      onMessagesChange((prev) =>
-        prev.map((m) =>
-          m.id === msgId
-            ? {
-                id: msgId,
-                role: "assistant",
-                text: "",
-                at: new Date().toISOString(),
-                streaming: true,
-              }
-            : m,
-        ),
-      );
-      timerRef.current = window.setTimeout(tick, 0);
-    },
-    [onMessagesChange, genRef],
-  );
-
-  return reveal;
-}
 
 export const SideChat = memo(function SideChat({
   sessionId,
@@ -204,34 +99,73 @@ export const SideChat = memo(function SideChat({
   onMessagesChange,
   active = true,
 }: Props) {
-  const [draft, setDraft] = useState("");
   const [busy, setBusy] = useState(false);
+  const [hasDraft, setHasDraft] = useState(false);
   const listRef = useRef<HTMLDivElement | null>(null);
-  const inputRef = useRef<HTMLTextAreaElement | null>(null);
-  /** Ignore stale answers after clear / session switch. */
+  const composerRef = useRef<ComposerInputHandle | null>(null);
   const genRef = useRef(0);
-  const reveal = useRevealAnswer(onMessagesChange, genRef);
 
   useEffect(() => {
     genRef.current += 1;
     setBusy(false);
-    setDraft("");
+    setHasDraft(false);
+    composerRef.current?.clear();
   }, [sessionId]);
+
+  /** Smooth follow to bottom when side-chat content grows. */
+  const sideScrollRaf = useRef<number | null>(null);
+  useEffect(() => {
+    return () => {
+      if (sideScrollRaf.current != null) {
+        cancelAnimationFrame(sideScrollRaf.current);
+        sideScrollRaf.current = null;
+      }
+    };
+  }, []);
 
   useEffect(() => {
     const el = listRef.current;
     if (!el) return;
-    el.scrollTop = el.scrollHeight;
-  }, [messages]);
+    // Already chasing bottom — live loop reads scrollHeight each frame.
+    if (sideScrollRaf.current != null) return;
+
+    const step = () => {
+      const root = listRef.current;
+      if (!root) {
+        sideScrollRaf.current = null;
+        return;
+      }
+      const maxTop = Math.max(0, root.scrollHeight - root.clientHeight);
+      const remaining = maxTop - root.scrollTop;
+      if (remaining <= 0.5) {
+        if (remaining > 0) root.scrollTop = maxTop;
+        // Keep a light poll while waiting for answer (height may still change).
+        if (busy) {
+          sideScrollRaf.current = requestAnimationFrame(step);
+        } else {
+          sideScrollRaf.current = null;
+        }
+        return;
+      }
+      const ease =
+        remaining > 200 ? 0.26 : remaining > 80 ? 0.18 : 0.13;
+      let delta = remaining * ease;
+      if (delta < 1) delta = Math.min(1, remaining);
+      if (delta > 72) delta = 72;
+      root.scrollTop = Math.min(maxTop, root.scrollTop + delta);
+      sideScrollRaf.current = requestAnimationFrame(step);
+    };
+    sideScrollRaf.current = requestAnimationFrame(step);
+  }, [messages, busy]);
 
   useEffect(() => {
     if (active && connected) {
-      inputRef.current?.focus();
+      composerRef.current?.focus();
     }
   }, [active, connected, sessionId]);
 
   const canSend =
-    Boolean(sessionId) && connected && !busy && draft.trim().length > 0;
+    Boolean(sessionId) && connected && !busy && hasDraft;
 
   const clearLocal = useCallback(() => {
     genRef.current += 1;
@@ -239,8 +173,21 @@ export const SideChat = memo(function SideChat({
     onMessagesChange(() => []);
   }, [onMessagesChange]);
 
+  const toggleThought = useCallback(
+    (id: string) => {
+      onMessagesChange((prev) =>
+        prev.map((m) =>
+          m.id === id && m.role === "thought"
+            ? { ...m, thoughtOpen: !(m.thoughtOpen ?? true) }
+            : m,
+        ),
+      );
+    },
+    [onMessagesChange],
+  );
+
   const send = useCallback(async () => {
-    const question = draft.trim();
+    const question = (composerRef.current?.getValue() ?? "").trim();
     if (!question || !sessionId || !connected || busy) return;
 
     const gen = ++genRef.current;
@@ -259,16 +206,45 @@ export const SideChat = memo(function SideChat({
       pending: true,
     };
 
-    setDraft("");
+    composerRef.current?.clear();
+    setHasDraft(false);
     setBusy(true);
     onMessagesChange((prev) => [...prev, userMsg, pendingMsg]);
 
     try {
-      const answer = await invoke<string>("send_btw", { question });
+      const raw = await invoke<BtwResult | string>("send_btw", { question });
       if (genRef.current !== gen) return;
-      const full = answer?.trim() || "No response";
-      // Progressive reveal + markdown as text grows.
-      reveal(pendingId, full, gen);
+
+      // Compat: older bridge returned plain string.
+      const answer =
+        typeof raw === "string"
+          ? raw.trim()
+          : (raw?.answer ?? "").trim() || "No response";
+      const thinking =
+        typeof raw === "string"
+          ? null
+          : (raw?.thinking ?? "").trim() || null;
+
+      onMessagesChange((prev) => {
+        const withoutPending = prev.filter((m) => m.id !== pendingId);
+        const next: SideChatMessage[] = [...withoutPending];
+        if (thinking) {
+          next.push({
+            id: nextId("side-thought"),
+            role: "thought",
+            text: thinking,
+            at: new Date().toISOString(),
+            thoughtOpen: true,
+          });
+        }
+        next.push({
+          id: pendingId,
+          role: "assistant",
+          text: answer,
+          at: new Date().toISOString(),
+        });
+        return next;
+      });
     } catch (e) {
       if (genRef.current !== gen) return;
       onMessagesChange((prev) =>
@@ -276,7 +252,7 @@ export const SideChat = memo(function SideChat({
           m.id === pendingId
             ? {
                 id: pendingId,
-                role: "assistant" as const,
+                role: "assistant",
                 text: String(e),
                 at: new Date().toISOString(),
                 error: true,
@@ -285,16 +261,12 @@ export const SideChat = memo(function SideChat({
         ),
       );
     } finally {
-      if (genRef.current === gen) setBusy(false);
+      if (genRef.current === gen) {
+        setBusy(false);
+        composerRef.current?.focus();
+      }
     }
-  }, [draft, sessionId, connected, busy, onMessagesChange, reveal]);
-
-  const onKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
-    if (e.key === "Enter" && !e.shiftKey) {
-      e.preventDefault();
-      void send();
-    }
-  };
+  }, [sessionId, connected, busy, onMessagesChange]);
 
   return (
     <div className="side-chat side-chat-embedded" aria-label="Side chat">
@@ -308,7 +280,7 @@ export const SideChat = memo(function SideChat({
           title="Clear side chat"
           aria-label="Clear side chat"
           onClick={clearLocal}
-          disabled={messages.length === 0 && !draft}
+          disabled={messages.length === 0 && !hasDraft}
         >
           <IconTrash size={14} />
         </button>
@@ -321,71 +293,131 @@ export const SideChat = memo(function SideChat({
               Ask a side question without adding to the main chat context.
             </p>
             <p className="side-chat-empty-hint">
-              Uses Grok Build <code>/btw</code> — works while the agent is
-              Working. Answers render as Markdown.
+              Uses Grok Build <code>/btw</code> — same composer as main chat.
+              Thinking appears like the main transcript when the model returns
+              it.
             </p>
           </div>
         ) : (
-          messages.map((m) => (
-            <div
-              key={m.id}
-              className={`side-chat-msg side-chat-msg-${m.role}${
-                m.pending ? " is-pending" : ""
-              }${m.streaming ? " is-streaming" : ""}${
-                m.error ? " is-error" : ""
-              }`}
-            >
-              <div className="side-chat-bubble">
-                {m.role === "user" ? (
-                  m.text
-                ) : m.error ? (
-                  m.text
-                ) : m.pending && !m.text ? (
-                  <span className="side-chat-thinking">
-                    Thinking
-                    <span className="side-chat-thinking-dots" aria-hidden>
-                      …
+          messages.map((m) => {
+            if (m.role === "user") {
+              return (
+                <div key={m.id} className="msg msg-user side-chat-line">
+                  <div className="msg-user-stack">
+                    <div className="msg-body">
+                      <div className="msg-user-text">{m.text}</div>
+                    </div>
+                  </div>
+                </div>
+              );
+            }
+            if (m.role === "thought") {
+              const open = m.thoughtOpen ?? true;
+              return (
+                <div key={m.id} className="msg msg-thought side-chat-line">
+                  <button
+                    type="button"
+                    className="side-chat-thought-toggle"
+                    onClick={() => toggleThought(m.id)}
+                    aria-expanded={open}
+                  >
+                    <span className="side-chat-thought-chevron" aria-hidden>
+                      {open ? "▾" : "▸"}
                     </span>
-                    <span className="stream-caret" aria-hidden />
-                  </span>
-                ) : (
-                  <SideMarkdown text={m.text} streaming={m.streaming} />
-                )}
+                    Thinking
+                  </button>
+                  {open && (
+                    <div className="msg-body md-body thought-md">
+                      <SideMarkdown text={m.text} />
+                    </div>
+                  )}
+                </div>
+              );
+            }
+            // assistant
+            return (
+              <div
+                key={m.id}
+                className={`msg msg-assistant side-chat-line${
+                  m.pending ? " is-pending" : ""
+                }${m.error ? " is-error" : ""}`}
+              >
+                <div className="msg-body md-body">
+                  {m.pending && !m.text ? (
+                    <div className="waiting-body">
+                      <span className="waiting-dots" aria-hidden>
+                        <span />
+                        <span />
+                        <span />
+                      </span>
+                      <span>Thinking…</span>
+                    </div>
+                  ) : m.error ? (
+                    m.text
+                  ) : (
+                    <SideMarkdown text={m.text} />
+                  )}
+                </div>
               </div>
-            </div>
-          ))
+            );
+          })
         )}
       </div>
 
-      <div className="side-chat-composer">
+      <div className="side-chat-composer-dock">
         {!sessionId || !connected ? (
           <p className="side-chat-composer-hint">
             Connect a task to use side chat.
           </p>
         ) : null}
-        <textarea
-          ref={inputRef}
-          className="side-chat-input"
-          rows={2}
-          placeholder="Do anything"
-          value={draft}
+        <ComposerInput
+          ref={composerRef}
           disabled={!sessionId || !connected || busy}
-          onChange={(e) => setDraft(e.target.value)}
-          onKeyDown={onKeyDown}
+          placeholder={
+            sessionId && connected
+              ? "Describe what this task should do… (paste text or images)"
+              : "Connect a task to start…"
+          }
+          onSubmit={() => {
+            void send();
+          }}
+          onDraftChange={(t) => setHasDraft(t.trim().length > 0)}
         />
-        <div className="side-chat-composer-row">
-          <span className="side-chat-composer-meta">
-            {busy ? "Asking…" : "Side question"}
-          </span>
-          <button
-            type="button"
-            className="send-btn"
-            title="Send side question"
-            disabled={!canSend}
-            onClick={() => void send()}
-          >
-            <IconSend size={14} />
-          </button>
+        <div className="composer-bar side-chat-composer-bar">
+          <div className="composer-left">
+            <span className="side-chat-composer-meta">
+              {busy ? "Asking…" : "Not in main context"}
+            </span>
+          </div>
+          <div className="composer-right">
+            {busy ? (
+              <button
+                type="button"
+                className="send-btn stop"
+                title="Stop waiting (discards late reply)"
+                aria-label="Stop side chat wait"
+                onClick={() => {
+                  genRef.current += 1;
+                  setBusy(false);
+                  onMessagesChange((prev) =>
+                    prev.filter((m) => !(m.role === "assistant" && m.pending)),
+                  );
+                }}
+              >
+                <IconStop size={14} />
+              </button>
+            ) : (
+              <button
+                type="button"
+                className="send-btn"
+                title="Send side question"
+                disabled={!canSend}
+                onClick={() => void send()}
+              >
+                <IconSend size={16} />
+              </button>
+            )}
+          </div>
         </div>
       </div>
     </div>

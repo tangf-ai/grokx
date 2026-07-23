@@ -54,7 +54,6 @@ import {
   VirtualChatList,
   type VirtualChatListHandle,
 } from "./components/VirtualChatList";
-import { StreamReveal } from "./components/StreamReveal";
 import { SessionOutline } from "./components/SessionOutline";
 import {
   SideChat,
@@ -136,84 +135,143 @@ function resolveLocalMediaSrc(
 /**
  * Shared markdown rendering for chat: links open in the system browser;
  * local images resolve against the active task workspace.
+ * When `streaming`, newly added block-level nodes fade in (DOM MutationObserver)
+ * and a soft caret is shown — no per-character effects.
  */
 function ChatMarkdown({
   children,
   mediaBases = [],
+  streaming = false,
 }: {
   children: string;
   /** Candidate roots for relative media (task cwd, project root). */
   mediaBases?: Array<string | null | undefined>;
+  /** Soft block fade-in + caret while assistant is generating. */
+  streaming?: boolean;
 }) {
+  const rootRef = useRef<HTMLDivElement | null>(null);
+  const knownBlocksRef = useRef<WeakSet<Element>>(new WeakSet());
+
+  useEffect(() => {
+    if (!streaming) {
+      knownBlocksRef.current = new WeakSet();
+      return;
+    }
+    const root = rootRef.current;
+    if (!root || typeof MutationObserver === "undefined") return;
+
+    const markEnter = (el: Element) => {
+      if (knownBlocksRef.current.has(el)) return;
+      knownBlocksRef.current.add(el);
+      el.classList.add("md-block-enter");
+      window.setTimeout(() => el.classList.remove("md-block-enter"), 260);
+    };
+
+    // Seed existing blocks without animating (first paint of this stream).
+    root
+      .querySelectorAll(
+        ":scope > p, :scope > h1, :scope > h2, :scope > h3, :scope > h4, :scope > ul, :scope > ol, :scope > pre, :scope > blockquote, :scope > table, :scope > hr, :scope > li",
+      )
+      .forEach((el) => knownBlocksRef.current.add(el));
+
+    const mo = new MutationObserver((records) => {
+      for (const rec of records) {
+        rec.addedNodes.forEach((node) => {
+          if (node.nodeType !== Node.ELEMENT_NODE) return;
+          const el = node as Element;
+          if (
+            /^(P|H1|H2|H3|H4|UL|OL|LI|PRE|BLOCKQUOTE|TABLE|HR)$/.test(
+              el.tagName,
+            )
+          ) {
+            markEnter(el);
+          }
+          // Nested blocks (e.g. li inside newly added ul)
+          el.querySelectorAll?.(
+            "p, h1, h2, h3, h4, ul, ol, li, pre, blockquote, table, hr",
+          ).forEach((child) => markEnter(child));
+        });
+      }
+    });
+    mo.observe(root, { childList: true, subtree: true });
+    return () => mo.disconnect();
+  }, [streaming]);
+
   return (
-    <ReactMarkdown
-      remarkPlugins={[remarkGfm]}
-      urlTransform={(url) => {
-        // Allow local paths / asset URLs through (default sanitizer may strip).
-        if (!url) return url;
-        if (/^(https?:|data:|asset:|blob:|file:)/i.test(url)) return url;
-        if (url.startsWith("/") || url.startsWith("./") || !url.includes(":")) {
-          return url;
-        }
-        return url;
-      }}
-      components={{
-        a({ href, children: linkChildren, node: _node, ...props }) {
-          return (
-            <a
-              {...props}
-              href={href}
-              // No target=_blank: WKWebView would also open the system browser,
-              // doubling with our shell open().
-              rel="noopener noreferrer"
-              onClick={(e) => {
-                e.preventDefault();
-                e.stopPropagation();
-                if (href) openExternalUrl(href);
-              }}
-            >
-              {linkChildren}
-            </a>
-          );
-        },
-        img({ src, alt, node: _node, ...props }) {
-          const resolved = resolveLocalMediaSrc(src, mediaBases);
-          if (!resolved) return null;
-          return (
-            <img
-              {...props}
-              src={resolved}
-              alt={alt ?? ""}
-              className="chat-md-img"
-              loading="lazy"
-              onClick={(e) => {
-                e.preventDefault();
-                // Prefer opening the original path when possible.
-                const orig = (src || "").trim();
-                if (orig && !/^(https?:|data:)/i.test(orig)) {
-                  const abs =
-                    orig.startsWith("/") || /^[A-Za-z]:[\\/]/.test(orig)
-                      ? orig
-                      : mediaBases.find(Boolean)
-                        ? `${String(mediaBases.find(Boolean)).replace(
-                            /[/\\]+$/,
-                            "",
-                          )}/${orig.replace(/^\.\//, "")}`
-                        : null;
-                  if (abs) {
-                    void invoke("open_path", { path: abs }).catch(() => {});
-                    return;
-                  }
-                }
-                if (resolved.startsWith("http")) openExternalUrl(resolved);
-              }}
-            />
-          );
-        },
-      }}
+    <div
+      ref={rootRef}
+      className={`md-stream-root${streaming ? " is-streaming" : ""}`}
     >
-      {children}
-    </ReactMarkdown>
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        urlTransform={(url) => {
+          // Allow local paths / asset URLs through (default sanitizer may strip).
+          if (!url) return url;
+          if (/^(https?:|data:|asset:|blob:|file:)/i.test(url)) return url;
+          if (url.startsWith("/") || url.startsWith("./") || !url.includes(":")) {
+            return url;
+          }
+          return url;
+        }}
+        components={{
+          a({ href, children: linkChildren, node: _node, ...props }) {
+            return (
+              <a
+                {...props}
+                href={href}
+                // No target=_blank: WKWebView would also open the system browser,
+                // doubling with our shell open().
+                rel="noopener noreferrer"
+                onClick={(e) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  if (href) openExternalUrl(href);
+                }}
+              >
+                {linkChildren}
+              </a>
+            );
+          },
+          img({ src, alt, node: _node, ...props }) {
+            const resolved = resolveLocalMediaSrc(src, mediaBases);
+            if (!resolved) return null;
+            return (
+              <img
+                {...props}
+                src={resolved}
+                alt={alt ?? ""}
+                className="chat-md-img"
+                loading="lazy"
+                onClick={(e) => {
+                  e.preventDefault();
+                  // Prefer opening the original path when possible.
+                  const orig = (src || "").trim();
+                  if (orig && !/^(https?:|data:)/i.test(orig)) {
+                    const abs =
+                      orig.startsWith("/") || /^[A-Za-z]:[\\/]/.test(orig)
+                        ? orig
+                        : mediaBases.find(Boolean)
+                          ? `${String(mediaBases.find(Boolean)).replace(
+                              /[/\\]+$/,
+                              "",
+                            )}/${orig.replace(/^\.\//, "")}`
+                          : null;
+                    if (abs) {
+                      void invoke("open_path", { path: abs }).catch(() => {});
+                      return;
+                    }
+                  }
+                  if (resolved.startsWith("http")) openExternalUrl(resolved);
+                }}
+              />
+            );
+          },
+        }}
+      >
+        {children}
+      </ReactMarkdown>
+      {streaming ? <span className="stream-caret" aria-hidden /> : null}
+    </div>
   );
 }
 
@@ -2229,7 +2287,12 @@ export default function App() {
     });
   }, []);
 
-  /** Ease viewport toward bottom (slow + smooth). Does not jump. */
+  /**
+   * Silky follow to bottom while auto-scroll is on.
+   * Exponential ease each frame (no hard 14px cap) so stream growth doesn't
+   * feel like stop-start steps. Keeps looping while still away from bottom
+   * or while the turn is busy (content may keep growing).
+   */
   const ensureSmoothAutoScroll = useCallback(() => {
     if (!autoScrollEnabledRef.current) return;
     if (scrollAnimRef.current != null) return;
@@ -2240,32 +2303,39 @@ export default function App() {
       const el = chatScrollRef.current;
       if (!el) return;
 
-      const remaining = distanceFromBottom(el);
-      if (remaining <= 1.5) {
-        // Snap residual for crisp bottom alignment.
+      const maxTop = Math.max(0, el.scrollHeight - el.clientHeight);
+      const remaining = maxTop - el.scrollTop;
+
+      if (remaining <= 0.5) {
         if (remaining > 0) {
           lastProgrammaticScrollRef.current = performance.now();
-          el.scrollTop = el.scrollHeight;
+          el.scrollTop = maxTop;
+        }
+        // While Working, keep a cheap poll so new stream height is chased
+        // without waiting for the next React commit (smoother than restart).
+        if (busyRef.current) {
+          scrollAnimRef.current = requestAnimationFrame(step);
         }
         return;
       }
 
-      // Ease: move a fraction of remaining distance each frame (slow follow).
-      // Cap step so long streams don't race the eye.
-      const ease = 0.08;
-      const minStep = 0.6;
-      const maxStep = 14;
+      // Distance-adaptive ease: catch up when far, soft land when close.
+      // Higher than the old 0.08 so we don't lag in visible "jumps".
+      const ease =
+        remaining > 320 ? 0.28 : remaining > 120 ? 0.2 : remaining > 40 ? 0.15 : 0.12;
       let delta = remaining * ease;
-      if (delta < minStep) delta = Math.min(minStep, remaining);
-      if (delta > maxStep) delta = maxStep;
+      // Gentle floor so we never stall on sub-pixel leftovers.
+      if (delta < 1.2) delta = Math.min(1.2, remaining);
+      // Soft ceiling only for huge reflows (virtual list remount) — still smooth.
+      if (delta > 96) delta = 96;
 
       lastProgrammaticScrollRef.current = performance.now();
-      el.scrollTop += delta;
+      el.scrollTop = Math.min(maxTop, el.scrollTop + delta);
       scrollAnimRef.current = requestAnimationFrame(step);
     };
 
     scrollAnimRef.current = requestAnimationFrame(step);
-  }, [distanceFromBottom]);
+  }, []);
 
   const enableAutoScroll = useCallback(() => {
     autoScrollEnabledRef.current = true;
@@ -2343,26 +2413,46 @@ export default function App() {
     autoScrollEnabledRef.current = true;
     userScrollIntentRef.current = false;
     setShowScrollToBottom(false);
+    // Expand virtual window with a few snaps, then ease the rest (less jarring).
     const snap = () => {
       const root = chatScrollRef.current;
       if (!root) return;
       root.scrollTop = Math.max(0, root.scrollHeight - root.clientHeight);
     };
-    // Instant snap first so virtual window expands to the tail (end = n).
-    snap();
+    const far = distanceFromBottom(el) > 400;
+    if (far) {
+      // One quick jump most of the way, then silky finish.
+      el.scrollTop = Math.max(
+        0,
+        el.scrollHeight - el.clientHeight - 120,
+      );
+    }
     requestAnimationFrame(() => {
-      snap();
-      requestAnimationFrame(snap);
+      ensureSmoothAutoScroll();
+      requestAnimationFrame(() => ensureSmoothAutoScroll());
     });
-    // After ResizeObserver height corrections, snap again.
-    window.setTimeout(snap, 40);
-    window.setTimeout(snap, 120);
     window.setTimeout(() => {
-      snap();
+      if (autoScrollEnabledRef.current) ensureSmoothAutoScroll();
+    }, 40);
+    window.setTimeout(() => {
+      if (autoScrollEnabledRef.current) ensureSmoothAutoScroll();
       updateScrollToBottomVisible();
       scheduleStickyUser();
+    }, 160);
+    window.setTimeout(() => {
+      // Final alignment after RO measures.
+      if (autoScrollEnabledRef.current) {
+        snap();
+        ensureSmoothAutoScroll();
+      }
+      updateScrollToBottomVisible();
     }, 320);
-  }, [scheduleStickyUser, updateScrollToBottomVisible]);
+  }, [
+    scheduleStickyUser,
+    updateScrollToBottomVisible,
+    distanceFromBottom,
+    ensureSmoothAutoScroll,
+  ]);
 
   // When chat content grows, ease toward bottom only if auto-follow is on.
   useEffect(() => {
@@ -6292,7 +6382,10 @@ export default function App() {
                 renderItem={(line, i) => {
                   if (line.kind === "trace") {
                     return (
-                      <div key={line.id} className="msg msg-trace">
+                      <div
+                        key={line.id}
+                        className="msg msg-trace"
+                      >
                         <div
                           className={`trace-panel${
                             line.expanded ? " is-expanded" : ""
@@ -6404,7 +6497,10 @@ export default function App() {
                   }
                   if (line.kind === "waiting") {
                     return (
-                      <div key={line.id} className="msg msg-waiting">
+                      <div
+                        key={line.id}
+                        className="msg msg-waiting"
+                      >
                         <div className="msg-body waiting-body">
                           <span className="waiting-dots" aria-hidden>
                             <span />
@@ -6433,15 +6529,12 @@ export default function App() {
                           }`}
                         >
                           <div className="msg-body md-body">
-                            <ChatMarkdown mediaBases={chatMediaBases}>
+                            <ChatMarkdown
+                              mediaBases={chatMediaBases}
+                              streaming={streaming}
+                            >
                               {line.text}
                             </ChatMarkdown>
-                            {streaming && (
-                              <>
-                                <StreamReveal text={line.text} active />
-                                <span className="stream-caret" aria-hidden />
-                              </>
-                            )}
                           </div>
                           {canCopy && (
                             <div className="msg-actions">
@@ -6540,12 +6633,25 @@ export default function App() {
                   }
                   if (line.kind === "thought") {
                     return (
-                      <div key={line.id} className="msg msg-thought">
+                      <div
+                        key={line.id}
+                        className="msg msg-thought"
+                      >
                         <div className="msg-body md-body thought-md">
                           <ChatMarkdown mediaBases={chatMediaBases}>
                             {line.text}
                           </ChatMarkdown>
                         </div>
+                      </div>
+                    );
+                  }
+                  if (line.kind === "error") {
+                    return (
+                      <div
+                        key={line.id}
+                        className="msg msg-error"
+                      >
+                        <div className="msg-body">{line.text}</div>
                       </div>
                     );
                   }
@@ -6771,11 +6877,8 @@ export default function App() {
                       </div>
                     );
                   }
-                  return (
-                    <div key={line.id} className={`msg msg-${line.kind}`}>
-                      <div className="msg-body">{line.text}</div>
-                    </div>
-                  );
+                  // Exhaustive for ChatLine kinds handled above.
+                  return null;
                 }}
               />
               )}
@@ -7090,7 +7193,8 @@ export default function App() {
                       type="button"
                       className="send-btn stop"
                       onClick={() => void onCancel()}
-                      title="Stop"
+                      title="Stop generation"
+                      aria-label="Stop generation"
                     >
                       <IconStop size={14} />
                     </button>

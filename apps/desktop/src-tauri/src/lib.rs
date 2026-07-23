@@ -394,9 +394,18 @@ async fn send_prompt(core: State<'_, CoreState>, text: String) -> Result<(), Str
 }
 
 /// Side chat / `/btw` — does not write to main session transcript.
+/// Returns `{ answer, thinking? }`.
 #[tauri::command]
-async fn send_btw(core: State<'_, CoreState>, question: String) -> Result<String, String> {
-    core.0.send_btw(question).await.map_err(|e| e.to_string())
+async fn send_btw(
+    core: State<'_, CoreState>,
+    question: String,
+) -> Result<serde_json::Value, String> {
+    let (answer, thinking) = core.0.send_btw(question).await.map_err(|e| e.to_string())?;
+    let mut v = serde_json::json!({ "answer": answer });
+    if let Some(t) = thinking.filter(|s| !s.trim().is_empty()) {
+        v["thinking"] = serde_json::Value::String(t);
+    }
+    Ok(v)
 }
 
 #[tauri::command]

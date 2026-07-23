@@ -622,7 +622,8 @@ pub enum SessionCommand {
     /// tool-free model call, and returns the response text.
     SideQuestion {
         question: String,
-        respond_to: oneshot::Sender<Result<String, String>>,
+        /// `(answer, optional_thinking)` — thinking is model reasoning text when present.
+        respond_to: oneshot::Sender<Result<(String, Option<String>), String>>,
     },
     /// Generate a session recap (a short "where was I" summary) and broadcast
     /// it to clients via `SessionUpdate::SessionRecap`.

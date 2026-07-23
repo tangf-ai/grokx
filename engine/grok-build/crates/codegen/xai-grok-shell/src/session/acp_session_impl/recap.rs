@@ -18,7 +18,11 @@ impl SessionActor {
     ///
     /// Generates a unique btw session ID and persists the result to
     /// `btw_history.jsonl` in the session folder.
-    pub(super) async fn handle_side_question(&self, question: &str) -> Result<String, String> {
+    /// Returns `(answer, optional thinking/reasoning text)` for UI display.
+    pub(super) async fn handle_side_question(
+        &self,
+        question: &str,
+    ) -> Result<(String, Option<String>), String> {
         let btw_session_id = format!("btw-{}", uuid::Uuid::new_v4());
         let parent_session_id = self.session_info.id.to_string();
         let asked_at = chrono::Utc::now();
@@ -126,13 +130,26 @@ impl SessionActor {
                 msg
             })?;
         let content = response.assistant_text();
+        // Collect reasoning/thinking for side-chat UI (same surface as main chat thoughts).
+        let thinking = {
+            let parts: Vec<String> = response
+                .reasoning_items()
+                .map(xai_grok_sampling_types::conversation::reasoning_item_text)
+                .filter(|s| !s.trim().is_empty())
+                .collect();
+            if parts.is_empty() {
+                None
+            } else {
+                Some(parts.join("\n\n"))
+            }
+        };
 
         if content.is_empty() {
             persist(String::new(), false, Some("No response from model".into()));
             return Err("No response from model".to_string());
         }
         persist(content.clone(), true, None);
-        Ok(content)
+        Ok((content, thinking))
     }
 
     /// Generate a session recap and broadcast it via

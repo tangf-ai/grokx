@@ -2046,69 +2046,48 @@ button.msg-user-file-chip:hover {
   }
 }
 
-/* Rainbow confetti while assistant is streaming */
+/* Streaming assistant wrap */
 .msg-assistant-wrap {
   position: relative;
 }
 
-/* Soft monochrome fall-in as stream deltas arrive (near caret) */
-.stream-reveal {
-  display: inline-block;
-  position: relative;
-  width: 0;
-  height: 0;
-  vertical-align: text-bottom;
-  overflow: visible;
+/* Soft edge while generating — very subtle, no rainbow */
+.msg-assistant-wrap.is-streaming .msg-body {
+  animation: stream-soft-pulse 2.8s ease-in-out infinite;
 }
 
-.stream-reveal-burst {
-  position: absolute;
-  left: 0;
-  bottom: 0.15em;
-  display: inline-flex;
-  pointer-events: none;
-  white-space: nowrap;
-}
-
-.stream-reveal-char {
-  display: inline-block;
-  margin-left: 0.5px;
-  font-size: 14.5px;
-  font-weight: 500;
-  line-height: 1;
-  /* Same ink as body text — no rainbow */
-  color: var(--text);
-  opacity: 0;
-  /* Slow, smooth settle — readable, not flashy */
-  animation: stream-reveal-drop 1.05s cubic-bezier(0.22, 0.72, 0.18, 1) both;
-  animation-delay: calc(var(--i) * 48ms);
-  will-change: transform, opacity;
-}
-
-@keyframes stream-reveal-drop {
-  0% {
-    opacity: 0;
-    transform: translate3d(0, -14px, 0);
-    filter: blur(1.2px);
-  }
-  40% {
-    opacity: 0.85;
-    filter: blur(0.2px);
-  }
-  72% {
-    opacity: 0.55;
-    transform: translate3d(0, 1px, 0);
-    filter: blur(0);
-  }
+@keyframes stream-soft-pulse {
+  0%,
   100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.97;
+  }
+}
+
+/* New markdown blocks fade in while streaming (scheme 2) */
+.md-block-enter {
+  animation: md-block-enter 220ms ease-out both;
+}
+
+@keyframes md-block-enter {
+  from {
     opacity: 0;
-    transform: translate3d(0, 4px, 0);
+  }
+  to {
+    opacity: 1;
   }
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .stream-reveal {
-    display: none !important;
+  .msg-assistant-wrap.is-streaming .msg-body {
+    animation: none;
+  }
+
+  .md-block-enter {
+    animation: none !important;
+    opacity: 1 !important;
   }
 }
 
@@ -3015,6 +2994,43 @@ button.msg-user-file-chip:hover {
 
 .send-btn.stop {
   background: var(--accent);
+  /* Working: gentle grow/shrink so stop is noticeable and still clickable */
+  animation: send-stop-pulse 1.35s ease-in-out infinite;
+  box-shadow: 0 0 0 0 rgba(255, 90, 31, 0.35);
+}
+
+.send-btn.stop:hover {
+  animation: none;
+  transform: scale(1.06);
+  box-shadow: 0 0 0 4px rgba(255, 90, 31, 0.18);
+}
+
+.send-btn.stop:active {
+  transform: scale(0.94);
+  animation: none;
+}
+
+.send-btn.stop svg {
+  /* Icon scales with the button for a clearer “breathing” stop */
+  transform-origin: center;
+}
+
+@keyframes send-stop-pulse {
+  0%,
+  100% {
+    transform: scale(0.92);
+    box-shadow: 0 0 0 0 rgba(255, 90, 31, 0.28);
+  }
+  50% {
+    transform: scale(1.12);
+    box-shadow: 0 0 0 6px rgba(255, 90, 31, 0);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .send-btn.stop {
+    animation: none;
+  }
 }
 
 /* ─── Side chat embedded in right rail (Chat tab) ─── */
@@ -3068,10 +3084,71 @@ button.msg-user-file-chip:hover {
   flex: 1;
   min-height: 0;
   overflow: auto;
-  padding: 4px 4px 12px;
+  padding: 8px 8px 16px;
   display: flex;
   flex-direction: column;
   gap: 10px;
+}
+
+/* Reuse main-chat message alignment inside the side rail */
+.side-chat-line.msg {
+  margin: 0;
+}
+
+.side-chat-line.msg-user {
+  width: 100%;
+}
+
+.side-chat-line.msg-user .msg-user-stack,
+.side-chat-line.msg-user .msg-body {
+  max-width: 100%;
+}
+
+.side-chat-line.msg-assistant .msg-body,
+.side-chat-line.msg-thought .msg-body {
+  max-width: 100%;
+}
+
+.side-chat-line.msg-assistant .msg-body {
+  background: transparent;
+  padding: 0;
+  box-shadow: none;
+}
+
+.side-chat-line.msg-assistant.is-error .msg-body {
+  background: var(--error-bg);
+  color: var(--error);
+  border-radius: 12px;
+  padding: 10px 12px;
+}
+
+.side-chat-thought-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0 0 4px;
+  padding: 2px 0;
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.side-chat-thought-toggle:hover {
+  color: var(--text);
+}
+
+.side-chat-thought-chevron {
+  width: 14px;
+  text-align: center;
+  font-size: 12px;
+}
+
+.side-chat-line .thought-md {
+  opacity: 0.88;
+  font-size: 13px;
 }
 
 .side-chat-empty {
@@ -3211,11 +3288,15 @@ button.msg-user-file-chip:hover {
   color: var(--text);
 }
 
-.side-chat-composer {
+/* Composer matches main chat dock (compact for the rail) */
+.side-chat-composer-dock {
   flex-shrink: 0;
-  padding: 10px 4px 14px;
-  border-top: 1px solid var(--border-soft);
-  background: transparent;
+  margin: 0 6px 10px;
+  padding: 10px 12px 8px;
+  border: 1px solid var(--border);
+  border-radius: 18px;
+  background: #fff;
+  box-shadow: var(--shadow-sm);
 }
 
 .side-chat-composer-hint {
@@ -3224,36 +3305,29 @@ button.msg-user-file-chip:hover {
   color: var(--muted-2);
 }
 
-.side-chat-input {
+.side-chat-composer-dock textarea {
   width: 100%;
-  resize: none;
-  border: 1px solid var(--border);
-  border-radius: 14px;
-  padding: 10px 12px;
-  background: #fff;
-  color: var(--text);
+  border: none;
   outline: none;
-  min-height: 56px;
-  max-height: 140px;
-  line-height: 1.4;
+  resize: none;
+  min-height: 44px;
+  max-height: 120px;
+  background: transparent;
+  color: var(--text);
+  line-height: 1.45;
+  font-size: 14px;
 }
 
-.side-chat-input:focus {
-  border-color: #d0d0d6;
-  box-shadow: 0 0 0 3px rgba(0, 0, 0, 0.04);
+.side-chat-composer-dock textarea::placeholder {
+  color: var(--muted-2);
 }
 
-.side-chat-input:disabled {
+.side-chat-composer-dock textarea:disabled {
   opacity: 0.6;
-  cursor: not-allowed;
 }
 
-.side-chat-composer-row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  margin-top: 8px;
+.side-chat-composer-bar {
+  margin-top: 4px;
 }
 
 .side-chat-composer-meta {
@@ -3262,9 +3336,10 @@ button.msg-user-file-chip:hover {
   font-weight: 500;
 }
 
-.side-chat-composer-row .send-btn {
-  width: 32px;
-  height: 32px;
+/* Remove obsolete bubble layout leftovers if any remain */
+.side-chat-msg,
+.side-chat-bubble {
+  /* kept empty for safety — main styles use .msg */
 }
 
 .topbar-side-chat-toggle.is-active,

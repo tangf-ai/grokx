@@ -1282,7 +1282,11 @@ impl AppCore {
     ///
     /// Does not set `turn_busy`, does not emit main-chat UserMessage/deltas,
     /// and may run while a main turn is in progress.
-    pub async fn send_btw(&self, question: String) -> Result<String, CoreError> {
+    /// Returns `(answer, optional thinking text)`.
+    pub async fn send_btw(
+        &self,
+        question: String,
+    ) -> Result<(String, Option<String>), CoreError> {
         let question = question.trim().to_string();
         if question.is_empty() {
             return Err(CoreError::Message("empty side question".into()));

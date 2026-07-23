@@ -330,7 +330,12 @@ impl AcpClientHandle {
     /// Does **not** enqueue a main-session turn, does **not** mutate the
     /// conversation transcript, and does **not** require `turn_busy` free.
     /// The engine snapshots the current conversation read-only.
-    pub async fn send_btw(&self, question: &str) -> Result<String, BridgeError> {
+    ///
+    /// Returns `(answer, optional thinking/reasoning)` for side-chat UI.
+    pub async fn send_btw(
+        &self,
+        question: &str,
+    ) -> Result<(String, Option<String>), BridgeError> {
         let question = question.trim();
         if question.is_empty() {
             return Err(BridgeError::Message("empty side question".into()));
@@ -354,7 +359,7 @@ impl AcpClientHandle {
             )
             .await?;
 
-        parse_btw_answer(&result)
+        parse_btw_response(&result)
     }
 
     /// Best-effort model switch for the live session.
@@ -615,13 +620,10 @@ impl AcpClientHandle {
     }
 }
 
-/// Extract answer text from an `x.ai/btw` ExtResponse / ExtMethodResult payload.
+/// Extract answer (+ optional thinking) from an `x.ai/btw` ExtResponse payload.
 ///
-/// Engine wraps via `ExtMethodResult { result: { answer }, error }` so the
-/// JSON-RPC `result` we receive is typically:
-/// `{ "result": { "answer": "..." } }`.
-/// Also accept a bare `{ "answer": "..." }` for resilience.
-fn parse_btw_answer(result: &Value) -> Result<String, BridgeError> {
+/// Engine wraps via `ExtMethodResult { result: { answer, thinking? }, error }`.
+fn parse_btw_response(result: &Value) -> Result<(String, Option<String>), BridgeError> {
     if let Some(err) = result.get("error").filter(|e| !e.is_null()) {
         let msg = err
             .as_str()
@@ -632,25 +634,31 @@ fn parse_btw_answer(result: &Value) -> Result<String, BridgeError> {
         }
     }
 
-    let answer = result
-        .pointer("/result/answer")
-        .or_else(|| result.get("answer"))
-        .or_else(|| result.pointer("/result/result/answer"))
+    let body = result
+        .get("result")
+        .cloned()
+        .unwrap_or_else(|| result.clone());
+
+    let answer = body
+        .get("answer")
+        .or_else(|| body.pointer("/result/answer"))
         .and_then(|a| a.as_str())
-        .map(|s| s.to_string());
+        .map(|s| s.to_string())
+        .or_else(|| result.as_str().map(|s| s.to_string()));
+
+    let thinking = body
+        .get("thinking")
+        .or_else(|| body.pointer("/result/thinking"))
+        .and_then(|t| t.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
 
     match answer {
-        Some(s) if !s.is_empty() => Ok(s),
-        Some(_) => Ok("No response".into()),
-        None => {
-            // Last resort: if the whole payload is a plain string.
-            if let Some(s) = result.as_str() {
-                return Ok(s.to_string());
-            }
-            Err(BridgeError::Message(format!(
-                "side question returned no answer: {result}"
-            )))
-        }
+        Some(s) if !s.is_empty() => Ok((s, thinking)),
+        Some(_) => Ok(("No response".into(), thinking)),
+        None => Err(BridgeError::Message(format!(
+            "side question returned no answer: {result}"
+        ))),
     }
 }
 
@@ -922,19 +930,35 @@ mod tests {
     #[test]
     fn parse_btw_answer_from_ext_method_result() {
         let v = json!({ "result": { "answer": "hello side" } });
-        assert_eq!(parse_btw_answer(&v).unwrap(), "hello side");
+        let (a, t) = parse_btw_response(&v).unwrap();
+        assert_eq!(a, "hello side");
+        assert!(t.is_none());
+    }
+
+    #[test]
+    fn parse_btw_answer_with_thinking() {
+        let v = json!({
+            "result": {
+                "answer": "yes",
+                "thinking": "consider the docs"
+            }
+        });
+        let (a, t) = parse_btw_response(&v).unwrap();
+        assert_eq!(a, "yes");
+        assert_eq!(t.as_deref(), Some("consider the docs"));
     }
 
     #[test]
     fn parse_btw_answer_bare() {
         let v = json!({ "answer": "plain" });
-        assert_eq!(parse_btw_answer(&v).unwrap(), "plain");
+        let (a, _) = parse_btw_response(&v).unwrap();
+        assert_eq!(a, "plain");
     }
 
     #[test]
     fn parse_btw_answer_error_field() {
         let v = json!({ "result": null, "error": "boom" });
-        let err = parse_btw_answer(&v).unwrap_err().to_string();
+        let err = parse_btw_response(&v).unwrap_err().to_string();
         assert!(err.contains("boom"), "{err}");
     }
 }
