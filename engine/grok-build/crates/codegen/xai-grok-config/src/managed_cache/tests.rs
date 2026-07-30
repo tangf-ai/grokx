@@ -26,6 +26,7 @@ fn signed_verdict_overrides_marker_both_ways() {
     // Signed says NOT compromised → proceed, overriding the marker's tamper signal.
     assert!(!managed_policy_compromised_decision(
         SignedVerdict::Trusted,
+        || false,
         false,
         Some(&cache),
         home,
@@ -39,6 +40,7 @@ fn signed_verdict_overrides_marker_both_ways() {
     };
     assert!(managed_policy_compromised_decision(
         SignedVerdict::Compromised,
+        || false,
         false,
         Some(&intact),
         home,
@@ -65,6 +67,7 @@ fn signed_verdict_does_not_skip_deploy_key_fingerprint() {
     // opted-in cache.
     assert!(managed_policy_compromised_decision(
         SignedVerdict::Trusted,
+        || false,
         true, // deploy-key fingerprint mismatch
         Some(&opted_in),
         home,
@@ -73,6 +76,7 @@ fn signed_verdict_does_not_skip_deploy_key_fingerprint() {
     // A matching fingerprint trusts the signed verdict as before.
     assert!(!managed_policy_compromised_decision(
         SignedVerdict::Trusted,
+        || false,
         false,
         Some(&opted_in),
         home,
@@ -87,6 +91,7 @@ fn signed_verdict_does_not_skip_deploy_key_fingerprint() {
     };
     assert!(!managed_policy_compromised_decision(
         SignedVerdict::Trusted,
+        || false,
         true,
         Some(&opted_out),
         home,
@@ -96,6 +101,7 @@ fn signed_verdict_does_not_skip_deploy_key_fingerprint() {
     // this opted-OUT marker.
     assert!(managed_policy_compromised_decision(
         SignedVerdict::Compromised,
+        || false,
         true,
         Some(&opted_out),
         home,
@@ -122,6 +128,7 @@ fn unreadable_sidecar_falls_back_to_marker() {
     assert!(
         !managed_policy_compromised_decision(
             SignedVerdict::SidecarUnreadable,
+            || false,
             false,
             Some(&served_fail_closed),
             home,
@@ -133,6 +140,7 @@ fn unreadable_sidecar_falls_back_to_marker() {
     std::fs::remove_file(home.join("requirements.toml")).unwrap();
     assert!(managed_policy_compromised_decision(
         SignedVerdict::SidecarUnreadable,
+        || false,
         false,
         Some(&served_fail_closed),
         home,
@@ -159,6 +167,7 @@ fn missing_sidecar_under_fail_closed_marker_refuses() {
     assert!(
         managed_policy_compromised_decision(
             SignedVerdict::NoAuthenticSidecar,
+            || false,
             false,
             Some(&served_fail_closed),
             home,
@@ -174,6 +183,7 @@ fn missing_sidecar_under_fail_closed_marker_refuses() {
     };
     assert!(!managed_policy_compromised_decision(
         SignedVerdict::NoAuthenticSidecar,
+        || false,
         false,
         Some(&served_nothing),
         home,
@@ -188,6 +198,7 @@ fn missing_sidecar_under_fail_closed_marker_refuses() {
     };
     assert!(!managed_policy_compromised_decision(
         SignedVerdict::NoAuthenticSidecar,
+        || false,
         false,
         Some(&opted_out),
         home,
@@ -196,6 +207,7 @@ fn missing_sidecar_under_fail_closed_marker_refuses() {
     // No marker at all → nothing to enforce.
     assert!(!managed_policy_compromised_decision(
         SignedVerdict::NoAuthenticSidecar,
+        || false,
         false,
         None,
         home,
@@ -219,6 +231,7 @@ fn inactive_verdict_falls_through_to_marker() {
     };
     assert!(managed_policy_compromised_decision(
         SignedVerdict::Inactive,
+        || false,
         false,
         Some(&missing),
         home,
@@ -233,6 +246,7 @@ fn inactive_verdict_falls_through_to_marker() {
     };
     assert!(!managed_policy_compromised_decision(
         SignedVerdict::Inactive,
+        || false,
         false,
         Some(&optout),
         home,
@@ -241,6 +255,7 @@ fn inactive_verdict_falls_through_to_marker() {
     // No marker at all → nothing to enforce.
     assert!(!managed_policy_compromised_decision(
         SignedVerdict::Inactive,
+        || false,
         false,
         None,
         home,
@@ -341,7 +356,7 @@ fn managed_config_stale_at_is_true_for_old_sync() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A served-then-deleted artifact reads stale regardless of the timer.
+/// Served-then-deleted is stale; armed also treats unsigned-on-disk as stale.
 #[test]
 fn managed_config_stale_when_served_artifact_deleted() {
     let dir = std::env::temp_dir().join(format!("grok-stale-artgone-{}", std::process::id()));
@@ -357,8 +372,13 @@ fn managed_config_stale_when_served_artifact_deleted() {
         },
     );
     std::fs::write(dir.join("requirements.toml"), "[features]\n").unwrap();
-    assert!(!managed_config_stale_at(Some(&dir), &team("team-1")));
+    let cache = read_managed_config_cache(&dir).unwrap();
+    // present → usable; deleted → tamper
+    assert!(!cache_unusable_for(&cache, &dir, &team("team-1")));
+    // armed: unsigned policy still hard-stale
+    assert!(managed_config_stale_at(Some(&dir), &team("team-1")));
     std::fs::remove_file(dir.join("requirements.toml")).unwrap();
+    assert!(cache_unusable_for(&cache, &dir, &team("team-1")));
     assert!(managed_config_stale_at(Some(&dir), &team("team-1")));
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -426,7 +446,7 @@ fn managed_config_legacy_marker_is_conservative() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Hard-staleness: missing artifact or identity mismatch → true; a fresh same-identity cache → false.
+/// Hard-stale: missing artifact or identity mismatch; fresh same-identity is usable.
 #[test]
 fn hard_stale_only_on_missing_or_identity() {
     let dir = std::env::temp_dir().join(format!("grok-hardstale-{}", std::process::id()));
@@ -442,12 +462,16 @@ fn hard_stale_only_on_missing_or_identity() {
         },
     );
     std::fs::write(dir.join("requirements.toml"), "[features]\n").unwrap();
-    // Same identity, artifact present → not hard-stale (even past the timer).
-    assert!(!is_managed_config_hard_stale_for_at(&dir, &team("team-a")));
-    // Different identity → hard-stale.
-    assert!(is_managed_config_hard_stale_for_at(&dir, &team("team-b")));
-    // Served artifact deleted → hard-stale.
+    let cache = read_managed_config_cache(&dir).unwrap();
+    // same identity + present → usable
+    assert!(!cache_unusable_for(&cache, &dir, &team("team-a")));
+    // different identity → unusable
+    assert!(cache_unusable_for(&cache, &dir, &team("team-b")));
+    // deleted artifact → unusable
     std::fs::remove_file(dir.join("requirements.toml")).unwrap();
+    assert!(cache_unusable_for(&cache, &dir, &team("team-a")));
+    // armed: unsigned still hard-stale
+    std::fs::write(dir.join("requirements.toml"), "[features]\n").unwrap();
     assert!(is_managed_config_hard_stale_for_at(&dir, &team("team-a")));
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -479,7 +503,7 @@ fn corrupt_marker_reads_as_no_marker_and_allows() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A deploy-key switch is detected offline as an identity mismatch (`cache_unusable_for`) and refetched online.
+/// Deploy-key switch → offline identity mismatch (refetch online).
 #[test]
 fn deployment_key_switch_is_stale_and_tampered_offline() {
     let dir = std::env::temp_dir().join(format!("grok-dk-switch-{}", std::process::id()));
@@ -496,18 +520,21 @@ fn deployment_key_switch_is_stale_and_tampered_offline() {
         },
     );
     std::fs::write(dir.join("requirements.toml"), "[features]\n").unwrap();
+    let cache = read_managed_config_cache(&dir).unwrap();
 
-    // Same key, artifacts intact → not stale, not tampered.
-    assert!(!is_managed_config_hard_stale_for_at(&dir, &dkey("fp-a")));
-    assert!(!managed_config_stale_at(Some(&dir), &dkey("fp-a")));
+    // same key → usable
+    assert!(!cache_unusable_for(&cache, &dir, &dkey("fp-a")));
+    assert!(!cache_key_fingerprint_mismatch(&cache, &dkey("fp-a")));
 
-    // Different key (fp-b) → identity mismatch: hard-stale and tampered.
+    // different key → unusable
+    assert!(cache_unusable_for(&cache, &dir, &dkey("fp-b")));
+    assert!(cache_key_fingerprint_mismatch(&cache, &dkey("fp-b")));
     assert!(is_managed_config_hard_stale_for_at(&dir, &dkey("fp-b")));
     assert!(managed_config_stale_at(Some(&dir), &dkey("fp-b")));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A pre-upgrade marker (no `key_fingerprint`) must not fire when a key is now configured — it self-upgrades next sync.
+/// Pre-upgrade marker (no fingerprint) must not fire key dimension.
 #[test]
 fn pre_upgrade_marker_without_fingerprint_does_not_fire_on_key() {
     let dir = std::env::temp_dir().join(format!("grok-dk-preupgrade-{}", std::process::id()));
@@ -523,16 +550,14 @@ fn pre_upgrade_marker_without_fingerprint_does_not_fire_on_key() {
     )
     .unwrap();
     std::fs::write(dir.join("requirements.toml"), "[features]\n").unwrap();
-    // A key is configured now but the marker has none → no key mismatch, no spurious refetch.
-    assert!(!is_managed_config_hard_stale_for_at(
-        &dir,
-        &dkey("fp-current")
-    ));
-    assert!(!managed_config_stale_at(Some(&dir), &dkey("fp-current")));
+    // key now configured, marker has none → no mismatch
+    let cache = read_managed_config_cache(&dir).unwrap();
+    assert!(!cache_key_fingerprint_mismatch(&cache, &dkey("fp-current")));
+    assert!(!cache_unusable_for(&cache, &dir, &dkey("fp-current")));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The team path keys on `principal` (team id), records no fingerprint, and never fires a key mismatch.
+/// Team path: principal only; never a key mismatch.
 #[test]
 fn team_path_keys_on_principal_not_key_fingerprint() {
     let dir = std::env::temp_dir().join(format!("grok-team-nofp-{}", std::process::id()));
@@ -548,9 +573,12 @@ fn team_path_keys_on_principal_not_key_fingerprint() {
         },
     );
     std::fs::write(dir.join("requirements.toml"), "[features]\n").unwrap();
+    let cache = read_managed_config_cache(&dir).unwrap();
     // Team path: identity carries no fingerprint → never a key mismatch.
-    assert!(!is_managed_config_hard_stale_for_at(&dir, &team("team-a")));
+    assert!(!cache_key_fingerprint_mismatch(&cache, &team("team-a")));
+    assert!(!cache_unusable_for(&cache, &dir, &team("team-a")));
     // A team switch is still detected via principal (unchanged behavior).
+    assert!(cache_unusable_for(&cache, &dir, &team("team-b")));
     assert!(is_managed_config_hard_stale_for_at(&dir, &team("team-b")));
     // No key fingerprint is recorded on the team path.
     let marker = std::fs::read_to_string(dir.join(MANAGED_CONFIG_CACHE_FILE)).unwrap();
@@ -721,7 +749,7 @@ fn blank_principal_is_never_a_confirmed_switch() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Compromised only when opted in AND tampered; opted-out / never-synced / config-less / intact is never flagged.
+/// Armed: fail-closed + served policy requires authentic sidecar.
 #[test]
 fn compromised_only_when_opted_in_and_deleted_or_substituted() {
     let dir = std::env::temp_dir().join(format!("grok-compromised-{}", std::process::id()));
@@ -731,7 +759,7 @@ fn compromised_only_when_opted_in_and_deleted_or_substituted() {
     let _ = std::fs::remove_file(dir.join(MANAGED_CONFIG_CACHE_FILE));
     assert!(!managed_policy_compromised_for_at(&dir, &team("team-a")));
 
-    // Opted-in + present + same identity → not compromised.
+    // opted-in, no sidecar → refuse when armed
     std::fs::write(dir.join("requirements.toml"), "[features]\n").unwrap();
     mark_managed_config_synced_at(
         &dir,
@@ -743,7 +771,7 @@ fn compromised_only_when_opted_in_and_deleted_or_substituted() {
             fail_closed: true,
         },
     );
-    assert!(!managed_policy_compromised_for_at(&dir, &team("team-a")));
+    assert!(managed_policy_compromised_for_at(&dir, &team("team-a")));
 
     // Served-then-deleted (admin opted in) → compromised.
     std::fs::remove_file(dir.join("requirements.toml")).unwrap();
@@ -783,15 +811,16 @@ fn compromised_only_when_opted_in_and_deleted_or_substituted() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The OTHER served artifact — `managed_config.toml`, not just `requirements.toml` —
-/// deleted under a fail_closed marker is compromised.
+/// fail_closed + deleted managed_config.toml is compromised.
 #[test]
 fn compromised_on_managed_config_deletion_when_fail_closed() {
+    use crate::signed_policy::SignedVerdict;
     let dir = std::env::temp_dir().join(format!("grok-compromised-mc-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("managed_config.toml"), "[cli]\n").unwrap();
+    let home = dir.as_path();
+    std::fs::create_dir_all(home).unwrap();
+    std::fs::write(home.join("managed_config.toml"), "[cli]\n").unwrap();
     mark_managed_config_synced_at(
-        &dir,
+        home,
         SyncMarker {
             principal: Some("team-a"),
             had_managed_config: true,
@@ -800,24 +829,43 @@ fn compromised_on_managed_config_deletion_when_fail_closed() {
             fail_closed: true,
         },
     );
-    // Present → not compromised.
-    assert!(!managed_policy_compromised_for_at(&dir, &team("team-a")));
+    let cache = read_managed_config_cache(home);
+    // present → not compromised (marker)
+    assert!(!managed_policy_compromised_decision(
+        SignedVerdict::Inactive,
+        || false,
+        false,
+        cache.as_ref(),
+        home,
+        &team("team-a")
+    ));
     // Served-then-deleted managed_config.toml → compromised by the missing artifact.
-    std::fs::remove_file(dir.join("managed_config.toml")).unwrap();
-    assert!(managed_policy_compromised_for_at(&dir, &team("team-a")));
+    std::fs::remove_file(home.join("managed_config.toml")).unwrap();
+    assert!(managed_policy_compromised_decision(
+        SignedVerdict::Inactive,
+        || false,
+        false,
+        cache.as_ref(),
+        home,
+        &team("team-a")
+    ));
+    // armed public gate refuses sidecar-less fail-closed
+    assert!(managed_policy_compromised_for_at(home, &team("team-a")));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Deployment-key path: an opted-in marker is compromised on an offline key switch (the fingerprint is the only offline identity).
+/// Offline deploy-key switch on opted-in marker is compromised.
 #[test]
 fn compromised_on_deployment_key_switch_when_fail_closed() {
+    use crate::signed_policy::SignedVerdict;
     let dir = std::env::temp_dir().join(format!("grok-compromised-dk-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let home = dir.as_path();
+    std::fs::create_dir_all(home).unwrap();
 
     // Provisioned with key A (fp-a), opted into fail_closed, artifact present.
-    std::fs::write(dir.join("requirements.toml"), "[features]\n").unwrap();
+    std::fs::write(home.join("requirements.toml"), "[features]\n").unwrap();
     mark_managed_config_synced_at(
-        &dir,
+        home,
         SyncMarker {
             principal: Some("dep-A"),
             had_managed_config: false,
@@ -826,16 +874,32 @@ fn compromised_on_deployment_key_switch_when_fail_closed() {
             fail_closed: true,
         },
     );
+    let cache = read_managed_config_cache(home);
 
-    // Same key, offline → not compromised (ALLOW).
-    assert!(!managed_policy_compromised_for_at(&dir, &dkey("fp-a")));
+    // same key offline → allow (marker)
+    assert!(!managed_policy_compromised_decision(
+        SignedVerdict::Inactive,
+        || false,
+        false,
+        cache.as_ref(),
+        home,
+        &dkey("fp-a")
+    ));
+    // different key offline → refuse
+    assert!(managed_policy_compromised_decision(
+        SignedVerdict::Inactive,
+        || false,
+        true,
+        cache.as_ref(),
+        home,
+        &dkey("fp-b")
+    ));
+    // armed public gate agrees
+    assert!(managed_policy_compromised_for_at(home, &dkey("fp-b")));
 
-    // Different key (fp-b) → compromised (REFUSE): offline deploy-key switch.
-    assert!(managed_policy_compromised_for_at(&dir, &dkey("fp-b")));
-
-    // Not opted in (fail_closed=false): a key switch is NOT failed closed.
+    // fail_closed=false: key switch not refused
     mark_managed_config_synced_at(
-        &dir,
+        home,
         SyncMarker {
             principal: Some("dep-A"),
             had_managed_config: false,
@@ -844,22 +908,23 @@ fn compromised_on_deployment_key_switch_when_fail_closed() {
             fail_closed: false,
         },
     );
-    assert!(!managed_policy_compromised_for_at(&dir, &dkey("fp-b")));
+    assert!(!managed_policy_compromised_for_at(home, &dkey("fp-b")));
 
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The gate refuses ONLY on tamper for the CURRENT principal (artifact missing or changed key fingerprint),
-/// never a pure identity mismatch; staleness still treats that mismatch as a refetch trigger (asserted alongside).
+/// Marker refuses only current-principal tamper, not pure identity mismatch.
 #[test]
 fn gate_excludes_pure_identity_mismatch_but_keeps_artifact_and_key_tamper() {
+    use crate::signed_policy::SignedVerdict;
     let dir = std::env::temp_dir().join(format!("grok-gate-fix1-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let home = dir.as_path();
+    std::fs::create_dir_all(home).unwrap();
 
     // (1) Principal A (fail_closed), artifact intact; serving team-b = pure identity mismatch → ALLOWED.
-    std::fs::write(dir.join("requirements.toml"), "[features]\n").unwrap();
+    std::fs::write(home.join("requirements.toml"), "[features]\n").unwrap();
     mark_managed_config_synced_at(
-        &dir,
+        home,
         SyncMarker {
             principal: Some("dep-A"),
             had_managed_config: false,
@@ -868,19 +933,27 @@ fn gate_excludes_pure_identity_mismatch_but_keeps_artifact_and_key_tamper() {
             fail_closed: true,
         },
     );
+    let cache = read_managed_config_cache(home);
     assert!(
-        !managed_policy_compromised_for_at(&dir, &team("team-b")),
-        "a foreign/stale principal's fail_closed must NOT refuse the current session"
+        !managed_policy_compromised_decision(
+            SignedVerdict::Inactive,
+            || false,
+            false,
+            cache.as_ref(),
+            home,
+            &team("team-b")
+        ),
+        "a foreign/stale principal's fail_closed must NOT refuse on the marker path"
     );
     // ...but still stale for B → the refetch path rebinds online.
     assert!(
-        is_managed_config_hard_stale_for_at(&dir, &team("team-b")),
+        is_managed_config_hard_stale_for_at(home, &team("team-b")),
         "a pure identity mismatch must still trigger a refetch (rebind)"
     );
 
-    // (2) Same principal, served artifact now missing → still REFUSED offline.
+    // (2) same principal, artifact missing → refuse offline
     mark_managed_config_synced_at(
-        &dir,
+        home,
         SyncMarker {
             principal: Some("team-b"),
             had_managed_config: false,
@@ -889,16 +962,25 @@ fn gate_excludes_pure_identity_mismatch_but_keeps_artifact_and_key_tamper() {
             fail_closed: true,
         },
     );
-    std::fs::remove_file(dir.join("requirements.toml")).unwrap();
+    std::fs::remove_file(home.join("requirements.toml")).unwrap();
+    let cache = read_managed_config_cache(home);
     assert!(
-        managed_policy_compromised_for_at(&dir, &team("team-b")),
+        managed_policy_compromised_decision(
+            SignedVerdict::Inactive,
+            || false,
+            false,
+            cache.as_ref(),
+            home,
+            &team("team-b")
+        ),
         "same-principal served-then-deleted artifact must fail closed offline"
     );
+    assert!(managed_policy_compromised_for_at(home, &team("team-b")));
 
     // (3) Deploy-key fingerprint mismatch for the current key → still REFUSED.
-    std::fs::write(dir.join("requirements.toml"), "[features]\n").unwrap();
+    std::fs::write(home.join("requirements.toml"), "[features]\n").unwrap();
     mark_managed_config_synced_at(
-        &dir,
+        home,
         SyncMarker {
             principal: Some("dep-A"),
             had_managed_config: false,
@@ -907,24 +989,35 @@ fn gate_excludes_pure_identity_mismatch_but_keeps_artifact_and_key_tamper() {
             fail_closed: true,
         },
     );
+    let cache = read_managed_config_cache(home);
     assert!(
-        managed_policy_compromised_for_at(&dir, &dkey("fp-b")),
+        managed_policy_compromised_decision(
+            SignedVerdict::Inactive,
+            || false,
+            true,
+            cache.as_ref(),
+            home,
+            &dkey("fp-b")
+        ),
         "a changed deployment-key fingerprint must fail closed offline"
     );
+    assert!(managed_policy_compromised_for_at(home, &dkey("fp-b")));
 
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Opt-in comes from the served response, not disk, so a no-write sync can't disarm the gate.
+/// Opt-in from response, not disk; no-write sync cannot disarm.
 #[test]
 fn mark_keeps_fail_closed_armed_without_on_disk_file() {
+    use crate::signed_policy::SignedVerdict;
     let dir = std::env::temp_dir().join(format!("grok-mark-disarm-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let home = dir.as_path();
+    std::fs::create_dir_all(home).unwrap();
 
-    // Opted-in policy served + present → not compromised (intact).
-    std::fs::write(dir.join("requirements.toml"), "[features]\n").unwrap();
+    // opted-in + present → allow (marker)
+    std::fs::write(home.join("requirements.toml"), "[features]\n").unwrap();
     mark_managed_config_synced_at(
-        &dir,
+        home,
         SyncMarker {
             principal: Some("team-1"),
             had_managed_config: false,
@@ -933,15 +1026,31 @@ fn mark_keeps_fail_closed_armed_without_on_disk_file() {
             fail_closed: true,
         },
     );
-    assert!(!managed_policy_compromised_for_at(&dir, &team("team-1")));
+    let cache = read_managed_config_cache(home);
+    assert!(!managed_policy_compromised_decision(
+        SignedVerdict::Inactive,
+        || false,
+        false,
+        cache.as_ref(),
+        home,
+        &team("team-1")
+    ));
 
-    // Tamper: delete the served file → compromised.
-    std::fs::remove_file(dir.join("requirements.toml")).unwrap();
-    assert!(managed_policy_compromised_for_at(&dir, &team("team-1")));
+    // delete served file → compromised
+    std::fs::remove_file(home.join("requirements.toml")).unwrap();
+    assert!(managed_policy_compromised_decision(
+        SignedVerdict::Inactive,
+        || false,
+        false,
+        cache.as_ref(),
+        home,
+        &team("team-1")
+    ));
+    assert!(managed_policy_compromised_for_at(home, &team("team-1")));
 
     // A no-write sync (file still absent) stays armed: opt-in is from the response.
     mark_managed_config_synced_at(
-        &dir,
+        home,
         SyncMarker {
             principal: Some("team-1"),
             had_managed_config: false,
@@ -951,13 +1060,13 @@ fn mark_keeps_fail_closed_armed_without_on_disk_file() {
         },
     );
     assert!(
-        managed_policy_compromised_for_at(&dir, &team("team-1")),
+        managed_policy_compromised_for_at(home, &team("team-1")),
         "a no-write sync must not disarm the fail-closed gate"
     );
 
-    // An opt-OUT (fail_closed=false) still takes effect.
+    // fail_closed=false still takes effect
     mark_managed_config_synced_at(
-        &dir,
+        home,
         SyncMarker {
             principal: Some("team-1"),
             had_managed_config: false,
@@ -966,7 +1075,7 @@ fn mark_keeps_fail_closed_armed_without_on_disk_file() {
             fail_closed: false,
         },
     );
-    assert!(!managed_policy_compromised_for_at(&dir, &team("team-1")));
+    assert!(!managed_policy_compromised_for_at(home, &team("team-1")));
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -1010,3 +1119,371 @@ fn gate_retries_once_on_a_compromised_verdict() {
     assert!(refused);
     assert_eq!(evals, 1);
 }
+
+/// The offline purge detector: fires only on a marker-recorded TEAM switch, returning the
+/// evicted principal; a key-scoped marker means the key owns the machine's policy, so a
+/// team mismatch (even with live config unreadable/blipping) must never confirm.
+#[test]
+fn confirmed_team_switch_scopes_to_marker() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+
+    // No marker → no switch (first run / signed-out).
+    assert_eq!(confirmed_team_switch_at(home, "team-b"), None);
+
+    // Team marker A → B confirms and reports the evicted principal; same team doesn't.
+    mark_managed_config_synced_at(
+        home,
+        SyncMarker {
+            principal: Some("team-a"),
+            had_managed_config: true,
+            had_requirements: true,
+            key_fingerprint: None,
+            fail_closed: true,
+        },
+    );
+    assert_eq!(
+        confirmed_team_switch_at(home, "team-b").as_deref(),
+        Some("team-a")
+    );
+    assert_eq!(confirmed_team_switch_at(home, "team-a"), None);
+
+    // Key-scoped marker (dk-synced): a differing team NEVER confirms — the regression
+    // shape is a dk machine with a team user signed in and config resolution blipping.
+    mark_managed_config_synced_at(
+        home,
+        SyncMarker {
+            principal: Some("dk-deployment-1"),
+            had_managed_config: true,
+            had_requirements: true,
+            key_fingerprint: Some("fp-1"),
+            fail_closed: true,
+        },
+    );
+    assert_eq!(confirmed_team_switch_at(home, "team-b"), None);
+}
+
+/// Blank identity values normalize to `None` at the marker WRITE, so no reader can
+/// treat "unknown" as a distinct tenant (the detectors' blank guards stay as
+/// defense in depth).
+#[test]
+fn marker_write_normalizes_blank_identities() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    mark_managed_config_synced_at(
+        home,
+        SyncMarker {
+            principal: Some("   "),
+            had_managed_config: true,
+            had_requirements: true,
+            key_fingerprint: Some(""),
+            fail_closed: true,
+        },
+    );
+    let cache = read_managed_config_cache(home).expect("marker written");
+    assert_eq!(
+        cache.principal, None,
+        "blank principal must not be recorded"
+    );
+    assert_eq!(
+        cache.key_fingerprint, None,
+        "blank fingerprint must not be recorded"
+    );
+    // And a blank-recorded marker can't confirm a switch.
+    assert_eq!(confirmed_team_switch_at(home, "team-b"), None);
+}
+
+/// Identity values are stored TRIMMED at the marker write, so a marker can never
+/// differ from a live value by surrounding whitespace alone.
+#[test]
+fn marker_write_trims_identity_values() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    mark_managed_config_synced_at(
+        home,
+        SyncMarker {
+            principal: Some("  team-a  "),
+            had_managed_config: true,
+            had_requirements: true,
+            key_fingerprint: Some(" fp-1 "),
+            fail_closed: false,
+        },
+    );
+    let cache = read_managed_config_cache(home).expect("marker written");
+    assert_eq!(cache.principal.as_deref(), Some("team-a"));
+    assert_eq!(cache.key_fingerprint.as_deref(), Some("fp-1"));
+}
+
+/// The one home of the blank + trim rules ([`known`] + `confirmed_switch`): both sides
+/// known and differing on their trimmed forms, else `None`.
+#[test]
+fn confirmed_switch_requires_two_known_differing_sides() {
+    assert_eq!(confirmed_switch(Some("a"), Some("b")), Some("a"));
+    assert_eq!(confirmed_switch(Some("a"), Some("a")), None);
+    assert_eq!(confirmed_switch(Some(" "), Some("b")), None);
+    assert_eq!(confirmed_switch(Some("a"), Some("")), None);
+    assert_eq!(confirmed_switch(None, Some("b")), None);
+    assert_eq!(confirmed_switch(Some("a"), None), None);
+    assert_eq!(confirmed_switch(None, None), None);
+    // Whitespace is not identity: a marker written untrimmed by an older build must
+    // not read as a tenant switch against the same (trimmed) value...
+    assert_eq!(confirmed_switch(Some("team-a "), Some("team-a")), None);
+    assert_eq!(confirmed_switch(Some("team-a"), Some("team-a ")), None);
+    // ...while genuinely different trimmed values still switch (the recorded value
+    // is returned verbatim for logging).
+    assert_eq!(
+        confirmed_switch(Some(" team-a "), Some("team-b")),
+        Some(" team-a ")
+    );
+}
+
+/// Staleness identity compare is trim-aware (sibling of marker write normalize).
+#[test]
+fn cache_identity_mismatch_ignores_whitespace_only_diffs() {
+    let cache = ManagedConfigCache {
+        principal: Some("team-a".into()),
+        ..Default::default()
+    };
+    assert!(
+        !cache_identity_mismatch(&cache, &team(" team-a ")),
+        "whitespace-only team id diff must not hard-stale"
+    );
+    assert!(
+        cache_identity_mismatch(&cache, &team("team-b")),
+        "a real team switch must still mismatch"
+    );
+    // One-sided known still mismatches (first install / cleared marker fields).
+    let empty = ManagedConfigCache::default();
+    assert!(cache_identity_mismatch(&empty, &team("team-a")));
+}
+
+/// Tick raises an existing floor, never lowers it, and never creates a marker.
+#[test]
+fn rollback_floor_ticks_up_never_down_and_never_creates_a_marker() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let floor = |home: &Path| read_managed_config_cache(home).map_or(0, |c| c.rollback_floor);
+
+    raise_rollback_floor(home, 5_000);
+    assert!(
+        read_managed_config_cache(home).is_none(),
+        "the tick must not create a marker"
+    );
+
+    mark_managed_config_synced_at(
+        home,
+        SyncMarker {
+            principal: Some("team-a"),
+            had_managed_config: false,
+            had_requirements: false,
+            key_fingerprint: None,
+            fail_closed: false,
+        },
+    );
+    let base = floor(home);
+    assert!(
+        base >= 1_700_000_000,
+        "a fetch seeds the floor at the wall clock"
+    );
+
+    raise_rollback_floor(home, base + 1_000);
+    assert_eq!(floor(home), base + 1_000);
+    raise_rollback_floor(home, base);
+    assert_eq!(floor(home), base + 1_000, "the tick never lowers the floor");
+}
+
+/// The floor RMW preserves marker fields this binary doesn't know (mixed-version homes).
+#[test]
+fn floor_bump_preserves_unknown_marker_fields() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    std::fs::write(
+        home.join(MANAGED_CONFIG_CACHE_FILE),
+        r#"{"synced_at":1700000000,"rollback_floor":1700000000,"from_the_future":true}"#,
+    )
+    .unwrap();
+    raise_rollback_floor(home, 1_700_000_100);
+    let marker = std::fs::read_to_string(home.join(MANAGED_CONFIG_CACHE_FILE)).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&marker).unwrap();
+    assert_eq!(v["rollback_floor"].as_u64(), Some(1_700_000_100));
+    assert_eq!(
+        v["from_the_future"],
+        serde_json::Value::Bool(true),
+        "the RMW must not strip fields a newer binary wrote: {marker}"
+    );
+}
+
+/// Successful fetch resets (never maxes) an inflated floor to the wall clock.
+#[test]
+fn fetch_resets_an_inflated_rollback_floor() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    std::fs::write(
+        home.join(MANAGED_CONFIG_CACHE_FILE),
+        r#"{"rollback_floor":9999999999}"#,
+    )
+    .unwrap();
+
+    mark_managed_config_synced_at(
+        home,
+        SyncMarker {
+            principal: Some("team-a"),
+            had_managed_config: false,
+            had_requirements: false,
+            key_fingerprint: None,
+            fail_closed: false,
+        },
+    );
+    let floor = read_managed_config_cache(home).map_or(0, |c| c.rollback_floor);
+    assert!(
+        (1_700_000_000..9_999_999_999).contains(&floor),
+        "the fetch must reset the inflated floor to the wall clock, got {floor}"
+    );
+}
+
+/// Keyless: public tick is a no-op.
+#[test]
+fn bump_rollback_floor_is_inert_when_dark() {
+    crate::signed_policy::test_seam::with_dark(|| {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        mark_managed_config_synced_at(
+            home,
+            SyncMarker {
+                principal: Some("team-a"),
+                had_managed_config: false,
+                had_requirements: false,
+                key_fingerprint: None,
+                fail_closed: false,
+            },
+        );
+        let floor = |home: &Path| read_managed_config_cache(home).map_or(0, |c| c.rollback_floor);
+        let base = floor(home);
+        assert!(!crate::signed_policy::verification_active());
+        bump_rollback_floor_with_now(home, base + 10_000);
+        assert_eq!(
+            floor(home),
+            base,
+            "dark build: the tick must not move the floor"
+        );
+    });
+}
+
+/// Armed: public tick raises the floor.
+#[test]
+fn bump_rollback_floor_raises_when_verification_active() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    mark_managed_config_synced_at(
+        home,
+        SyncMarker {
+            principal: Some("team-a"),
+            had_managed_config: false,
+            had_requirements: false,
+            key_fingerprint: None,
+            fail_closed: false,
+        },
+    );
+    let floor = |home: &Path| read_managed_config_cache(home).map_or(0, |c| c.rollback_floor);
+    let base = floor(home);
+    assert!(crate::signed_policy::verification_active());
+    let raised = base + 10_000;
+    bump_rollback_floor_with_now(home, raised);
+    assert_eq!(
+        floor(home),
+        raised,
+        "armed build: the tick must raise the floor"
+    );
+}
+
+/// Far-future `synced_at` is stale; modest forward skew stays fresh.
+#[test]
+fn managed_config_stale_for_far_future_sync() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    // ~year 3000: beyond the skew allowance.
+    std::fs::write(
+        home.join(MANAGED_CONFIG_CACHE_FILE),
+        "{\"synced_at\":32503680000}",
+    )
+    .unwrap();
+    assert!(
+        managed_config_stale_at(Some(home), &ServingIdentity::None),
+        "a far-future synced_at must not freeze the refetch timer"
+    );
+
+    // Past `SystemTime`'s range: must read stale, not panic (would kill the sync task).
+    std::fs::write(
+        home.join(MANAGED_CONFIG_CACHE_FILE),
+        format!("{{\"synced_at\":{}}}", u64::MAX),
+    )
+    .unwrap();
+    assert!(
+        managed_config_stale_at(Some(home), &ServingIdentity::None),
+        "an out-of-range synced_at reads stale"
+    );
+
+    let in_a_minute = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 60;
+    std::fs::write(
+        home.join(MANAGED_CONFIG_CACHE_FILE),
+        format!("{{\"synced_at\":{in_a_minute}}}"),
+    )
+    .unwrap();
+    assert!(
+        !managed_config_stale_at(Some(home), &ServingIdentity::None),
+        "a minute of genuine clock skew still reads fresh"
+    );
+}
+
+/// Unreadable requirements (PermissionDenied) with no fail_closed marker must
+/// still arm the gate so clear_orphan cannot wipe policy that may still be
+/// fail_closed on disk.
+#[test]
+#[cfg(unix)]
+fn unreadable_requirements_treats_fail_closed_as_armed() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let req = home.join(crate::loader::REQUIREMENTS_FILENAME);
+    std::fs::write(&req, "fail_closed = true\n").unwrap();
+    assert!(
+        fail_closed_policy_armed_at(home),
+        "readable fail_closed requirements must arm the gate"
+    );
+
+    // Drop read perms so read_to_string fails with PermissionDenied (not NotFound).
+    std::fs::set_permissions(&req, std::fs::Permissions::from_mode(0o000)).unwrap();
+    // Restore on drop so tempfile cleanup can remove the file.
+    struct RestorePerms<'a>(&'a std::path::Path);
+    impl Drop for RestorePerms<'_> {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(self.0, std::fs::Permissions::from_mode(0o600));
+        }
+    }
+    let _restore = RestorePerms(&req);
+
+    assert!(
+        fail_closed_policy_armed_at(home),
+        "unreadable requirements must treat fail_closed as armed (no wipe)"
+    );
+}
+
+/// Absent requirements + no fail_closed marker → not armed (safe to clear).
+#[test]
+fn missing_requirements_and_marker_not_armed() {
+    let dir = tempfile::tempdir().unwrap();
+    assert!(
+        !fail_closed_policy_armed_at(dir.path()),
+        "NotFound requirements with no marker must not arm fail_closed"
+    );
+}
+
+// The is-managed claim gate tests live in a sibling child module (this file is
+// past the 1k-line mark); same private access via the #[path] include below.
+#[path = "claim_tests.rs"]
+mod claim_tests;

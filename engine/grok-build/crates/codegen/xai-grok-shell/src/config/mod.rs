@@ -224,6 +224,9 @@ impl MemoryConfig {
 pub struct SubagentsConfig {
     /// Whether subagent support is enabled.
     pub enabled: bool,
+    /// Raw `[subagents] max_depth` (i64 so out-of-range parses; clamped ≥1 at resolve).
+    #[serde(default)]
+    pub max_depth: Option<i64>,
     /// Per-subagent model ID overrides.
     /// Keys are agent names, values are model IDs that must exist in the
     /// available models registry. Parsed from `[subagents.models]` in config.toml.
@@ -283,7 +286,7 @@ impl SubagentsConfig {
         let entries = match std::fs::read_dir(dir) {
             Ok(e) => e,
             Err(e) => {
-                tracing::debug!(error = % e, "Failed to read personas directory");
+                tracing::debug!(error = %e, "Failed to read personas directory");
                 return;
             }
         };
@@ -303,20 +306,15 @@ impl SubagentsConfig {
                     Ok(mut persona) => {
                         persona.source_dir = path.parent().map(|p| p.to_path_buf());
                         persona.source_path = Some(path.display().to_string());
-                        tracing::debug!(
-                            persona = % name, "Loaded persona from file"
-                        );
+                        tracing::debug!(persona = %name, "Loaded persona from file");
                         self.personas.insert(name, persona);
                     }
                     Err(e) => {
-                        tracing::warn!(
-                            persona = % name, error = % e,
-                            "Failed to parse persona file"
-                        );
+                        tracing::warn!(persona = %name, error = %e, "Failed to parse persona file");
                     }
                 },
                 Err(e) => {
-                    tracing::warn!(error = % e, "Failed to read persona file");
+                    tracing::warn!(error = %e, "Failed to read persona file");
                 }
             }
         }
@@ -328,7 +326,7 @@ impl SubagentsConfig {
         let entries = match std::fs::read_dir(dir) {
             Ok(e) => e,
             Err(e) => {
-                tracing::debug!(error = % e, "Failed to read roles directory");
+                tracing::debug!(error = %e, "Failed to read roles directory");
                 return;
             }
         };
@@ -341,29 +339,30 @@ impl SubagentsConfig {
                 continue;
             };
             if self.roles.contains_key(&name) {
-                tracing::debug!(
-                    role = % name,
-                    "Skipping file-based role, higher-priority config takes precedence"
-                );
+                tracing::debug!(role = %name, "Skipping file-based role, higher-priority config takes precedence");
                 continue;
             }
             match std::fs::read_to_string(&path) {
                 Ok(content) => match toml::from_str::<SubagentRole>(&content) {
                     Ok(mut role) => {
                         role.source_dir = path.parent().map(|p| p.to_path_buf());
-                        tracing::debug!(role = % name, "Loaded role from file");
+                        tracing::debug!(role = %name, "Loaded role from file");
                         self.roles.insert(name, role);
                     }
                     Err(e) => {
                         tracing::warn!(
-                            role = % name, path = % path.display(), error = % e,
+                            role = %name,
+                            path = %path.display(),
+                            error = %e,
                             "Failed to parse role file"
                         );
                     }
                 },
                 Err(e) => {
                     tracing::warn!(
-                        path = % path.display(), error = % e, "Failed to read role file"
+                        path = %path.display(),
+                        error = %e,
+                        "Failed to read role file"
                     );
                 }
             }
@@ -434,19 +433,81 @@ impl SubagentsConfig {
         let roles_dir = cwd.join(".grok").join("roles");
         self.discover_roles_in_dir(&roles_dir);
     }
+    pub const ENV_MAX_DEPTH: &'static str = "GROK_SUBAGENTS_MAX_DEPTH";
+    pub const DEFAULT_MAX_DEPTH: u32 = 1;
+    /// Clamp to `1..=u32::MAX`. Values below 1 (including 0 / negatives) warn
+    /// and become 1 so nesting is never accidentally disabled.
+    pub fn clamp_max_depth(raw: i64, source: &str) -> u32 {
+        if raw < i64::from(Self::DEFAULT_MAX_DEPTH) {
+            tracing::warn!(
+                source,
+                value = raw,
+                "subagents max_depth < 1; clamping to 1"
+            );
+            Self::DEFAULT_MAX_DEPTH
+        } else if raw > i64::from(u32::MAX) {
+            tracing::warn!(
+                source,
+                value = raw,
+                "subagents max_depth exceeds u32::MAX; clamping"
+            );
+            u32::MAX
+        } else {
+            raw as u32
+        }
+    }
+    /// Precedence: env > TOML > remote > [`Self::DEFAULT_MAX_DEPTH`].
+    ///
+    /// Depth 0 is the top-level session; a child is parent+1. Spawn is rejected
+    /// when `depth >= max`. So `max = 1` allows only top-level spawns; nested
+    /// spawns from a first-level subagent need `max >= 2`.
+    pub fn resolve_max_depth(env: Option<&str>, config: Option<i64>, remote: Option<u32>) -> u32 {
+        if let Some(raw) = env {
+            match raw.trim().parse::<i64>() {
+                Ok(v) => return Self::clamp_max_depth(v, "env"),
+                Err(_) => {
+                    tracing::warn!(
+                        value = %raw,
+                        "invalid GROK_SUBAGENTS_MAX_DEPTH (expected integer); ignoring"
+                    );
+                }
+            }
+        }
+        if let Some(v) = config {
+            return Self::clamp_max_depth(v, "config");
+        }
+        if let Some(v) = remote {
+            return Self::clamp_max_depth(i64::from(v), "remote");
+        }
+        Self::DEFAULT_MAX_DEPTH
+    }
     /// Resolve the final subagents config from all sources (in priority order):
     /// 1. CLI flag `--subagents` (absolute highest — always enables)
     /// 2. `GROK_SUBAGENTS` env var: `1`/`true` enables, `0`/`false` force-disables
     /// 3. Config file `[subagents]` section
     /// 4. Default (enabled)
     ///
-    /// Subagents are deliberately not remotely gated — only explicit local
+    /// `enabled` is deliberately not remotely gated — only explicit local
     /// intent (CLI flag, `GROK_SUBAGENTS`, `[subagents] enabled`) changes
     /// the default.
     ///
-    /// When `cwd` is provided, file-based roles are discovered from
-    /// `{cwd}/.grok/roles/*.toml` and merged (inline config takes precedence).
-    pub fn resolve(cli_flag: bool, config: &toml::Value, cwd: Option<&std::path::Path>) -> Self {
+    /// Project files are excluded from this trust-independent base; Task
+    /// boundaries overlay them using the parent cwd's authoritative trust verdict.
+    pub fn resolve(cli_flag: bool, config: &toml::Value) -> Self {
+        let user_grok_root = xai_grok_config::user_grok_home();
+        Self::resolve_base_with_sources(
+            cli_flag,
+            config,
+            user_grok_root.as_deref(),
+            &bundle::bundled_root(),
+        )
+    }
+    pub(crate) fn resolve_base_with_sources(
+        cli_flag: bool,
+        config: &toml::Value,
+        user_grok_root: Option<&std::path::Path>,
+        bundled_root: &std::path::Path,
+    ) -> Self {
         let mut result: Self = config
             .get("subagents")
             .and_then(|v| v.clone().try_into().ok())
@@ -460,18 +521,39 @@ impl SubagentsConfig {
             true,
         );
         result.enabled = resolved.value;
-        if let Some(cwd) = cwd {
-            result.discover_roles(cwd);
-            result.discover_personas(cwd);
+        if let Some(root) = user_grok_root {
+            result.discover_roles_in_dir(&root.join("roles"));
+            result.discover_personas_in_dir(&root.join("personas"));
         }
-        if let Some(home) = dirs::home_dir() {
-            result.discover_roles(&home);
-            result.discover_personas(&home);
-        }
-        let bundled_root = bundle::bundled_root();
         result.discover_roles_in_dir(&bundled_root.join("roles"));
         result.discover_personas_in_dir(&bundled_root.join("personas"));
         result
+    }
+    pub(crate) fn effective_definition_maps(
+        roles: &std::collections::HashMap<String, SubagentRole>,
+        personas: &std::collections::HashMap<String, SubagentPersona>,
+        cwd: &std::path::Path,
+        project_trusted: bool,
+    ) -> (
+        std::collections::HashMap<String, SubagentRole>,
+        std::collections::HashMap<String, SubagentPersona>,
+    ) {
+        let mut project = Self::default();
+        if project_trusted {
+            project.discover_roles(cwd);
+            project.discover_personas(cwd);
+        }
+        for (name, role) in roles {
+            if role.source_dir.is_none() || !project.roles.contains_key(name) {
+                project.roles.insert(name.clone(), role.clone());
+            }
+        }
+        for (name, persona) in personas {
+            if persona.source_path.is_none() || !project.personas.contains_key(name) {
+                project.personas.insert(name.clone(), persona.clone());
+            }
+        }
+        (project.roles, project.personas)
     }
 }
 /// Managed MCP connector fetching config (`[managed_mcps]` in config.toml).
@@ -739,15 +821,15 @@ impl ToolsConfig {
                     Ok(cfg) if cfg.is_valid() => Some(cfg),
                     Ok(_) => {
                         tracing::warn!(
-                            "tools.zdr_video_output_s3 is present but incomplete; ignoring ZDR video output config"
-                        );
+                                "tools.zdr_video_output_s3 is present but incomplete; ignoring ZDR video output config"
+                            );
                         None
                     }
                     Err(e) => {
                         tracing::warn!(
-                            error = % e,
-                            "tools.zdr_video_output_s3 failed to parse; ignoring ZDR video output config"
-                        );
+                                error = %e,
+                                "tools.zdr_video_output_s3 failed to parse; ignoring ZDR video output config"
+                            );
                         None
                     }
                 }),
@@ -809,6 +891,19 @@ impl StorageMode {
         }
         Self::Local
     }
+    /// Resolve from remote settings, enforcing the rule that `Writeback`
+    /// requires grok.com auth (it syncs to grok-code-backend). This is the
+    /// single home for that gate, used at boot ([`crate::agent::init`]) and by
+    /// the post-readiness self-heal (`MvpAgent::reapply_storage_mode`).
+    pub fn from_remote_gated(
+        remote: Option<&crate::util::config::RemoteSettings>,
+        has_xai_auth: bool,
+    ) -> Self {
+        match Self::resolve(None, remote) {
+            Self::Writeback if !has_xai_auth => Self::Local,
+            mode => mode,
+        }
+    }
     /// Returns true if this mode syncs to the backend.
     pub fn is_writeback(&self) -> bool {
         matches!(self, Self::Writeback)
@@ -817,12 +912,12 @@ impl StorageMode {
 pub use xai_grok_config::ConfigLayers;
 pub use xai_grok_config::{
     MDM_REQUIREMENTS_SOURCE, RequirementsLayer, RequirementsSource, ServingIdentity, SyncMarker,
-    claude_managed_settings_probe_path, fail_closed_flag_from_str,
+    claude_managed_settings_probe_path, confirmed_team_switch, confirmed_team_switch_at,
     is_managed_config_hard_stale_for, is_managed_config_stale_for, load_config_file,
     load_from_disk, load_managed_config, load_merged_requirements, load_system_managed_config,
-    load_toml_file, managed_config_identity_changed, managed_deployment_id,
-    managed_policy_compromised_for, mark_managed_config_synced, requirements_layers,
-    system_config_dir, user_grok_home,
+    load_toml_file, managed_config_identity_changed_at, managed_deployment_id,
+    managed_policy_compromised_for, mark_managed_config_synced, mark_managed_config_synced_at,
+    normalize_identity, requirements_layers, system_config_dir, user_grok_home,
 };
 /// Map of "dotted.path" to which config file the value came from.
 pub fn config_origins(
@@ -1057,10 +1152,11 @@ fn apply_requirements_inner(
     pin_feature!(tool_search);
     pin_feature!(web_fetch);
     pin_feature!(ask_user_question);
-    pin_requirement_only!(image_gen);
+    pin_feature!(image_gen);
     pin_requirement_only!(image_edit);
     pin_feature!(video_gen);
     pin_feature!(write_file);
+    pin_feature!(voice_mode);
     pin_requirement_only!(remote_fetch);
     if let Some(val) = req_bool(req, "telemetry", "trace_upload") {
         config.requirements.trace_upload.pin(val, source.clone());
@@ -1114,6 +1210,17 @@ fn apply_requirements_inner(
     enforce_str!("models", "web_search", config.models.web_search);
     enforce_str!("cli", "channel", config.cli.channel);
     enforce_str!("cli", "minimum_version", config.cli.minimum_version);
+    enforce_str!("cli", "maximum_version", config.cli.maximum_version);
+    enforce_str!(
+        "cli",
+        "required_minimum_version",
+        config.cli.required_minimum_version
+    );
+    enforce_str!(
+        "cli",
+        "required_maximum_version",
+        config.cli.required_maximum_version
+    );
     if let Some(val) = req_str(req, "endpoints", "xai_api_base_url")
         && config.endpoints.xai_api_base_url != val
     {
@@ -1234,8 +1341,8 @@ fn apply_requirements_inner(
     }
     if !enforced.is_empty() {
         tracing::info!(
-            enforced = ? enforced.iter().map(| e | e.to_string()).collect::< Vec < _ >>
-            (), "deployment requirements enforced"
+            enforced = ?enforced.iter().map(|e| e.to_string()).collect::<Vec<_>>(),
+            "deployment requirements enforced"
         );
     }
     enforced
@@ -1279,12 +1386,17 @@ pub fn apply_sandbox(
     #[cfg(target_os = "linux")]
     let requires_read_deny = xai_grok_sandbox::requires_read_deny(&sandbox_profile, &workspace);
     #[cfg(target_os = "linux")]
+    let requires_hook_write_deny =
+        xai_grok_sandbox::requires_hook_write_deny(&sandbox_profile, &workspace);
+    #[cfg(target_os = "linux")]
+    let requires_bwrap = requires_read_deny || requires_hook_write_deny;
+    #[cfg(target_os = "linux")]
     {
         let refuse_unprotected = |detail: &str| {
             eprintln!(
-                "error: this sandbox could not enforce its read-deny set on Linux \
-                 (bubblewrap missing/unusable, or a deny glob exceeded its expansion \
-                 limit — see any message above). Install bubblewrap with \
+                "error: this sandbox could not enforce its mount-namespace deny set \
+                 on Linux (bubblewrap missing/unusable, or a deny glob exceeded its \
+                 expansion limit — see any message above). Install bubblewrap with \
                  `apt install -y bubblewrap` if needed. Refusing to start with denied \
                  paths unprotected.{detail}"
             );
@@ -1293,7 +1405,7 @@ pub fn apply_sandbox(
             Some(mut cmd) => {
                 use std::os::unix::process::CommandExt;
                 let err = cmd.exec();
-                if requires_read_deny {
+                if requires_bwrap {
                     refuse_unprotected(&format!(" (bwrap exec failed: {err})"));
                     std::process::exit(1);
                 }
@@ -1303,7 +1415,19 @@ pub fn apply_sandbox(
                      Install bubblewrap: apt install -y bubblewrap"
                 );
             }
-            None if requires_read_deny && !xai_grok_sandbox::is_inside_bwrap() => {
+            None if requires_bwrap && xai_grok_sandbox::is_inside_bwrap() => {
+                if requires_hook_write_deny
+                    && let Err(e) = xai_grok_sandbox::verify_hook_write_deny_enforced()
+                {
+                    eprintln!(
+                        "error: sandbox reports bwrap but required hook write-deny \
+                         mounts are missing or writable ({e}); refusing to start \
+                         (possible __GROK_INSIDE_BWRAP spoof)"
+                    );
+                    std::process::exit(1);
+                }
+            }
+            None if requires_bwrap => {
                 refuse_unprotected("");
                 std::process::exit(1);
             }
@@ -1312,7 +1436,12 @@ pub fn apply_sandbox(
     }
     if sandbox_profile != xai_grok_sandbox::ProfileName::Off {
         #[cfg(any(target_os = "linux", target_os = "macos"))]
-        let is_custom = matches!(sandbox_profile, xai_grok_sandbox::ProfileName::Custom(_));
+        let requires_protection = {
+            let is_custom = matches!(sandbox_profile, xai_grok_sandbox::ProfileName::Custom(_));
+            let needs_hooks =
+                xai_grok_sandbox::requires_hook_write_deny(&sandbox_profile, &workspace);
+            is_custom || needs_hooks
+        };
         let mut sandbox = xai_grok_sandbox::SandboxManager::new(sandbox_profile, &workspace);
         if let Err(e) = sandbox.apply(&workspace) {
             eprintln!("warning: sandbox could not be applied: {e}");
@@ -1320,14 +1449,27 @@ pub fn apply_sandbox(
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
             #[cfg(target_os = "macos")]
-            let unappliable_custom = is_custom && !sandbox.is_applied();
+            let unappliable = requires_protection && !sandbox.is_applied();
             #[cfg(target_os = "linux")]
-            let unappliable_custom =
-                is_custom && !sandbox.is_applied() && !xai_grok_sandbox::is_inside_bwrap();
-            if unappliable_custom {
+            let unappliable = requires_protection
+                && !sandbox.is_applied()
+                && !xai_grok_sandbox::is_inside_bwrap();
+            if unappliable {
                 eprintln!(
-                    "error: could not apply the '{}' sandbox profile; refusing to start rather than run unsandboxed.",
+                    "error: could not apply the '{}' sandbox profile (including \
+                     direct global-hook write protection); refusing to start.",
                     sandbox.profile()
+                );
+                std::process::exit(1);
+            }
+            #[cfg(target_os = "linux")]
+            if requires_hook_write_deny
+                && xai_grok_sandbox::is_inside_bwrap()
+                && let Err(e) = xai_grok_sandbox::verify_hook_write_deny_enforced()
+            {
+                eprintln!(
+                    "error: required hook write-deny mounts not verified after apply ({e}); \
+                     refusing to start"
                 );
                 std::process::exit(1);
             }

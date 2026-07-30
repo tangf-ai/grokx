@@ -74,7 +74,7 @@ fn toggle_group_tool_calls(harness: &mut PtyHarness, want_on: bool) {
 /// individual Read rows immediately (no `/new` needed — the toggle path must
 /// invalidate cached entry heights); turning it back ON refolds them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "PTY e2e; run with cargo test -p xai-grok-pager --test pty_e2e -- --ignored"]
+#[ignore = "PTY e2e; run the owning pty_e2e_* Cargo test with --ignored (see Cargo.toml)"]
 async fn verb_group_settings_toggle_pty() {
     let content = ContentController::start().await.expect("start content");
     // Pin ON via the CONFIG tier, not the env var — env outranks config in
@@ -91,14 +91,18 @@ async fn verb_group_settings_toggle_pty() {
         std::fs::write(&path, "hello verb group\n").expect("write fixture file");
         paths.push(dunce::canonicalize(&path).unwrap_or(path));
     }
-    for (i, p) in paths.iter().enumerate() {
-        enqueue_tool_turn(
-            &content,
-            &format!("call_t{i}"),
-            "read_file",
-            json!({ "target_file": p.to_string_lossy() }).to_string(),
-        );
-    }
+    let _tool_turns: Vec<_> = paths
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            expect_tool_turn(
+                &content,
+                &format!("call_t{i}"),
+                "read_file",
+                json!({ "target_file": p.to_string_lossy() }).to_string(),
+            )
+        })
+        .collect();
     content.set_response(DONE_SENTINEL);
 
     let binary = pager_binary().expect("resolve pager binary");

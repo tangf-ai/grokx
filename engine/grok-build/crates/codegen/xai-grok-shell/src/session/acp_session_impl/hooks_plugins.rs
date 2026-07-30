@@ -311,6 +311,7 @@ impl SessionActor {
                 match xai_grok_agent::plugins::git_install::install_from_source(
                     &install_source,
                     &registry,
+                    crate::plugin::marketplace_require_sha(),
                 ) {
                     Ok(result) => {
                         let repo = xai_grok_agent::plugins::git_install::build_installed_repo(
@@ -448,7 +449,11 @@ impl SessionActor {
                 let mut messages = Vec::new();
                 let mut any_updated = false;
                 for (key, repo) in &repos_to_update {
-                    match xai_grok_agent::plugins::git_install::update_repo(key, repo) {
+                    match xai_grok_agent::plugins::git_install::update_repo(
+                        key,
+                        repo,
+                        crate::plugin::marketplace_require_sha(),
+                    ) {
                         Ok(status) => {
                             use xai_grok_agent::plugins::git_install::UpdateStatus;
                             match status {
@@ -882,8 +887,18 @@ impl SessionActor {
                     hook_reg.remove_by_prefix("plugin/");
                     hook_reg.append_specs(new_specs);
                 } else if !new_specs.is_empty() {
-                    let (mut new_reg, _) =
-                        xai_grok_hooks::discovery::load_hooks_from_sources(&[], &[]);
+                    // No registry yet: bootstrap config-layer and file hooks (as
+                    // reload_hooks_impl does), not empty sources, so a plugin-first
+                    // snapshot doesn't drop config hooks.
+                    let git_root =
+                        xai_grok_workspace::session::git::find_git_root_from_path(session_cwd).ok();
+                    let is_trusted =
+                        crate::agent::folder_trust::resolve_and_record(session_cwd, None, false);
+                    let (mut new_reg, _errs) = crate::util::hooks::discover_hooks(
+                        git_root.as_deref(),
+                        &self.rebuild_spec.compat,
+                        is_trusted,
+                    );
                     new_reg.append_specs(new_specs);
                     *reg = Some(Arc::new(new_reg));
                 }

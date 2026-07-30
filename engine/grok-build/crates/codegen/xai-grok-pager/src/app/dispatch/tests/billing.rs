@@ -1,6 +1,7 @@
 //! Tests for credit-limit upsells, paywall gating, and auto-topup.
 
 use super::*;
+use xai_grok_shell::sampling::error::is_free_usage_exhausted_error;
 
 // ── Credit-limit upsell / max-tier tests ───────────────────────────
 
@@ -72,6 +73,7 @@ fn credit_limit_retry_preserves_image_submission_state() {
         text: "retry [Image #1]".into(),
         images: vec![image],
         scrollback_entry: crate::scrollback::EntryId::new(0),
+        combined_scrollback_entries: Vec::new(),
         chip_elements: vec![crate::app::agent::ChipElement {
             range: 6..16,
             kind: crate::views::prompt_widget::KIND_IMAGE,
@@ -481,19 +483,201 @@ fn upsell_max_tier_not_idempotent_pushes_multiple_cards() {
     );
 }
 
-// ── ShowUsage dispatch tests ────────────────────────────────────────
+// ── ShowUsage / session usage ───────────────────────────────────────
+
+fn is_session_usage_fetch(effects: &[Effect]) -> bool {
+    matches!(
+        effects,
+        [Effect::FetchSessionUsage { agent_id, .. }] if *agent_id == AgentId(0)
+    )
+}
+
+fn is_nonsilent_billing(effects: &[Effect]) -> bool {
+    matches!(
+        effects,
+        [Effect::FetchBilling { agent_id, silent }] if *agent_id == AgentId(0) && !*silent
+    )
+}
+
+fn complete_session_usage(
+    app: &mut AppView,
+    session_id: &str,
+    usage: xai_grok_shell::extensions::notification::PromptUsage,
+) -> Vec<Effect> {
+    dispatch(
+        Action::TaskComplete(TaskResult::SessionUsageComplete {
+            agent_id: AgentId(0),
+            session_id: session_id.to_string().into(),
+            usage: Box::new(usage),
+        }),
+        app,
+    )
+}
+
+fn fail_session_usage(app: &mut AppView, session_id: &str, error: &str) -> Vec<Effect> {
+    dispatch(
+        Action::TaskComplete(TaskResult::SessionUsageFailed {
+            agent_id: AgentId(0),
+            session_id: session_id.to_string().into(),
+            error: error.into(),
+        }),
+        app,
+    )
+}
 
 #[test]
-fn show_usage_returns_fetch_billing_effect() {
+fn show_usage_schedules_session_fetch_only() {
     let mut app = test_app_with_agent();
+    assert!(is_session_usage_fetch(&dispatch(
+        Action::ShowUsage,
+        &mut app
+    )));
+
+    app.usage_visible = false;
+    assert!(is_session_usage_fetch(&dispatch(
+        Action::ShowUsage,
+        &mut app
+    )));
+}
+
+#[test]
+fn show_usage_without_session_still_surfaces_credits() {
+    let mut app = test_app_with_agent();
+    app.agents.get_mut(&AgentId(0)).unwrap().session.session_id = None;
+    let before = agent_scrollback_len(&app);
     let effects = dispatch(Action::ShowUsage, &mut app);
-    // One non-silent FetchBilling — the effect pulls billing + auto-topup
-    // together and renders a single summary.
-    assert_eq!(effects.len(), 1, "got: {effects:?}");
+    assert!(last_system_text(&app, AgentId(0)).contains("unavailable"));
+    assert_eq!(agent_scrollback_len(&app), before + 1);
+    assert!(is_nonsilent_billing(&effects));
+}
+
+#[test]
+fn team_auth_disables_agent_billing_surface() {
+    let mut app = test_app_with_agent();
+    app.agents
+        .get_mut(&AgentId(0))
+        .unwrap()
+        .billing_surface_visible = true;
+    app.apply_auth_meta(&xai_grok_shell::auth::AuthMeta {
+        team_id: Some("team-uuid".into()),
+        team_name: Some("Acme Corp".into()),
+        ..Default::default()
+    });
+    assert!(!app.usage_visible);
+    assert!(!app.agents.get(&AgentId(0)).unwrap().billing_surface_visible);
+}
+
+#[serial_test::serial(GROK_TEST_OPEN_URL_FILE)]
+#[test]
+fn manage_billing_gates_on_consumer_billing_surface() {
+    let out = std::env::temp_dir().join(format!("grok-manage-billing-{}.txt", std::process::id()));
+    let _ = std::fs::remove_file(&out);
+    // SAFETY: serialized via `serial_test` so no other test races the env var.
+    unsafe { std::env::set_var("GROK_TEST_OPEN_URL_FILE", &out) };
+    let mut app = test_app_with_agent();
+    dispatch(Action::ManageBilling, &mut app);
+    let opened = std::fs::read_to_string(&out).unwrap_or_default();
+    assert!(opened.contains("grok.com/?_s=usage"), "got: {opened}");
+    let _ = std::fs::remove_file(&out);
+
+    // Non-consumer: silent no-op (slash command never offers manage).
+    let mut app = test_app_with_agent();
+    app.usage_visible = false;
+    let before = agent_scrollback_len(&app);
+    assert!(dispatch(Action::ManageBilling, &mut app).is_empty());
+    assert_eq!(agent_scrollback_len(&app), before);
+}
+
+#[test]
+fn session_usage_complete_pushes_block_and_chains_billing() {
+    let mut app = test_app_with_agent();
+    let before = agent_scrollback_len(&app);
+    let usage = xai_grok_shell::extensions::notification::PromptUsage {
+        totals: xai_grok_shell::extensions::notification::PromptUsageModel {
+            input_tokens: 1_000,
+            output_tokens: 100,
+            total_tokens: 1_100,
+            model_calls: 3,
+            cost_usd_ticks: Some(5_000_000_000),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let effects = complete_session_usage(&mut app, "test-session", usage);
+    assert_eq!(agent_scrollback_len(&app), before + 1);
+    let text = last_system_text(&app, AgentId(0));
     assert!(
-        matches!(&effects[0], Effect::FetchBilling { agent_id, silent } if *agent_id == AgentId(0) && !*silent),
-        "effect should be a non-silent FetchBilling, got: {effects:?}"
+        text.contains("Session usage") && text.contains("$0.5000"),
+        "{text}"
     );
+    assert!(is_nonsilent_billing(&effects));
+}
+
+#[test]
+fn session_usage_complete_no_billing_when_surface_hidden() {
+    let mut app = test_app_with_agent();
+    app.usage_visible = false;
+    let before = agent_scrollback_len(&app);
+    let effects = complete_session_usage(&mut app, "test-session", Default::default());
+    assert!(effects.is_empty());
+    // Only the credit follow-up is gated; the session block itself must land.
+    assert_eq!(agent_scrollback_len(&app), before + 1);
+}
+
+#[test]
+fn session_usage_complete_redirect_after_session_block() {
+    let mut app = test_app_with_agent();
+    app.usage_billing_redirect_url = Some("https://billing.example.com/me".into());
+    // Dispatch defers the redirect until after the session block.
+    let before = agent_scrollback_len(&app);
+    assert!(is_session_usage_fetch(&dispatch(
+        Action::ShowUsage,
+        &mut app
+    )));
+    assert_eq!(agent_scrollback_len(&app), before);
+
+    let effects = complete_session_usage(&mut app, "test-session", Default::default());
+    assert!(effects.is_empty());
+    assert_eq!(agent_scrollback_len(&app), before + 2);
+    assert!(last_system_text(&app, AgentId(0)).contains("https://billing.example.com/me"));
+}
+
+#[test]
+fn session_usage_complete_drops_stale_session() {
+    let mut app = test_app_with_agent();
+    let before = agent_scrollback_len(&app);
+    let effects = complete_session_usage(
+        &mut app,
+        "old-session",
+        xai_grok_shell::extensions::notification::PromptUsage {
+            totals: xai_grok_shell::extensions::notification::PromptUsageModel {
+                model_calls: 99,
+                cost_usd_ticks: Some(1_000_000_000_000),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    );
+    assert!(effects.is_empty());
+    assert_eq!(agent_scrollback_len(&app), before);
+}
+
+#[test]
+fn session_usage_failed_pushes_error_and_chains_billing() {
+    let mut app = test_app_with_agent();
+    let before = agent_scrollback_len(&app);
+    let effects = fail_session_usage(&mut app, "test-session", "boom");
+    assert_eq!(agent_scrollback_len(&app), before + 1);
+    assert!(last_system_text(&app, AgentId(0)).contains("Couldn't load session usage: boom"));
+    assert!(is_nonsilent_billing(&effects));
+}
+
+#[test]
+fn session_usage_failed_drops_stale_session() {
+    let mut app = test_app_with_agent();
+    let before = agent_scrollback_len(&app);
+    assert!(fail_session_usage(&mut app, "old-session", "boom").is_empty());
+    assert_eq!(agent_scrollback_len(&app), before);
 }
 
 // ── BillingFetched dispatch tests ───────────────────────────────────
@@ -1057,4 +1241,136 @@ fn unknown_non_restricted_command_still_passes_through() {
         app.agents[&id].question_view.is_none(),
         "no upsell for genuinely unknown commands"
     );
+}
+
+// ── Browser-unavailable URL fallback ────────────────────────────────
+
+/// When the OS browser opener cannot run (simulated via a broken
+/// `GROK_TEST_OPEN_URL_FILE` seam), `Action::OpenUrl` for a billing CTA
+/// must push a scrollback system message that includes the full URL —
+/// the headless-VM fix for silent Upgrade / Buy-more-credits no-ops.
+#[serial_test::serial(GROK_TEST_OPEN_URL_FILE)]
+#[test]
+fn open_url_shows_manual_url_when_browser_unavailable() {
+    // Point the test seam at a path whose parent dir does not exist so the
+    // write fails and `open_url` returns false (BrowserUnavailable).
+    let bad = std::env::temp_dir().join(format!(
+        "grok-open-url-missing-{}/out.txt",
+        std::process::id()
+    ));
+    // SAFETY: serialized via `serial_test` so no other test races the env var.
+    unsafe { std::env::set_var("GROK_TEST_OPEN_URL_FILE", &bad) };
+
+    let mut app = test_app_with_agent();
+    let before = agent_scrollback_len(&app);
+    let url = UPSELL_URL_UPGRADE;
+    let effects = dispatch(Action::OpenUrl(url.to_string()), &mut app);
+    assert!(effects.is_empty());
+
+    assert_eq!(
+        agent_scrollback_len(&app),
+        before + 1,
+        "must push a system message with the URL"
+    );
+    let text = last_system_text(&app, AgentId(0));
+    assert!(
+        text.contains("Could not open a browser"),
+        "fallback copy missing: {text}"
+    );
+    assert!(
+        text.contains(url),
+        "full billing URL must be visible for copy: {text}"
+    );
+    let toast = app.agents[&AgentId(0)]
+        .toast
+        .as_ref()
+        .map(|(m, _)| m.as_str());
+    assert_eq!(toast, Some("Browser unavailable - URL shown above"));
+
+    // SAFETY: serialized via `serial_test`; restore the env for other tests.
+    unsafe { std::env::remove_var("GROK_TEST_OPEN_URL_FILE") };
+}
+
+/// Successful open (test seam write OK) must not spam a fallback system message.
+#[serial_test::serial(GROK_TEST_OPEN_URL_FILE)]
+#[test]
+fn open_url_does_not_show_fallback_when_opener_succeeds() {
+    let url_file =
+        std::env::temp_dir().join(format!("grok-open-url-ok-{}.txt", std::process::id()));
+    let _ = std::fs::remove_file(&url_file);
+    // SAFETY: serialized via `serial_test`.
+    unsafe { std::env::set_var("GROK_TEST_OPEN_URL_FILE", &url_file) };
+
+    let mut app = test_app_with_agent();
+    let before = agent_scrollback_len(&app);
+    let url = UPSELL_URL_PAYG;
+    let _ = dispatch(Action::OpenUrl(url.to_string()), &mut app);
+
+    assert_eq!(
+        agent_scrollback_len(&app),
+        before,
+        "successful open must not push a fallback system message"
+    );
+    let recorded = std::fs::read_to_string(&url_file).unwrap_or_default();
+    assert!(
+        recorded.lines().any(|l| l == url),
+        "opener seam must record the URL; got {recorded:?}"
+    );
+
+    // SAFETY: serialized via `serial_test`.
+    unsafe { std::env::remove_var("GROK_TEST_OPEN_URL_FILE") };
+    let _ = std::fs::remove_file(&url_file);
+}
+
+/// Credit-limit upsell Q&A submit routes through OpenUrl; when the browser
+/// is unavailable the full option URL must land in scrollback.
+#[serial_test::serial(GROK_TEST_OPEN_URL_FILE)]
+#[test]
+fn credit_limit_upsell_submit_shows_url_when_browser_unavailable() {
+    use crate::app::agent_view::translate_local_submit_for_test;
+    use crate::app::app_view::InputOutcome;
+    use crate::views::question_view::{LocalQuestionKind, QuestionSelection};
+
+    let bad = std::env::temp_dir().join(format!(
+        "grok-open-url-upsell-missing-{}/out.txt",
+        std::process::id()
+    ));
+    // SAFETY: serialized via `serial_test`.
+    unsafe { std::env::set_var("GROK_TEST_OPEN_URL_FILE", &bad) };
+
+    let mut app = test_app_with_agent();
+    open_upsell_qa(&mut app, CreditLimitUpsellMode::UnifiedCredits);
+    let mut qv = app
+        .agents
+        .get_mut(&AgentId(0))
+        .unwrap()
+        .question_view
+        .take()
+        .expect("expected credit-limit upsell modal");
+    // Select option 1 = "Buy more credits" (credits / usage URL).
+    qv.selections[0] = QuestionSelection::Single(Some(1));
+    let kind = LocalQuestionKind::CreditLimitUpsell {
+        choices: vec![
+            xai_grok_telemetry::events::CreditLimitChoice::UpgradeTier,
+            xai_grok_telemetry::events::CreditLimitChoice::PurchaseCredits,
+        ],
+    };
+    let InputOutcome::Action(Action::OpenUrl(url)) =
+        translate_local_submit_for_test(&qv, kind, false)
+    else {
+        panic!("expected OpenUrl from upsell submit");
+    };
+    assert_eq!(url, UPSELL_URL_PAYG);
+
+    let before = agent_scrollback_len(&app);
+    let _ = dispatch(Action::OpenUrl(url.clone()), &mut app);
+    let text = last_system_text(&app, AgentId(0));
+    assert_eq!(agent_scrollback_len(&app), before + 1);
+    assert!(
+        text.contains(&url),
+        "upsell URL missing from fallback: {text}"
+    );
+
+    // SAFETY: serialized via `serial_test`.
+    unsafe { std::env::remove_var("GROK_TEST_OPEN_URL_FILE") };
 }

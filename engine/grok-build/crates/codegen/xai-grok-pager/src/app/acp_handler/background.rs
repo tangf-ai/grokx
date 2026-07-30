@@ -229,15 +229,6 @@ pub(super) fn handle_task_backgrounded(notif: &acp::ExtNotification, app: &mut A
         bg.scrollback_entry_id = Some(entry_id);
     }
 
-    // Ext notifications reorder vs session updates: work registering after
-    // its awaiting wait must re-evaluate the skipped park. Root only — child
-    // tasks never enter root `bg_tasks`.
-    if !matches!(matched, SessionMatch::Child(_))
-        && let Some((_, _, agent)) = resolve_notif_agent(app, &session_notif.session_id)
-    {
-        agent.maybe_push_parked_marker();
-    }
-
     is_active
 }
 
@@ -313,18 +304,25 @@ pub(super) fn handle_scheduled_task_created(
         .scheduled_tasks
         .retain(|k, _| !k.starts_with("provisional-"));
 
-    agent
-        .session
-        .scheduled_tasks
-        .entry(task_id.clone())
-        .or_insert_with(|| crate::app::agent::ScheduledTaskInfo {
-            task_id,
-            prompt,
-            human_schedule,
-            created_at: std::time::Instant::now(),
-            next_fire_at,
-            tag: "loop".into(),
-        });
+    match agent.session.scheduled_tasks.entry(task_id.clone()) {
+        Entry::Occupied(mut e) => {
+            let info = e.get_mut();
+            info.prompt = prompt;
+            info.human_schedule = human_schedule;
+            info.next_fire_at = next_fire_at;
+        }
+        Entry::Vacant(e) => {
+            e.insert(crate::app::agent::ScheduledTaskInfo {
+                task_id,
+                prompt,
+                human_schedule,
+                created_at: std::time::Instant::now(),
+                next_fire_at,
+                tag: "loop".into(),
+                last_subagent_id: None,
+            });
+        }
+    }
 
     is_active
 }
@@ -333,13 +331,14 @@ pub(super) fn handle_scheduled_task_fired(notif: &acp::ExtNotification, app: &mu
     let Ok(session_notif) = serde_json::from_str::<SessionNotification>(notif.params.get()) else {
         return false;
     };
-    let (task_id, prompt, human_schedule, next_fire_at) = match session_notif.update {
+    let (task_id, prompt, human_schedule, next_fire_at, subagent_id) = match session_notif.update {
         XaiSessionUpdate::ScheduledTaskFired {
             task_id,
             prompt,
             human_schedule,
             next_fire_at,
-        } => (task_id, prompt, human_schedule, next_fire_at),
+            subagent_id,
+        } => (task_id, prompt, human_schedule, next_fire_at, subagent_id),
         _ => return false,
     };
     let matched = match find_session_match(app, &session_notif.session_id) {
@@ -358,12 +357,13 @@ pub(super) fn handle_scheduled_task_fired(notif: &acp::ExtNotification, app: &mu
     // payload so the tasks pane still shows the loop.
     match agent.session.scheduled_tasks.entry(task_id) {
         Entry::Occupied(mut e) => {
-            e.get_mut().next_fire_at = next_fire_at;
+            let info = e.get_mut();
+            info.next_fire_at = next_fire_at;
+            if subagent_id.is_some() {
+                info.last_subagent_id = subagent_id;
+            }
         }
         Entry::Vacant(e) => {
-            // next_fire_at: None marks a missed-one-shot fire from
-            // handle_missed_tasks(); a ScheduledTaskRemoved follows
-            // immediately. Skip the insert to avoid a one-frame flicker.
             if next_fire_at.is_none() {
                 return is_active;
             }
@@ -375,6 +375,7 @@ pub(super) fn handle_scheduled_task_fired(notif: &acp::ExtNotification, app: &mu
                 created_at: std::time::Instant::now(),
                 next_fire_at,
                 tag: "loop".into(),
+                last_subagent_id: subagent_id,
             });
         }
     }
@@ -430,16 +431,6 @@ pub(super) fn handle_scheduled_task_inject_prompt(
     let human_schedule = payload["humanSchedule"].as_str().unwrap_or("unknown");
     tracing::debug!(task_id, human_schedule, "Enqueuing scheduled cron prompt");
 
-    let agent = app.agents.values_mut().find(|a| {
-        a.session
-            .session_id
-            .as_ref()
-            .is_some_and(|sid| sid.0.as_ref() == session_id)
-    });
-    let Some(agent) = agent else {
-        return false;
-    };
-
     // Only the driver injects + runs the scheduled prompt. In leader mode the
     // `x.ai/scheduled_task_inject_prompt` notification is routed by the leader
     // to the SINGLE session driver (see `is_scheduled_task_inject_prompt` in
@@ -450,28 +441,41 @@ pub(super) fn handle_scheduled_task_inject_prompt(
     // suppressed cron on an attacher-driver, leaving the loop stuck with no
     // output. The other clients render the resulting turn from the broadcast
     // deltas. (The de-dup guards below still prevent a double enqueue.)
+    let agent_id = {
+        let agent = app.agents.values_mut().find(|a| {
+            a.session
+                .session_id
+                .as_ref()
+                .is_some_and(|sid| sid.0.as_ref() == session_id)
+        });
+        let Some(agent) = agent else {
+            return false;
+        };
 
-    // Skip if this specific task is already running or queued.
-    if agent.cron_task_id.as_deref() == Some(task_id) {
-        tracing::debug!(task_id, "cron prompt skipped: task already running");
-        return true;
-    }
-    let already_queued = agent
-        .session
-        .pending_prompts
-        .iter()
-        .any(|p| p.task_id.as_deref() == Some(task_id));
-    if already_queued {
-        tracing::debug!(task_id, "cron prompt already queued, skipping duplicate");
-        return true;
-    }
+        // Skip if this specific task is already running or queued.
+        if agent.cron_task_id.as_deref() == Some(task_id) {
+            tracing::debug!(task_id, "cron prompt skipped: task already running");
+            return true;
+        }
+        let already_queued = agent
+            .session
+            .pending_prompts
+            .iter()
+            .any(|p| p.task_id.as_deref() == Some(task_id));
+        if already_queued {
+            tracing::debug!(task_id, "cron prompt already queued, skipping duplicate");
+            return true;
+        }
 
-    agent.session.enqueue_cron_prompt(
-        prompt.to_string(),
-        task_id.to_string(),
-        human_schedule.to_string(),
-    );
-    let effects = super::super::dispatch::maybe_drain_queue(agent);
+        let agent_id = agent.session.id;
+        agent.session.enqueue_cron_prompt(
+            prompt.to_string(),
+            task_id.to_string(),
+            human_schedule.to_string(),
+        );
+        agent_id
+    };
+    let effects = super::super::dispatch::maybe_drain_queue_and_note_peek(app, agent_id);
     app.pending_effects.extend(effects);
 
     true
@@ -555,11 +559,8 @@ pub(super) fn handle_task_completed(notif: &acp::ExtNotification, app: &mut AppV
         return false;
     };
 
-    let (task_snapshot, will_wake) = match session_notif.update {
-        XaiSessionUpdate::TaskCompleted {
-            task_snapshot,
-            will_wake,
-        } => (task_snapshot, will_wake),
+    let task_snapshot = match session_notif.update {
+        XaiSessionUpdate::TaskCompleted { task_snapshot, .. } => task_snapshot,
         _ => return false,
     };
 
@@ -598,9 +599,8 @@ pub(super) fn handle_task_completed(notif: &acp::ExtNotification, app: &mut AppV
     // Prefer the human description for "Task completed/failed: …" labels
     // (same as "Task started"), falling back to the raw command only when
     // no description was supplied.
-    let (command, elapsed, mut description, scrollback_entry_id, was_running) =
+    let (command, elapsed, mut description, scrollback_entry_id) =
         if let Some(bg_task) = session.bg_tasks.get_mut(task_id) {
-            let was_running = bg_task.status == BgTaskStatus::Running;
             bg_task.status = if success {
                 BgTaskStatus::Done
             } else {
@@ -616,7 +616,6 @@ pub(super) fn handle_task_completed(notif: &acp::ExtNotification, app: &mut AppV
                 bg_task.elapsed(),
                 bg_task.description.clone(),
                 bg_task.scrollback_entry_id,
-                was_running,
             )
         } else {
             // Task we didn't know about — use snapshot data. Prefer
@@ -642,9 +641,7 @@ pub(super) fn handle_task_completed(notif: &acp::ExtNotification, app: &mut AppV
                     Some(d)
                 }
             });
-            // Unknown task: it never counted toward the parked marker's
-            // running total, so its completion is not a countdown edge.
-            (command, elapsed, description, None, false)
+            (command, elapsed, description, None)
         };
 
     // Finish the "Task started" scrollback entry (stops bullet animation).
@@ -696,32 +693,6 @@ pub(super) fn handle_task_completed(notif: &acp::ExtNotification, app: &mut AppV
             .with_bg_task_description(description)
     };
     scrollback.push_block(block);
-
-    // Parked countdown: a Running command just finished under the parked
-    // "Worked for … still running" story. Root sessions only: a subagent-local
-    // task never counted toward the root marker's total. Re-borrow the
-    // agent — `resolve_target_view` consumed the earlier `&mut`.
-    if was_running
-        && !matches!(matched, SessionMatch::Child(_))
-        && let Some(agent) = app.agents.get_mut(&matched.agent_id())
-    {
-        agent.maybe_push_parked_marker();
-    }
-
-    // Between turns, a root-session completion re-emits the work-only status
-    // line so the story stays chronological (zero left: no line). When a wake
-    // response follows (`will_wake`, stamped by the shell), the wake turn's
-    // end marker carries the fresh counts instead — skip the line. Child
-    // (subagent) tasks route their chip to the child view above and never
-    // count toward the root marker — no root status line for them. Mutually
-    // exclusive with the parked tick above: parked means the turn is still
-    // running, which `maybe_push_work_status`'s busy gate refuses.
-    if !will_wake
-        && !matches!(matched, SessionMatch::Child(_))
-        && let Some(agent) = app.agents.get_mut(&matched.agent_id())
-    {
-        agent.maybe_push_work_status();
-    }
 
     is_active
 }

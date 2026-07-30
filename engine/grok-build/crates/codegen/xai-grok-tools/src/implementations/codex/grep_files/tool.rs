@@ -27,8 +27,7 @@ const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 
 // ─── Description ────────────────────────────────────────────────────
 
-const DESCRIPTION: &str =
-    "Finds files whose contents match the pattern and lists them by modification time.";
+const DESCRIPTION: &str = "Finds files whose contents match the ${{ params.search.pattern }} and lists them by modification time.";
 
 // ─── Input ──────────────────────────────────────────────────────────
 
@@ -170,7 +169,7 @@ impl xai_tool_runtime::Tool for CodexGrepFilesTool {
     ) -> xai_tool_types::ToolDescription {
         xai_tool_types::ToolDescription::new(
             "grep_files",
-            crate::types::tool_metadata::ToolMetadata::description_template(self),
+            crate::types::tool_metadata::ToolMetadata::sanitized_description_template(self),
         )
     }
 

@@ -16,7 +16,7 @@ use super::common::*;
 /// - reboot against the *same* server settings → the **config** model wins
 ///   and stays winning across `/new`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "PTY e2e; run with cargo test -p xai-grok-pager --test pty_e2e -- --ignored"]
+#[ignore = "PTY e2e; run the owning pty_e2e_* Cargo test with --ignored (see Cargo.toml)"]
 async fn campaign_remote_settings_nudge_and_dismiss() {
     const CONFIG_MODEL: &str = "config-model";
     const CAMPAIGN_MODEL: &str = "campaign-model";
@@ -53,11 +53,16 @@ async fn campaign_remote_settings_nudge_and_dismiss() {
     // structurally unreachable (see `spawn_polling_session`'s doc).
     seed_fake_oauth(&content, "pty-campaign-remote");
     let binary = pager_binary().expect("resolve pager binary");
-    let env = oauth_env_for_pager(&content);
     let spawn = || -> PtyHarness {
-        let env_refs: Vec<(&str, &str)> =
-            env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-        PtyHarness::new(&binary, DEFAULT_ROWS, DEFAULT_COLS, &[], &env_refs).expect("spawn pager")
+        PtyHarness::spawn_with_content_env_ops(
+            &binary,
+            DEFAULT_ROWS,
+            DEFAULT_COLS,
+            &content,
+            &[],
+            &oauth_credential_ops(),
+        )
+        .expect("spawn pager")
     };
 
     // ── Phase 1+2: the campaign applies to a new session; a pick dismisses. ──

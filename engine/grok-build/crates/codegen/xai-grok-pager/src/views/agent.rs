@@ -127,6 +127,13 @@ pub struct AgentViewLayout {
     pub scrollback_content: Rect,
     /// Scrollbar track position (x coordinate).
     pub scrollbar_x: u16,
+    /// Timeline rail left edge (only meaningful when `timeline_width > 0`;
+    /// the rail's right edge lands on the scrollbar column, which the rail
+    /// replaces).
+    pub timeline_x: u16,
+    /// Columns reserved for the timeline rail (0 = rail hidden). Non-zero
+    /// also means the scrollbar does not render this frame.
+    pub timeline_width: u16,
 }
 impl AgentViewLayout {
     /// Compute layout from screen area, appearance config, prompt height,
@@ -144,11 +151,15 @@ impl AgentViewLayout {
     /// When `startup_warning_height` is 0, the startup warning area is omitted.
     /// `prompt_gap` is 0 or 1 — controls the gap row between turn status
     /// (or scrollback) and the prompt widget.
+    /// `timeline_width` reserves rail columns for the timeline sidebar in
+    /// place of the scrollbar (0 = hidden); it requires the scrollbar's
+    /// gutter geometry, so a disabled scrollbar forces it to 0.
     #[allow(clippy::too_many_arguments)]
     pub fn compute(
         area: Rect,
         layout_cfg: &LayoutConfig,
         scrollbar_cfg: &ScrollbarConfig,
+        timeline_width: u16,
         prompt_height: u16,
         tasks_height: u16,
         catalog_height: u16,
@@ -189,7 +200,9 @@ impl AgentViewLayout {
             bottom_vpad,
         ));
         let inner_area = outer_block.inner(area);
-        let mut constraints = vec![Constraint::Length(1)];
+        let mut constraints = vec![
+            Constraint::Length(1), // StatusBar
+        ];
         if startup_warning_height > 0 {
             constraints.push(Constraint::Length(startup_warning_height));
         }
@@ -348,7 +361,17 @@ impl AgentViewLayout {
         }
         let shortcuts = chunks[i];
         let scrollbar_x = area.right().saturating_sub(scrollbar_cfg.gap_right + 1);
-        let content_end_x = scrollbar_x.saturating_sub(scrollbar_cfg.gap_left);
+        let timeline_width = if scrollbar_cfg.enabled {
+            timeline_width
+        } else {
+            0
+        };
+        let timeline_x = (scrollbar_x + 1).saturating_sub(timeline_width);
+        let content_end_x = if timeline_width > 0 {
+            timeline_x.saturating_sub(scrollbar_cfg.gap_left)
+        } else {
+            scrollbar_x.saturating_sub(scrollbar_cfg.gap_left)
+        };
         let scrollback_right = scrollback.x + scrollback.width;
         let scrollback_content = if !scrollbar_cfg.enabled || content_end_x >= scrollback_right {
             scrollback
@@ -376,6 +399,8 @@ impl AgentViewLayout {
             shortcuts,
             scrollback_content,
             scrollbar_x,
+            timeline_x,
+            timeline_width,
         }
     }
     /// Inner area width (for prompt height computation before full layout).
@@ -902,6 +927,7 @@ pub fn build_hints(
     vim_mode: bool,
     is_subagent_view: bool,
     is_turn_running: bool,
+    esc_would_cancel_turn: bool,
     has_queued_follow_up: bool,
     selected_is_user_prompt: bool,
     selected_is_agent_message: bool,
@@ -1166,7 +1192,11 @@ pub fn build_hints(
         }
     };
     if is_turn_running && let Some(def) = registry.find(ActionId::CancelTurn) {
-        hints.push(def.hint());
+        let mut hint = def.hint();
+        if esc_would_cancel_turn {
+            hint.keys = vec![crate::key!(Esc)];
+        }
+        hints.push(hint);
     }
     let has_composer_payload = !prompt.text().trim().is_empty() || is_editing_queued;
     if matches!(active_pane, ActivePane::Prompt)
@@ -1175,8 +1205,11 @@ pub fn build_hints(
     {
         hints.push(def.hint());
     }
-    if can_demote {
-        hints.push(HintItem::new(crate::key!('g', CONTROL), "send to bg"));
+    if can_demote
+        && !is_subagent_view
+        && let Some(key) = registry.key_for(ActionId::SendToBackground)
+    {
+        hints.push(HintItem::new(key, "send to bg"));
     }
     hints
 }
@@ -1233,6 +1266,7 @@ mod tests {
             false,
             false,
             false,
+            false,
             selected_is_user_prompt,
             selected_is_agent_message,
             false,
@@ -1242,6 +1276,41 @@ mod tests {
     }
     fn first_two_labels(hints: &[HintItem]) -> Vec<&str> {
         hints.iter().take(2).map(|h| h.label.as_ref()).collect()
+    }
+    #[test]
+    fn demotion_hint_uses_registered_ctrl_b_binding() {
+        let registry = ActionRegistry::defaults();
+        let hints = build_hints(
+            ActivePane::Scrollback,
+            &PromptWidget::default(),
+            &registry,
+            false,
+            None,
+            None,
+            "expand thinking",
+            false,
+            false,
+            None,
+            false,
+            true,
+            false,
+            false,
+            true,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            None,
+        );
+        let hint = hints
+            .iter()
+            .find(|hint| hint.label == "send to bg")
+            .expect("running Execute should advertise demotion");
+        assert_eq!(hint.keys, vec![crate::key!('b', CONTROL)]);
     }
     #[test]
     fn group_header_shows_enter_toggle_hint_instead_of_open_and_fold() {
@@ -1262,6 +1331,7 @@ mod tests {
             false,
             false,
             true,
+            false,
             false,
             false,
             false,
@@ -1433,6 +1503,7 @@ mod tests {
             false,
             false,
             false,
+            false,
             Some(&search),
         )
     }
@@ -1536,6 +1607,7 @@ mod tests {
             false,
             false,
             false,
+            false,
             None,
         );
         assert!(
@@ -1575,6 +1647,7 @@ mod tests {
             true,
             false,
             is_turn_running,
+            false,
             false,
             false,
             false,
@@ -1634,6 +1707,7 @@ mod tests {
                 true,
                 false,
                 true,
+                false,
                 true,
                 false,
                 false,
@@ -1648,6 +1722,159 @@ mod tests {
                  (multiline={multiline}); got {labels:?}"
             );
         }
+    }
+    /// Running-turn cancel hint key tracks `esc_would_cancel_turn` — the
+    /// input-routing predicate computed by the caller: Esc when a bare press
+    /// would reach the policy's mid-turn cancel, the registry Ctrl+C binding
+    /// otherwise. (The predicate itself — gate, panes, and higher-priority
+    /// Esc consumers — is pinned by `esc_would_cancel_turn_tests` in
+    /// `agent_view::input`.)
+    #[test]
+    fn running_turn_cancel_hint_key_tracks_esc_predicate() {
+        let prompt = PromptWidget::default();
+        let registry = ActionRegistry::defaults();
+        for (esc_would_cancel_turn, expected) in
+            [(true, crate::key!(Esc)), (false, crate::key!('c', CONTROL))]
+        {
+            let hints = build_hints(
+                ActivePane::Prompt,
+                &prompt,
+                &registry,
+                false,
+                None,
+                None,
+                "expand thinking",
+                false,
+                false,
+                None,
+                false,
+                false,
+                false,
+                false,
+                true,
+                false,
+                true,
+                esc_would_cancel_turn,
+                false,
+                false,
+                false,
+                false,
+                false,
+                None,
+            );
+            let cancel = hints
+                .iter()
+                .find(|h| h.label == "cancel")
+                .expect("running turn must surface the cancel hint");
+            assert_eq!(
+                cancel.keys,
+                vec![expected],
+                "cancel hint key for esc_would_cancel_turn={esc_would_cancel_turn}"
+            );
+        }
+    }
+    /// Running turn + open scrollback search: the search's own `Esc cancel`
+    /// hint stays the ONLY Esc hint — the CancelTurn hint keeps Ctrl+C (the
+    /// caller's predicate is false while the search would steal Esc), so the
+    /// bar never shows two different `Esc cancel` meanings at once.
+    #[test]
+    fn running_turn_with_scrollback_search_keeps_ctrl_c_cancel_hint() {
+        let registry = ActionRegistry::defaults();
+        let search = ScrollbackSearchState::open();
+        let hints = build_hints(
+            ActivePane::Scrollback,
+            &PromptWidget::default(),
+            &registry,
+            false,
+            None,
+            None,
+            "expand thinking",
+            false,
+            false,
+            None,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            Some(&search),
+        );
+        let esc_cancels: Vec<&HintItem> = hints
+            .iter()
+            .filter(|h| h.label == "cancel" && h.keys == vec![crate::key!(Esc)])
+            .collect();
+        assert_eq!(
+            esc_cancels.len(),
+            1,
+            "exactly one Esc:cancel hint (the search's own dismiss)"
+        );
+        assert!(
+            hints
+                .iter()
+                .any(|h| h.label == "cancel" && h.keys == vec![crate::key!('c', CONTROL)]),
+            "CancelTurn hint must stay on Ctrl+C while the search owns Esc"
+        );
+    }
+    /// Running turn + editing a queued prompt: the edit's own `Esc cancel`
+    /// (discard) hint is the ONLY Esc-keyed row — the CancelTurn hint keeps
+    /// Ctrl+C (the caller's predicate is false while the edit owns Esc), so
+    /// the bar never shows two contradictory `Esc cancel` rows.
+    #[test]
+    fn running_turn_editing_queued_keeps_ctrl_c_cancel_hint() {
+        let registry = ActionRegistry::defaults();
+        let mut prompt = PromptWidget::default();
+        prompt.textarea.insert_str("edited row");
+        let hints = build_hints(
+            ActivePane::Prompt,
+            &prompt,
+            &registry,
+            true,
+            None,
+            None,
+            "expand thinking",
+            false,
+            false,
+            None,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            None,
+        );
+        let esc_rows: Vec<&HintItem> = hints
+            .iter()
+            .filter(|h| h.keys.contains(&crate::key!(Esc)))
+            .collect();
+        assert_eq!(
+            esc_rows.len(),
+            1,
+            "exactly one Esc-keyed hint (the edit's discard), got {:?}",
+            hints.iter().map(|h| h.label.as_ref()).collect::<Vec<_>>()
+        );
+        assert_eq!(esc_rows[0].label, "cancel");
+        assert!(
+            hints
+                .iter()
+                .any(|h| h.label == "cancel" && h.keys == vec![crate::key!('c', CONTROL)]),
+            "CancelTurn hint must stay on Ctrl+C while the edit owns Esc"
+        );
     }
     #[test]
     fn prompt_legacy_vte_adds_alt_enter_newline_hint() {
@@ -1735,6 +1962,7 @@ mod tests {
             area,
             &layout_cfg,
             &scrollbar_cfg,
+            0,
             2,
             0,
             0,
@@ -1754,6 +1982,67 @@ mod tests {
     }
     fn layout_with_cta(area: Rect, cta_height: u16) -> AgentViewLayout {
         layout_with_rows(area, 0, cta_height, 0)
+    }
+    /// Minimal layout with a timeline rail request — hides the cfg-dependent
+    /// arity of `compute` like `layout_with_rows` does.
+    fn layout_with_rail(
+        area: Rect,
+        timeline_width: u16,
+        scrollbar_cfg: &ScrollbarConfig,
+    ) -> AgentViewLayout {
+        let layout_cfg = LayoutConfig::default();
+        AgentViewLayout::compute(
+            area,
+            &layout_cfg,
+            scrollbar_cfg,
+            timeline_width,
+            2,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            1,
+            false,
+        )
+    }
+    #[test]
+    fn timeline_rail_replaces_the_scrollbar_column() {
+        let area = Rect::new(0, 0, 80, 40);
+        let scrollbar_cfg = ScrollbarConfig::default();
+        let without = layout_with_rail(area, 0, &scrollbar_cfg);
+        let with_rail = layout_with_rail(area, 3, &scrollbar_cfg);
+        assert_eq!(with_rail.timeline_width, 3);
+        assert_eq!(with_rail.scrollbar_x, without.scrollbar_x);
+        assert_eq!(with_rail.timeline_x, with_rail.scrollbar_x + 1 - 3);
+        assert!(
+            with_rail.scrollback_content.x + with_rail.scrollback_content.width
+                <= with_rail.timeline_x,
+            "content (ends {}) must not overlap the rail (starts {})",
+            with_rail.scrollback_content.x + with_rail.scrollback_content.width,
+            with_rail.timeline_x,
+        );
+        assert!(
+            with_rail.scrollback_content.width <= without.scrollback_content.width,
+            "the rail never widens the content"
+        );
+        let no_scrollbar = ScrollbarConfig {
+            enabled: false,
+            ..ScrollbarConfig::default()
+        };
+        let forced_off = layout_with_rail(area, 3, &no_scrollbar);
+        assert_eq!(forced_off.timeline_width, 0);
+        assert_eq!(
+            forced_off.scrollback_content.width, forced_off.scrollback.width,
+            "no carve-out without the scrollbar gutter"
+        );
     }
     #[test]
     fn plugin_cta_row_present_above_prompt() {

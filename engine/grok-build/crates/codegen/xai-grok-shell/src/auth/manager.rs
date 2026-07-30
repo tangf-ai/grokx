@@ -61,10 +61,9 @@ pub(crate) enum RefreshReason {
 /// `recovery.rs`.
 pub(crate) const AUTH_LOCK_TIMEOUT: StdDuration = StdDuration::from_secs(10);
 
-/// Longer timeout for `refresh_chain` — the critical path that must
-/// hold the file lock across the IdP call to prevent refresh-token
-/// reuse.  Must exceed `EXTERNAL_REFRESH_TIMEOUT` (30 s) so followers
-/// wait for the leader to finish rather than timing out and retrying.
+/// Lock timeout for `refresh_chain`, held across the IdP call to prevent
+/// refresh-token reuse. Must exceed the external-auth refresh timeout
+/// (`EXTERNAL_AUTH_REFRESH_TIMEOUT`, 5 s) so followers wait rather than retry.
 const REFRESH_LOCK_TIMEOUT: StdDuration = StdDuration::from_secs(45);
 
 /// Long poll interval used by the proactive refresh task when no
@@ -125,6 +124,14 @@ const PERMANENT_FAILURE_TTL: StdDuration = StdDuration::from_secs(300);
 /// `attempted_verdict_key`, when a verdict is stored), never co-held. Never hold
 /// a `parking_lot` guard across `.await`. Refreshers return [`RefreshOutcome`]
 /// for `refresh_chain` to apply.
+/// Redacted `Debug` so `AuthManager` (held via `Arc` inside `Debug`-derived
+/// types like `PersistenceMsg`) never leaks credentials into logs or panics.
+impl std::fmt::Debug for AuthManager {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthManager").finish_non_exhaustive()
+    }
+}
+
 pub struct AuthManager {
     /// In-memory bearer. Mutate via [`Self::with_inner_write`] or
     /// [`Self::refresh_chain`]; the closure helpers' sync return type
@@ -162,6 +169,11 @@ pub struct AuthManager {
     /// disk every few seconds, so per-read logging would flood and no
     /// logging leaves auth.json loss invisible in production captures.
     disk_state: RwLock<Option<DiskAuthState>>,
+    /// See [`Self::cached_disk_api_key`].
+    static_key_cache: parking_lot::Mutex<Option<StaticKeyCacheEntry>>,
+    /// Model `api_key` / resolved `env_key` for voice/tools without a session.
+    /// Not a session token (those live on `inner`). Prefers over disk; env wins.
+    process_static_api_key: parking_lot::RwLock<Option<String>>,
     sleep_gate: SleepGate,
     /// Count of in-flight IdP refreshes (the network call only), so a
     /// sleep-imminent transition can wait for a refresh straddling suspend to
@@ -402,6 +414,8 @@ impl AuthManager {
             proactive_starts: std::sync::atomic::AtomicU32::new(0),
             refresh_notify: Arc::new(tokio::sync::Notify::new()),
             disk_state: RwLock::new(disk_state),
+            static_key_cache: parking_lot::Mutex::new(None),
+            process_static_api_key: parking_lot::RwLock::new(None),
             sleep_gate: SleepGate::default(),
             refresh_in_flight: std::sync::atomic::AtomicU32::new(0),
             refresh_drain_lock: parking_lot::Mutex::new(()),
@@ -472,6 +486,9 @@ impl AuthManager {
         );
         if scope == self.scope {
             self.clear_inner();
+            // Intentional logout/scope removal: drop sticky permanent so the
+            // next state is NotLoggedIn, not a retained invalid_grant verdict.
+            *self.permanent_failure.write() = None;
         }
         Ok(())
     }
@@ -493,9 +510,9 @@ impl AuthManager {
         }
     }
 
-    /// Drop the in-memory auth. The sticky permanent-failure verdict is scoped
-    /// to a credential key, so an empty cache reads through as "no failure"
-    /// without explicit clearing.
+    /// Drop the in-memory auth. Sticky `RefreshTokenRejected` still
+    /// short-circuits with no live credential until a wire-valid login;
+    /// non-sticky verdicts read absent once their scoped key is gone.
     fn clear_inner(&self) {
         *self.inner.write() = None;
     }
@@ -582,8 +599,11 @@ impl AuthManager {
     }
 
     /// Drop the in-memory credentials, loudly. Logs the discard (with `reason`)
-    /// before routing through [`clear_inner`] so the cached permanent_failure
-    /// (if any) goes with them. Centralizes the "credentials gone" telemetry.
+    /// before routing through [`clear_inner`]. Also clears a sticky permanent
+    /// verdict so force-reload / disk-anomaly paths surface `NotLoggedIn`
+    /// rather than a retained `invalid_grant`. Permanent discard after a live
+    /// IdP rejection uses [`clear_inner`] alone so the sticky short-circuit
+    /// survives until login.
     fn drop_in_memory_credentials(&self, reason: &str) {
         if let Some(d) = self.current_or_expired() {
             xai_grok_telemetry::unified_log::warn(
@@ -599,6 +619,7 @@ impl AuthManager {
             );
         }
         self.clear_inner();
+        *self.permanent_failure.write() = None;
     }
 
     // ── Read methods ─────────────────────────────────────────────────
@@ -709,6 +730,19 @@ impl AuthManager {
     /// Prefer [`Self::auth`] when `.await` is available.
     pub(crate) fn current_or_expired(&self) -> Option<GrokAuth> {
         self.current().or_else(|| self.expired_auth())
+    }
+
+    /// Cached token if still wire-valid ([`Self::is_token_hard_expired`]),
+    /// ignoring the early-invalidation buffer. For sync callers that cannot
+    /// refresh and must not demote a still-accepted token.
+    pub(crate) fn current_wire_valid(&self) -> Option<GrokAuth> {
+        let auth = self
+            .inner
+            .read()
+            .as_ref()
+            .filter(|a| !self.is_token_hard_expired(a))
+            .cloned()?;
+        self.vet_cached(auth)
     }
 
     /// `true` when data collection must be suppressed — the team has ZDR or
@@ -832,6 +866,7 @@ impl AuthManager {
         // current session work with fresh credentials while the user fixes the
         // filesystem (e.g. read-only disk). Without this, a disk failure leaves
         // the stale/dead token in memory and the user is completely stuck.
+        *self.permanent_failure.write() = None;
         self.with_inner_write(|inner| *inner = Some(auth.clone()));
 
         // Fire-and-forget enrichment. Off the critical path -- a slow
@@ -889,6 +924,7 @@ impl AuthManager {
             ),
         }
         // Always update in-memory, even if disk write failed (see update()).
+        *self.permanent_failure.write() = None;
         self.with_inner_write(|inner| *inner = Some(auth.clone()));
         write_result?;
         Ok(auth)
@@ -937,19 +973,25 @@ impl AuthManager {
 
     /// Run the external auth command and parse its output. Pure: no
     /// state mutation, no logging (refresher logs once on its arm).
-    pub(crate) fn run_external_refresh_command(&self, command: &str) -> Option<GrokAuth> {
+    pub(crate) async fn run_external_refresh_command(&self, command: &str) -> Option<GrokAuth> {
         let prev = self.inner_auth_or_external_default();
-        crate::auth::refresh_with_command(command, &prev)
+        crate::auth::refresh_with_command(command, &prev).await
     }
 
     /// Hot-swap credentials (called by config watcher). Does NOT write to disk.
+    /// Clears a sticky permanent verdict only when the new bearer is wire-valid
+    /// (login / sibling adopt). Hard-expired swaps keep the sticky short-circuit
+    /// so a dead RT is not re-tried until a real login.
     pub(crate) fn hot_swap(&self, new_auth: GrokAuth) {
+        if !self.is_token_hard_expired(&new_auth) {
+            *self.permanent_failure.write() = None;
+        }
         self.with_inner_write(|inner| *inner = Some(new_auth));
     }
 
-    /// Clear in-memory credentials. Does NOT touch disk, and does NOT clear the
-    /// permanent-failure verdict: that is credential-scoped and self-invalidates
-    /// on the next lookup once the credential it targets is gone.
+    /// Clear in-memory credentials. Does NOT touch disk. Sticky
+    /// `RefreshTokenRejected` remains until wire-valid login; other verdicts
+    /// are key-scoped and drop out once their credential is gone.
     pub(crate) fn clear_in_memory(&self) {
         self.clear_inner();
     }
@@ -1030,27 +1072,49 @@ impl AuthManager {
         Some(auth)
     }
 
-    /// `true` when a sibling process has rotated the refresh token on
-    /// disk (disk RT differs from in-memory RT). Used by `refresh_chain`
-    /// to demote a `PermanentFailure` to transient so the sibling's
-    /// fresher token can be tried on the next attempt.
-    fn sibling_has_different_refresh_token(&self) -> bool {
-        let disk_auth = self.read_disk_auth();
-        let Some(ref disk) = disk_auth else {
-            return false;
-        };
-        // Expired AT = dead sibling, not a live one. Disk may have
-        // diverged from memory due to failed writes (e.g. disk full)
-        // while both RTs are revoked.
-        if self.is_token_expired(disk) {
-            return false;
-        }
-        let disk_rt = disk.refresh_token.as_deref();
-        let Some(disk_rt) = disk_rt else {
-            return false;
-        };
-        let mem_rt = self.expired_auth().and_then(|a| a.refresh_token);
-        mem_rt.as_deref() != Some(disk_rt)
+    /// `true` when the refresh token on disk is present and differs from the
+    /// one we actually spent — i.e. a sibling process rotated the RT while our
+    /// exchange was in flight, so the rejection we just got is a lost race
+    /// rather than a revoked session.
+    ///
+    /// The single definition of "disk moved past the token we spent". Two
+    /// hand-rolled copies of this comparison is how the wrong one survived
+    /// long enough to log a dozen processes out at once.
+    ///
+    /// Takes an already-observed `disk_rt` rather than reading `auth.json`
+    /// itself, so one observation drives the decision, the unattributed
+    /// fallback, and the telemetry that explains them. A second read can catch
+    /// a *later* sibling write and produce a record that contradicts the
+    /// branch it documents — in the log whose whole purpose is post-incident
+    /// truth. Callers read under the auth file lock, so the observation
+    /// includes the sibling's committed write.
+    ///
+    /// Disk holding no RT is *not* divergence: there is no successor to fall
+    /// back to, so the rejection must be honored.
+    fn refresh_token_superseded(disk_rt: Option<&str>, spent_rt: &str) -> bool {
+        disk_rt.is_some_and(|disk_rt| disk_rt != spent_rt)
+    }
+
+    /// `true` when a sibling process has rotated the refresh token on disk
+    /// past the one in memory. Used by `refresh_chain` to demote a
+    /// `PermanentFailure` to transient so the sibling's fresher token can be
+    /// tried on the next attempt.
+    ///
+    /// Requires an in-memory RT: empty `inner` means the disk credential is
+    /// the only candidate (not a multi-process rotation). Does **not**
+    /// require a non-expired disk AT — a sibling may still hold a usable RT
+    /// while its AT is buffer/hard-expired.
+    ///
+    /// Only a fallback for authorities that cannot report which RT they spent.
+    /// Attributed refreshers pass the token they actually sent to
+    /// [`Self::refresh_token_superseded`] directly; because
+    /// `resolve_refresh_credential` is disk-first, the RT actually sent is
+    /// usually the disk one, and comparing disk against *memory* then answers
+    /// `false` in precisely the case that needs the demotion.
+    fn sibling_has_different_refresh_token(&self, disk_rt: Option<&str>) -> bool {
+        self.current_or_expired()
+            .and_then(|a| a.refresh_token)
+            .is_some_and(|mem_rt| Self::refresh_token_superseded(disk_rt, &mem_rt))
     }
 
     /// Re-read `auth.json` from disk without updating in-memory state.
@@ -1329,13 +1393,18 @@ impl AuthManager {
                 {
                     Ok(auth) => Ok(auth),
                     Err(e) => {
-                        // Grace: the early-invalidation buffer is OUR
-                        // conservative estimate, not the IdP's actual
-                        // expiry. If the cached token is still wire-valid
-                        // ([`Self::is_token_hard_expired`]), return it so a
-                        // transient IdP blip during the buffer window
-                        // is invisible to the user.
-                        if let Some(auth) = snapshot
+                        // Grace for still wire-valid ATs on transient failures
+                        // and retain-path permanents (ClientRejected / Other).
+                        // RefreshTokenRejected discards AT+RT — never re-serve
+                        // that snapshot even when it is only soft-expired.
+                        let deny_grace = matches!(
+                            &e,
+                            AuthError::Refresh(crate::auth::RefreshTokenError::Permanent(pe))
+                                if pe.reason
+                                    == crate::auth::error::RefreshTokenFailedReason::RefreshTokenRejected
+                        );
+                        if !deny_grace
+                            && let Some(auth) = snapshot
                             && !self.is_token_hard_expired(&auth)
                         {
                             tracing::debug!(
@@ -1768,7 +1837,11 @@ impl AuthManager {
                     Err(AuthError::transient_source(e))
                 }
             },
-            RefreshOutcome::PermanentFailure { error, tried_key } => {
+            RefreshOutcome::PermanentFailure {
+                error,
+                tried_key,
+                tried_refresh_token,
+            } => {
                 tracing::warn!(reason = ?error.reason, "auth.refresh.permanent_failure");
                 xai_grok_telemetry::unified_log::warn(
                     "auth.refresh.permanent_failure",
@@ -1785,16 +1858,99 @@ impl AuthManager {
                 ) {
                     return Ok(refreshed);
                 }
-                if self.sibling_has_different_refresh_token() {
-                    tracing::info!("auth: sibling-rotation detected; demoting to transient");
-                    return Err(AuthError::transient(format!("sibling-rotation: {error}")));
-                }
-                // No clear: the verdict (+ TTL) gates re-attempts; the dead
-                // bearer is dropped only on explicit logout. Key on the
-                // credential the refresher actually sent (`tried_key`), falling
-                // back to our own resolution when the authority has no key.
+                // Client contract: only genuine IdP RT rejection discards.
+                // Escalated `Other` / `ClientRejected` retain credentials.
+                // When mem and disk RTs diverge, clear only the side that was
+                // actually tried so an untried successor RT (e.g. mem after a
+                // disk-persist failure) is not wiped by a disk-first invalid_grant.
                 let failed_reason = error.reason;
-                if let Some(key) = tried_key.or(attempted_key) {
+                let is_rtr = failed_reason
+                    == crate::auth::error::RefreshTokenFailedReason::RefreshTokenRejected;
+                if is_rtr {
+                    let mem = self.current_or_expired();
+                    let disk = self.read_disk_auth();
+                    // Diverging RTs mean a sibling rotated while we were in
+                    // flight: our RT was superseded, not revoked. Demote
+                    // without recording so the next attempt picks up the
+                    // sibling's token (no sticky lockout, no credential loss).
+                    //
+                    // When the refresher told us which RT it spent (every
+                    // in-tree OIDC path), compare disk against *that*. The
+                    // legacy disk-vs-memory heuristic is only a fallback for
+                    // unattributed authorities: it asks the wrong question,
+                    // because `resolve_refresh_credential` is disk-first, so
+                    // the RT actually spent is usually the disk one and the
+                    // comparison collapses to "false" exactly when it matters.
+                    //
+                    // Both arms and the log below read one `disk` observation.
+                    // Re-reading per use lets the decision and the line that
+                    // explains it disagree about what disk held.
+                    let disk_rt = disk.as_ref().and_then(|d| d.refresh_token.as_deref());
+                    let sibling_rotated = match tried_refresh_token.as_deref() {
+                        Some(tried_rt) => Self::refresh_token_superseded(disk_rt, tried_rt),
+                        None => {
+                            tried_key.is_none() && self.sibling_has_different_refresh_token(disk_rt)
+                        }
+                    };
+                    if sibling_rotated {
+                        tracing::info!("auth: sibling-rotation detected; demoting to transient");
+                        xai_grok_telemetry::unified_log::info(
+                            "auth.refresh.sibling_rotation_demoted",
+                            None,
+                            Some(serde_json::json!({
+                                "reason": format!("{failed_reason:?}"),
+                                "tried_rt_prefix": tried_refresh_token
+                                    .as_deref()
+                                    .map(token_suffix),
+                                "disk_rt_prefix": disk_rt.map(token_suffix),
+                            })),
+                        );
+                        return Err(AuthError::transient(format!(
+                            "sibling-rotation: {failed_reason:?}"
+                        )));
+                    }
+                    let (clear_mem, clear_disk) = match (tried_key.as_ref(), &mem, &disk) {
+                        (Some(tk), m, d) => {
+                            let mem_match = m.as_ref().is_some_and(|a| a.key == *tk);
+                            let disk_match = d.as_ref().is_some_and(|a| a.key == *tk);
+                            if mem_match || disk_match {
+                                (mem_match, disk_match)
+                            } else {
+                                (true, true)
+                            }
+                        }
+                        (None, _, _) => (true, true),
+                    };
+                    if let Some(key) = tried_key.or(attempted_key) {
+                        self.record_permanent_failure(key, error);
+                    }
+                    let mut disk_mutation = "unchanged";
+                    if clear_disk {
+                        disk_mutation = match self.write_scope_removal(&self.scope) {
+                            Ok(m) => m.label(),
+                            Err(e) => {
+                                tracing::warn!(
+                                    error = %e,
+                                    "auth: failed to clear credentials after permanent refresh failure"
+                                );
+                                "write_failed"
+                            }
+                        };
+                    }
+                    if clear_mem {
+                        self.clear_inner();
+                    }
+                    xai_grok_telemetry::unified_log::warn(
+                        "auth: cleared credentials after permanent refresh failure",
+                        None,
+                        Some(serde_json::json!({
+                            "reason": format!("{failed_reason:?}"),
+                            "disk_mutation": disk_mutation,
+                            "cleared_mem": clear_mem,
+                            "cleared_disk": clear_disk,
+                        })),
+                    );
+                } else if let Some(key) = tried_key.or(attempted_key) {
                     self.record_permanent_failure(key, error);
                 }
                 Err(AuthError::permanent(failed_reason))
@@ -1814,7 +1970,13 @@ impl AuthManager {
     /// Re-read auth.json from disk and update the in-memory cache (used by the
     /// refresh chains). Non-destructive: only updates in-memory if disk has a
     /// different valid token (a sibling process wrote a fresher one).
-    pub(crate) fn pick_up_sibling_token(&self) {
+    ///
+    /// Returns `true` only when in-memory state was actually replaced, so
+    /// callers can log adoption truthfully instead of inferring it from
+    /// "we have a token now" — which is also true when our own token was fine
+    /// all along, and made the proactive-refresh log actively misleading when
+    /// reconstructing a rotation chain after an incident.
+    pub(crate) fn pick_up_sibling_token(&self) -> bool {
         let auth = match read_auth_json(&self.path) {
             Ok(map) => lookup_auth(&map, &self.scope),
             _ => None,
@@ -1834,7 +1996,9 @@ impl AuthManager {
                 })),
             );
             self.with_inner_write(|inner| *inner = Some(a.clone()));
+            return true;
         }
+        false
     }
 
     /// Check if a candidate auth has a different token than what's in memory.
@@ -1886,6 +2050,16 @@ impl AuthManager {
     /// the common no-verdict case returns before any disk I/O; only a stored
     /// verdict triggers [`Self::attempted_verdict_key`]'s disk read.
     ///
+    /// After a permanent failure **discards** credentials, sticky reasons
+    /// (`RefreshTokenRejected`) still short-circuit with no live credential so
+    /// concurrent callers cannot re-hit the IdP with a dead RT. Login
+    /// (`hot_swap` / `update`) and logout clear the verdict.
+    ///
+    /// Sticky applies only to the **same** rejected key or to **no** live
+    /// credential (post-discard). A different attempted key (sibling RT/AT
+    /// on disk) must be allowed to refresh — otherwise a hard-expired sibling
+    /// AT strands a process that could still refresh a live RT.
+    ///
     /// TTL expiry is judged on *both* clocks (see [`GateRaise`]): the monotonic
     /// clock pauses during a system suspend, so a wall-clock arm is required
     /// for the TTL to elapse across sleep. Without it, a recoverable failure
@@ -1910,8 +2084,14 @@ impl AuthManager {
         // would attempt. Guard dropped above so `inner` isn't co-held.
         // Deliberately `ServerRejected` (the widest resolution) regardless of
         // the caller's reason, so the read never misses a stored verdict.
-        (self.attempted_verdict_key(RefreshReason::ServerRejected)? == token_key)
-            .then(|| AuthError::permanent(reason))
+        match self.attempted_verdict_key(RefreshReason::ServerRejected) {
+            Some(k) if k == token_key => Some(AuthError::permanent(reason)),
+            // Different credential key: never sticky-block a sibling RT.
+            Some(_) => None,
+            // No live credential after discard: sticky short-circuit until login.
+            None if reason.is_sticky() => Some(AuthError::permanent(reason)),
+            None => None,
+        }
     }
 
     /// `true` iff [`Self::permanent_failure`] has a non-expired entry. Lets
@@ -1971,17 +2151,51 @@ impl AuthManager {
         crate::auth::recovery::UnauthorizedRecovery::new(self.clone(), rejected, source)
     }
 
-    /// One-shot 401 recovery off the live bearer, snapshotted once so the
-    /// rejected key and KPI attribution describe one credential.
+    /// 401 recovery off the live bearer. Snapshots the rejected credential once
+    /// for KPI attribution. On **transient** refresh failure (network, 5xx,
+    /// sleep/dark-wake defer, lock timeout) retries with backoff before giving
+    /// up. Permanent failures and NotLoggedIn stop immediately.
+    ///
+    /// After a successful recovery the **caller** retries the original request
+    /// (turn-level may resubmit more than once; API resubmit is separate from
+    /// refresh retries).
     pub(crate) async fn try_recover_unauthorized(
         self: &Arc<Self>,
         source: crate::auth::recovery::RecoverySource,
     ) -> bool {
+        /// Bounded refresh attempts for non-permanent failures. Kept strictly
+        /// below OidcRefresher's consecutive-transient escalation threshold so
+        /// one 401 recovery cannot alone escalate a network blip to permanent
+        /// `Other`.
+        const MAX_TRANSIENT_ATTEMPTS: u32 = 2;
+
         let cached = self.with_inner_read(|inner| inner.cloned());
-        self.unauthorized_recovery(cached, source)
-            .next()
-            .await
-            .is_ok()
+        let mut delay = StdDuration::from_millis(500);
+        for attempt in 0..MAX_TRANSIENT_ATTEMPTS {
+            match self
+                .unauthorized_recovery(cached.clone(), source)
+                .next()
+                .await
+            {
+                Ok(_) => return true,
+                Err(e) if e.is_transient() && attempt + 1 < MAX_TRANSIENT_ATTEMPTS => {
+                    xai_grok_telemetry::unified_log::warn(
+                        "auth recovery: transient failure, retrying",
+                        None,
+                        Some(serde_json::json!({
+                            "attempt": attempt + 1,
+                            "max_attempts": MAX_TRANSIENT_ATTEMPTS,
+                            "delay_ms": delay.as_millis() as u64,
+                            "error": format!("{e}"),
+                        })),
+                    );
+                    tokio::time::sleep(delay).await;
+                    delay = (delay.saturating_mul(2)).min(StdDuration::from_secs(4));
+                }
+                Err(_) => return false,
+            }
+        }
+        false
     }
 
     pub(crate) fn record_manual_auth(
@@ -2079,7 +2293,7 @@ impl AuthManager {
                 // already refreshed and wrote a valid token to disk.
                 // Combined with jitter, the first process to wake
                 // refreshes; later processes adopt the result here.
-                this.pick_up_sibling_token();
+                let adopted_from_sibling = this.pick_up_sibling_token();
                 if this.current().is_some() {
                     let adopted = this.current().map(|a| token_suffix(&a.key).to_owned());
                     let expires_at = this
@@ -2087,14 +2301,25 @@ impl AuthManager {
                         .read()
                         .as_ref()
                         .and_then(|a| a.expires_at.map(|e| e.to_rfc3339()));
-                    tracing::info!(
-                        "auth: proactive refresh skipped, adopted sibling token from disk"
-                    );
+                    // Distinguish "a sibling's token replaced ours" from "our
+                    // own token is still valid". Both skip the refresh, but
+                    // conflating them makes the log actively misleading when
+                    // reconstructing a rotation chain after an incident.
+                    if adopted_from_sibling {
+                        tracing::info!(
+                            "auth: proactive refresh skipped, adopted sibling token from disk"
+                        );
+                    } else {
+                        tracing::info!(
+                            "auth: proactive refresh skipped, in-memory token still valid"
+                        );
+                    }
                     xai_grok_telemetry::unified_log::info(
-                        "auth: proactive refresh adopted sibling token",
+                        "auth: proactive refresh skipped",
                         None,
                         Some(serde_json::json!({
-                            "adopted_key_prefix": adopted,
+                            "adopted_from_sibling": adopted_from_sibling,
+                            "key_prefix": adopted,
                             "expires_at": expires_at,
                         })),
                     );
@@ -2205,34 +2430,130 @@ pub(crate) fn compute_proactive_sleep(this: &AuthManager) -> StdDuration {
     }
 }
 
-/// Bridges `Arc<AuthManager>` into the `ApiKeyProvider` trait used by
-/// tool clients (image_gen, video_gen, web_search, embedding). Sync callers
-/// get the buffered snapshot; async callers drive the refresh chain.
+/// Tools + pager voice bearer. Static: env → process model key → disk.
+/// Kill-switch / `preferred_method = oidc` block static keys.
 pub(crate) struct SharedAuthKeyProvider(pub Arc<AuthManager>);
 
 impl xai_grok_tools::types::ApiKeyProvider for SharedAuthKeyProvider {
     fn current_api_key(&self) -> Option<String> {
-        self.0.current_or_expired().map(|a| a.key)
+        if prefers_static_api_key(&self.0) {
+            return resolve_static_api_key(&self.0);
+        }
+        // Wire-valid session > static key > expired session (last resort).
+        // Hard expiry, not the refresh buffer: sync cannot refresh, so a
+        // buffered-but-valid token must still beat static.
+        self.0
+            .current_wire_valid()
+            .map(|a| a.key)
+            .or_else(|| resolve_static_api_key(&self.0))
+            .or_else(|| self.0.current_or_expired().map(|a| a.key))
     }
 
     fn current_api_key_async(
         &self,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send + '_>> {
         let am = self.0.clone();
-        Box::pin(async move { am.get_valid_token().await.ok() })
+        Box::pin(async move {
+            if prefers_static_api_key(&am) {
+                return resolve_static_api_key(&am);
+            }
+            am.get_valid_token()
+                .await
+                .ok()
+                .or_else(|| resolve_static_api_key(&am))
+        })
     }
 }
 
-/// Build a refreshing [`ApiKeyProvider`](xai_grok_tools::types::ApiKeyProvider)
-/// from an `Arc<AuthManager>`.
-///
-/// This is the public, supported way for out-of-crate consumers (e.g. the
-/// pager's voice channel) to obtain a bearer that follows the same refresh
-/// chain as chat / tool traffic, rather than snapshotting a token at startup
-/// (the static-snapshot bug class). The returned
-/// provider resolves a fresh bearer per call via
-/// [`current_api_key_async`](xai_grok_tools::types::ApiKeyProvider::current_api_key_async),
-/// so it works for both OAuth/session (refreshes) and API-key auth.
+fn prefers_static_api_key(am: &AuthManager) -> bool {
+    matches!(
+        am.grok_com_config.preferred_method,
+        Some(super::config::PreferredAuthMethod::ApiKey)
+    )
+}
+
+/// Env → process model key → disk. Off under kill-switch / oidc pin.
+fn resolve_static_api_key(am: &AuthManager) -> Option<String> {
+    if am.grok_com_config.api_key_auth_disabled() {
+        return None;
+    }
+    if matches!(
+        am.grok_com_config.preferred_method,
+        Some(super::config::PreferredAuthMethod::Oidc)
+    ) {
+        return None;
+    }
+    non_empty_key(crate::agent::auth_method::read_xai_api_key_env().ok())
+        .or_else(|| non_empty_key(am.process_static_api_key.read().clone()))
+        .or_else(|| am.cached_disk_api_key())
+}
+
+fn api_key_from_auth_file(path: &Path) -> Option<String> {
+    let map = read_auth_json(path).ok()?;
+    non_empty_key(map.get(super::model::API_KEY_SCOPE).map(|a| a.key.clone()))
+}
+
+/// Memo for [`AuthManager::cached_disk_api_key`]. `stamp == None` = file absent.
+struct StaticKeyCacheEntry {
+    stamp: Option<AuthFileStamp>,
+    key: Option<String>,
+}
+
+/// (inode, mtime, len). `write_auth_json`'s temp+rename allocates a new inode
+/// per rewrite, so even a same-length same-mtime rewrite misses the memo.
+/// Windows has no stable inode (0 there); its fine mtimes suffice.
+type AuthFileStamp = (u64, Option<std::time::SystemTime>, u64);
+
+fn auth_file_stamp(path: &Path) -> Option<AuthFileStamp> {
+    let meta = std::fs::metadata(path).ok()?;
+    #[cfg(unix)]
+    let ino = std::os::unix::fs::MetadataExt::ino(&meta);
+    #[cfg(not(unix))]
+    let ino = 0;
+    Some((ino, meta.modified().ok(), meta.len()))
+}
+
+impl AuthManager {
+    /// `xai::api_key` from this manager's auth file, memoized on
+    /// [`AuthFileStamp`]: bearer resolution runs per tool call, so this
+    /// costs a `stat` instead of a read+parse on the hot path.
+    fn cached_disk_api_key(&self) -> Option<String> {
+        let stamp = auth_file_stamp(&self.path);
+        let mut cache = self.static_key_cache.lock();
+        match cache.as_ref() {
+            Some(entry) if entry.stamp == stamp => entry.key.clone(),
+            _ => {
+                let key = stamp
+                    .is_some()
+                    .then(|| api_key_from_auth_file(&self.path))
+                    .flatten();
+                *cache = Some(StaticKeyCacheEntry {
+                    stamp,
+                    key: key.clone(),
+                });
+                key
+            }
+        }
+    }
+
+    /// Set the process model key (empty clears). Not for session tokens.
+    pub fn set_process_static_api_key(&self, key: Option<String>) {
+        let key = key.map(|k| k.trim().to_string()).filter(|k| !k.is_empty());
+        *self.process_static_api_key.write() = key;
+    }
+
+    /// Static/BYOK key for export paths (e.g. desktop `getBearerToken`). Never a
+    /// session JWT; respects kill-switch and preferred-method pin.
+    pub(crate) fn static_api_key_for_export(&self) -> Option<String> {
+        resolve_static_api_key(self)
+    }
+}
+
+fn non_empty_key(key: Option<String>) -> Option<String> {
+    key.map(|k| k.trim().to_string()).filter(|k| !k.is_empty())
+}
+
+/// Per-request bearer for out-of-crate consumers (e.g. pager voice).
 pub fn shared_api_key_provider(
     auth_manager: Arc<AuthManager>,
 ) -> xai_grok_tools::types::SharedApiKeyProvider {

@@ -442,6 +442,13 @@ pub struct FeedbackSubmission {
     /// Backend URL linking this feedback to its server-side session log.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unified_log_url: Option<String>,
+
+    /// Client-reported display name; unverified, never used for authorization.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author_name: Option<String>,
+    /// Client-reported email; unverified, never used for authorization.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author_email: Option<String>,
 }
 
 impl FeedbackSubmission {
@@ -460,8 +467,8 @@ impl FeedbackSubmission {
         s
     }
 
-    /// Remove session context and model metadata, preserving only the
-    /// user's rating/text and essential identifiers (session_id, client_type).
+    /// Remove session context and model metadata. The author identity is
+    /// preserved so the author stays reachable after the strip.
     pub fn strip_metadata(&mut self) {
         self.model_id = None;
         self.resolved_model_id = None;
@@ -509,6 +516,12 @@ pub struct FeedbackTerminalInfo {
     pub is_byobu: bool,
     /// Raw `TERM` environment variable value.
     pub term_var: String,
+    /// Terminal version exactly as the emulator reports it, when known — not
+    /// always the release number, since Alacritty answers with its
+    /// `alacritty_terminal` library version (release 0.15.1 arrives as
+    /// "0.25.0"). The source that reported it is deliberately not carried.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub term_version: Option<String>,
     /// tmux server version if inside tmux, otherwise "n/a".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tmux_version: Option<String>,

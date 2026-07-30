@@ -88,22 +88,19 @@ pub(crate) fn format_hook_name(spec: &xai_grok_hooks::config::HookSpec) -> Strin
     }
 }
 
-/// Provenance from the namespace prefix each loader stamps on the spec name:
-/// `global/` → user, `project/` → project, `plugin/` → plugin, `agent:` →
-/// agent, else unknown. (Source-dir classification was wrong — both global and
-/// project dirs contain `/.grok/`.)
+/// Provenance for telemetry, mapped from the shared [`hook_origin`] classifier so
+/// this and `/hooks` inspect can't diverge.
 fn format_hook_source(spec: &xai_grok_hooks::config::HookSpec) -> &'static str {
-    let name = spec.name.as_str();
-    if name.starts_with("global/") {
-        "userSettings"
-    } else if name.starts_with("project/") {
-        "projectSettings"
-    } else if name.starts_with("plugin/") {
-        "pluginHook"
-    } else if name.starts_with("agent:") {
-        "agentHook"
-    } else {
-        "unknown"
+    use xai_grok_hooks::config::HookOrigin as O;
+    match xai_grok_hooks::config::hook_origin(spec) {
+        O::SystemManaged | O::Managed => "managedConfig",
+        O::Requirements => "requirementsConfig",
+        O::UserConfig => "userConfig",
+        O::UserFile => "userSettings",
+        O::ProjectFile => "projectSettings",
+        O::Plugin => "pluginHook",
+        O::Agent => "agentHook",
+        O::Unknown => "unknown",
     }
 }
 
@@ -120,7 +117,7 @@ impl HookRegInfo {
         Self {
             name: format_hook_name(spec),
             event: spec.event.to_string(),
-            hook_type: spec.handler_type.clone(),
+            hook_type: spec.handler_type.as_str().to_string(),
             source: format_hook_source(spec),
         }
     }
@@ -138,8 +135,9 @@ pub(crate) struct SessionHarnessMetrics {
     pub memory_enabled: bool,
     pub auto_update: Option<bool>,
     pub cwd: String,
-    pub skills_config: xai_grok_agent::prompt::skills::SkillsConfig,
-    /// Resolved vendor-compat config, so recorded skill / AGENTS.md names match
+    /// Filled from the built agent's bridge so `into_event` doesn't re-walk the disk.
+    pub skill_names: Vec<String>,
+    /// Resolved vendor-compat config, so recorded AGENTS.md names match
     /// what the session actually discovers.
     pub compat: xai_grok_tools::types::compat::CompatConfig,
     pub plugin_registry: Option<std::sync::Arc<xai_grok_agent::plugins::PluginRegistry>>,
@@ -192,16 +190,6 @@ impl SessionHarnessMetrics {
                 .map(|n| n.to_string_lossy().into_owned())
         })
         .collect();
-        let skill_names = xai_grok_agent::prompt::skills::list_skills_with_plugins(
-            Some(&self.cwd),
-            &self.skills_config,
-            self.plugin_registry.as_deref(),
-            self.compat,
-        )
-        .await
-        .into_iter()
-        .map(|s| s.name)
-        .collect();
         SessionHarness {
             session_id: self.session_id,
             client_identifier: self.client_identifier,
@@ -210,7 +198,7 @@ impl SessionHarnessMetrics {
             permission_mode: self.permission_mode,
             mcp_server_names: self.mcp_server_names,
             plugin_names: self.plugin_names,
-            skill_names,
+            skill_names: self.skill_names,
             lsp_server_names: self.lsp_server_names,
             hook_names,
             agents_md_dir_names,

@@ -553,6 +553,8 @@ pub struct PlanViewerExtras {
     pub comment_hovered: bool,
     pub abandon_button_area: Option<Rect>,
     pub abandon_hovered: bool,
+    pub copy_button_area: Option<Rect>,
+    pub copy_hovered: bool,
     pub last_click_at: Option<std::time::Instant>,
     pub gutter_drag_start: Option<usize>,
     pub gutter_drag_end: Option<usize>,
@@ -822,8 +824,7 @@ impl LineViewerState {
     }
 
     /// Whether the plan modal should render the action-button footer.
-    /// True for both modes: plan-approval (q/c/s|a) and casual
-    /// (c/s — quit via the close-X button instead of a footer button).
+    /// True for plan-approval and casual plan preview (not plain file preview).
     pub fn show_footer(&self) -> bool {
         self.plan
             .as_ref()
@@ -1007,13 +1008,13 @@ fn build_source_lines(path: &Path, content: &str) -> Vec<SourceLine> {
         .enumerate()
         .map(|(i, text)| {
             let line_number = i + 1;
-            let styled_line = if text.is_empty() {
-                // Empty line — still needs a Line (for line number prefix).
-                Line::from(" ".to_owned())
-            } else if let Some(ref mut hl) = highlighter {
-                highlight_to_ratatui_line(hl, text, &syntect.syntax_set)
-            } else {
-                Line::from((*text).to_owned())
+            // Feed every line, blank ones included, through the highlighter so
+            // its parse state stays in sync. Skipping blanks corrupts constructs
+            // that span multiple lines (block comments, multi-line strings).
+            let styled_line = match highlighter.as_mut() {
+                Some(hl) => highlight_to_ratatui_line(hl, text, &syntect.syntax_set),
+                None if text.is_empty() => Line::from(" ".to_owned()),
+                None => Line::from((*text).to_owned()),
             };
             SourceLine::new(line_number, styled_line, (*text).to_owned(), max_digits)
         })
@@ -1128,27 +1129,38 @@ fn highlight_to_ratatui_line(
     text: &str,
     syntax_set: &syntect::parsing::SyntaxSet,
 ) -> Line<'static> {
-    let highlighted = match hl.highlight_line(text, syntax_set) {
+    // syntect needs the trailing newline to recognize line-spanning constructs.
+    // Feed it, then strip the newline back out of the rendered spans.
+    let with_newline = format!("{text}\n");
+    let highlighted = match hl.highlight_line(&with_newline, syntax_set) {
         Ok(h) => h,
+        Err(_) if text.is_empty() => return Line::from(" ".to_owned()),
         Err(_) => return Line::from(text.to_owned()),
     };
 
-    let spans: Vec<Span<'static>> = highlighted
-        .into_iter()
-        .map(|(style, content)| {
-            let fg = syntect_to_ratatui_color(style.foreground);
-            Span::styled(content.to_owned(), Style::default().fg(fg))
-        })
-        .collect();
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    for (style, segment) in highlighted {
+        let mut piece = segment.to_owned();
+        while piece.ends_with('\n') || piece.ends_with('\r') {
+            piece.pop();
+        }
+        if piece.is_empty() {
+            continue;
+        }
+        // Shared path: polarity-safe under the terminal-native lock, else
+        // normal theme quantize (see xai_grok_pager_render::syntax).
+        let fg = crate::syntax::syntect_rgb_to_fg(
+            style.foreground.r,
+            style.foreground.g,
+            style.foreground.b,
+        );
+        spans.push(Span::styled(piece, Style::default().fg(fg)));
+    }
 
+    if spans.is_empty() {
+        return Line::from(" ".to_owned());
+    }
     Line::from(spans)
-}
-
-/// Convert a syntect RGBA color to a ratatui Color.
-///
-/// Quantizes the RGB value to the terminal's supported color level.
-fn syntect_to_ratatui_color(c: syntect::highlighting::Color) -> ratatui::style::Color {
-    crate::theme::quantize(ratatui::style::Color::Rgb(c.r, c.g, c.b))
 }
 
 /// Count digits in a number (for line number padding).
@@ -1466,10 +1478,7 @@ pub fn render_line_viewer(
     //    Buttons use the same `key bold + label dim` treatment as
     //    `render_modal_shortcuts`, sit in a single row separated by
     //    `  |  `, centered within the modal frame.
-    //
-    //    - Plan-approval:  q quit | c comment | s send / a approve
-    //    - Casual preview:           c comment | s send  (no `q` —
-    //      the close-X button handles closing in casual mode)
+    //    Casual preview omits `q` (close via the X button).
     if viewer.show_footer() && inner.height >= 2 {
         let div_y = inner.y + inner.height - 2;
         let div_style = Style::default().fg(theme.gray_dim).bg(theme.bg_base);
@@ -1481,10 +1490,14 @@ pub fn render_line_viewer(
         let abandon_hovered = viewer.plan_ref().is_some_and(|p| p.abandon_hovered);
         let comment_hovered = viewer.plan_ref().is_some_and(|p| p.comment_hovered);
         let approve_hovered = viewer.plan_ref().is_some_and(|p| p.approve_hovered);
+        let copy_hovered = viewer.plan_ref().is_some_and(|p| p.copy_hovered);
         let is_approval = viewer.feedback_active();
 
         let comment_spans = build_shortcut_button('c', "comment", comment_hovered, theme);
         let comment_w: u16 = comment_spans.iter().map(|s| s.width() as u16).sum();
+
+        let copy_spans = build_shortcut_button('y', "copy plan", copy_hovered, theme);
+        let copy_w: u16 = copy_spans.iter().map(|s| s.width() as u16).sum();
 
         // In approval mode, always show `a approve`. When there are
         // pending review comments, also show `s revise` (request changes).
@@ -1544,18 +1557,20 @@ pub fn render_line_viewer(
         let sep_w: u16 = 5; // separator is fixed-width ASCII; matches modal_window.rs:565
         let sep_style = Style::default().fg(theme.gray_dim).bg(theme.bg_base);
 
-        // Total width: [action] + (sep + revise)? + sep + comment[badge?] + (sep + quit)?
-        let mut total_w: u16 = 0;
+        let mut base_w: u16 = 0;
         if action_w > 0 {
-            total_w = total_w.saturating_add(action_w).saturating_add(sep_w);
+            base_w = base_w.saturating_add(action_w).saturating_add(sep_w);
         }
         if revise_w > 0 {
-            total_w = total_w.saturating_add(revise_w).saturating_add(sep_w);
+            base_w = base_w.saturating_add(revise_w).saturating_add(sep_w);
         }
-        total_w = total_w.saturating_add(comment_w).saturating_add(badge_w);
+        base_w = base_w.saturating_add(comment_w).saturating_add(badge_w);
         if let Some((_, w)) = &quit_spans {
-            total_w = total_w.saturating_add(sep_w).saturating_add(*w);
+            base_w = base_w.saturating_add(sep_w).saturating_add(*w);
         }
+        let with_copy_w = base_w.saturating_add(sep_w).saturating_add(copy_w);
+        let show_copy = with_copy_w <= inner.width;
+        let total_w = if show_copy { with_copy_w } else { base_w };
 
         if total_w <= inner.width {
             let mut x = inner.x + (inner.width - total_w) / 2;
@@ -1609,6 +1624,20 @@ pub fn render_line_viewer(
                 x += badge_w;
             }
 
+            if show_copy {
+                buf.set_string(x, bottom_y, separator, sep_style);
+                x += sep_w;
+                let copy_x = x;
+                for span in &copy_spans {
+                    let w = span.width() as u16;
+                    buf.set_span(x, bottom_y, span, w);
+                    x += w;
+                }
+                viewer.plan_mut().copy_button_area = Some(Rect::new(copy_x, bottom_y, copy_w, 1));
+            } else {
+                viewer.plan_mut().copy_button_area = None;
+            }
+
             // Quit button — approval mode only.
             if let Some((spans, w)) = quit_spans {
                 buf.set_string(x, bottom_y, separator, sep_style);
@@ -1629,6 +1658,7 @@ pub fn render_line_viewer(
             let plan = viewer.plan_mut();
             plan.approve_button_area = None;
             plan.comment_button_area = None;
+            plan.copy_button_area = None;
             plan.abandon_button_area = None;
         }
     }
@@ -1669,6 +1699,20 @@ mod tests {
     fn open_markdown_content_rejects_blank_content() {
         assert!(
             LineViewerState::open_markdown_content("plan.md", "  \n".to_owned(), None).is_none()
+        );
+    }
+
+    #[test]
+    fn plan_preview_exposes_full_raw_markdown_for_copy() {
+        let body = "# Plan\n\n- Do the thing\n- Then ship";
+        let mut viewer = LineViewerState::open_markdown_content("plan.md", body.to_owned(), None)
+            .expect("markdown content should open");
+        viewer.kind = LineViewerKind::PlanPreview;
+        viewer.prepare_layout(80, 20);
+
+        assert_eq!(
+            viewer.markdown_content_for_feedback().as_deref(),
+            Some(body)
         );
     }
 
