@@ -94,6 +94,46 @@ pub(super) fn set_hunk_tracker_mode_inner(app: &mut AppView, canonical: &str) {
     app.current_ui.hunk_tracker_mode = Some(canonical.to_string());
 }
 
+pub(super) fn set_screen_mode_inner(app: &mut AppView, canonical: &str) {
+    app.current_ui.screen_mode = Some(canonical.to_string());
+}
+
+/// Persist `[ui].screen_mode` (`fullscreen` | `minimal`). Restart-required.
+///
+/// Unset is *displayed* as Fullscreen but is not an explicit on-disk value —
+/// choosing Fullscreen when missing must still write, or legacy pager.toml /
+/// leaky-terminal paths can keep applying after the user confirmed Fullscreen.
+pub(in crate::app::dispatch) fn set_screen_mode(app: &mut AppView, value: String) -> Vec<Effect> {
+    let canonical = crate::settings::canonical_screen_mode(Some(&value));
+    let prev_raw = app.current_ui.screen_mode.as_deref();
+    let prev = crate::settings::canonical_screen_mode(prev_raw);
+    if screen_mode_raw_matches_canonical(prev_raw, canonical) {
+        return vec![];
+    }
+    set_screen_mode_inner(app, canonical);
+    refresh_open_settings_modals(app);
+    tracing::info!(target: "settings", key = "screen_mode", value = canonical, "setting changed");
+    app.show_toast(&format!(
+        "\u{2713} Screen mode: {canonical} (restart to apply)"
+    ));
+    vec![Effect::PersistSetting {
+        key: "screen_mode",
+        value: crate::settings::SettingValue::Enum(canonical),
+        rollback_value: crate::settings::SettingValue::Enum(prev),
+    }]
+}
+
+fn screen_mode_raw_matches_canonical(raw: Option<&str>, canonical: &str) -> bool {
+    let Some(raw) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return false;
+    };
+    match canonical {
+        "minimal" => raw.eq_ignore_ascii_case("minimal"),
+        "fullscreen" => raw.eq_ignore_ascii_case("fullscreen") || raw.eq_ignore_ascii_case("full"),
+        _ => false,
+    }
+}
+
 /// Set the hunk-tracker mode (registry-driven path).
 ///
 /// SHELL-owned, restart-required: persists to `[ui].hunk_tracker_mode` via
@@ -150,6 +190,39 @@ pub(in crate::app::dispatch) fn set_voice_capture_mode(
         key: "voice_capture_mode",
         value: crate::settings::SettingValue::Enum(canonical),
         rollback_value: crate::settings::SettingValue::Enum(prev),
+    }]
+}
+
+/// Mirror the voice-shortcut gate into `app.current_ui` (read live by the
+/// event-loop chord intercept) and the process-global mirror (read by key
+/// routing / view code without an `AppView`). Called by the commit path AND by
+/// [`apply_setting_rollback`](super::ui::apply_setting_rollback).
+pub(super) fn set_voice_keybind_enabled_inner(app: &mut AppView, new: bool) {
+    app.current_ui.voice_keybind_enabled = Some(new);
+    crate::app::VOICE_KEYBIND_ENABLED.store(new, std::sync::atomic::Ordering::Release);
+}
+
+/// Enable/disable the Ctrl+Space / F8 voice shortcut. SHELL-owned; persists to
+/// `[ui].voice_keybind_enabled` via `Effect::PersistSetting`. Applies on the
+/// next keypress (no restart). Only the chord is gated — `/voice`, Esc while
+/// listening, and the recording-row `[stop]` keep working.
+pub(in crate::app::dispatch) fn set_voice_keybind_enabled(
+    app: &mut AppView,
+    new: bool,
+) -> Vec<Effect> {
+    let prev_state = app.current_ui.voice_keybind_enabled;
+    let prev_effective = prev_state.unwrap_or(true);
+    if prev_effective == new && prev_state.is_some() {
+        return vec![];
+    }
+    set_voice_keybind_enabled_inner(app, new);
+    refresh_open_settings_modals(app);
+    tracing::info!(target: "settings", key = "voice_keybind_enabled", value = new, "setting changed");
+    app.show_toast(&save_success_toast("Voice shortcut", new));
+    vec![Effect::PersistSetting {
+        key: "voice_keybind_enabled",
+        value: crate::settings::SettingValue::Bool(new),
+        rollback_value: crate::settings::SettingValue::Bool(prev_effective),
     }]
 }
 
@@ -848,6 +921,86 @@ pub(in crate::app::dispatch) fn set_timestamps(app: &mut AppView, new: bool) -> 
     }]
 }
 
+/// State-only mutation for `show_timeline`. Mirrors `set_timestamps_inner`.
+pub(super) fn set_timeline_inner(app: &mut AppView, new: bool) {
+    app.current_ui.show_timeline = Some(new);
+    if app.appearance.show_timeline == new {
+        crate::appearance::cache::set_show_timeline(new);
+        return;
+    }
+    let mut config = app.appearance.clone();
+    config.show_timeline = new;
+    app.set_appearance(config);
+    crate::appearance::cache::set_show_timeline(new);
+}
+
+pub(in crate::app::dispatch) fn set_timeline(app: &mut AppView, new: bool) -> Vec<Effect> {
+    // Gate on the displayed state (`appearance.show_timeline`, what the rail
+    // renders from and what `/timeline` toggles against) — not the separately
+    // hydrated `current_ui`, which could disagree and make the toggle no-op.
+    let prev = app.appearance.show_timeline;
+    // Idempotency gate.
+    if prev == new {
+        return vec![];
+    }
+    set_timeline_inner(app, new);
+    refresh_open_settings_modals(app);
+    tracing::info!(target: "settings", key = "show_timeline", value = new, "setting changed");
+    app.show_toast(&save_success_toast("Timeline sidebar", new));
+    vec![Effect::PersistSetting {
+        key: "show_timeline",
+        value: crate::settings::SettingValue::Bool(new),
+        rollback_value: crate::settings::SettingValue::Bool(prev),
+    }]
+}
+
+pub(super) fn set_page_flip_on_send_inner(app: &mut AppView, new: bool) {
+    app.current_ui.page_flip_on_send = Some(new);
+    crate::appearance::cache::set_page_flip_on_send(new);
+}
+
+/// SHARED: cache + `[ui].page_flip_on_send` via `Effect::PersistSetting`.
+pub(in crate::app::dispatch) fn set_page_flip_on_send(app: &mut AppView, new: bool) -> Vec<Effect> {
+    let prev = crate::appearance::cache::load_page_flip_on_send();
+    if prev == new {
+        return vec![];
+    }
+    set_page_flip_on_send_inner(app, new);
+    refresh_open_settings_modals(app);
+    tracing::info!(target: "settings", key = "page_flip_on_send", value = new, "setting changed");
+    app.show_toast(&save_success_toast("Snap prompt to top on send", new));
+    vec![Effect::PersistSetting {
+        key: "page_flip_on_send",
+        value: crate::settings::SettingValue::Bool(new),
+        rollback_value: crate::settings::SettingValue::Bool(prev),
+    }]
+}
+
+pub(super) fn set_combine_queued_prompts_inner(app: &mut AppView, new: bool) {
+    app.current_ui.combine_queued_prompts = Some(new);
+    crate::appearance::cache::set_combine_queued_prompts(new);
+}
+
+/// SHARED: cache + `[ui].combine_queued_prompts` via `Effect::PersistSetting`.
+pub(in crate::app::dispatch) fn set_combine_queued_prompts(
+    app: &mut AppView,
+    new: bool,
+) -> Vec<Effect> {
+    let prev = crate::appearance::cache::load_combine_queued_prompts();
+    if prev == new {
+        return vec![];
+    }
+    set_combine_queued_prompts_inner(app, new);
+    refresh_open_settings_modals(app);
+    tracing::info!(target: "settings", key = "combine_queued_prompts", value = new, "setting changed");
+    app.show_toast(&save_success_toast("Combine queued prompts", new));
+    vec![Effect::PersistSetting {
+        key: "combine_queued_prompts",
+        value: crate::settings::SettingValue::Bool(new),
+        rollback_value: crate::settings::SettingValue::Bool(prev),
+    }]
+}
+
 /// State-only mutation for `simple_mode`.
 ///
 /// Propagates to every agent's `input_mode` so the toggle takes
@@ -1027,6 +1180,21 @@ pub(in crate::app::dispatch) fn set_contextual_hint_word_select(
         "Word select hint",
         prev,
         |h, v| h.word_select = v,
+        new,
+    )
+}
+
+pub(in crate::app::dispatch) fn set_contextual_hint_ssh_wrap(
+    app: &mut AppView,
+    new: bool,
+) -> Vec<Effect> {
+    let prev = app.current_ui.contextual_hints.ssh_wrap;
+    set_contextual_hint(
+        app,
+        "contextual_hints.ssh_wrap",
+        "SSH wrap hint",
+        prev,
+        |h, v| h.ssh_wrap = v,
         new,
     )
 }

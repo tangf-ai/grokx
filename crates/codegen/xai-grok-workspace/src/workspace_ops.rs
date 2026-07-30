@@ -36,6 +36,7 @@ pub use xai_grok_workspace_types::rpc::code_nav::{
     CodeFindDefinitionsReq, CodeFindReferencesReq, CodeGotoDefinitionReq, CodeGotoReferencesReq,
     CodeIndexStats, CodeIndexStatusReq, CodeIndexStatusResponse, CodeNavLocation, CodeNavResponse,
 };
+pub use xai_grok_workspace_types::rpc::export_github::ExportGithubReq;
 pub use xai_grok_workspace_types::rpc::fs::{
     ClientFsListNode, ClientFsListReq, ClientFsListRes, ClientFsReadFileReq, ClientFsReadFileRes,
     ClientFsStatReq, ClientFsStatRes, GetFileEntry, GetFileResult, GetFilesReq, GetFilesRes,
@@ -46,9 +47,9 @@ pub use xai_grok_workspace_types::rpc::git::{
     DiffStatsSummary, GitBranchesReq, GitCheckoutCommitReq, GitCheckoutReq, GitCollectChangesReq,
     GitCollectChangesResponse, GitCommitReq, GitCurrentCommitReq, GitDiffReq, GitDiscardReq,
     GitFilesReq, GitInfoReq, GitResolveRootReq, GitStageContentReq, GitStageReq, GitStashReq,
-    GitStatusExtReq, GitStatusExtResponse, GitStatusFormat, GitStatusReq, GitUnstageReq,
-    IdentityData, PublicBaseData, RepoInfo, UNTRACKED_CONTENT_THRESHOLD, UncommittedChangesData,
-    UntrackedFileData,
+    GitStatusExtReq, GitStatusExtResponse, GitStatusFormat, GitStatusReq, GitSyncBaseReq,
+    GitUnstageReq, IdentityData, PublicBaseData, RepoInfo, UNTRACKED_CONTENT_THRESHOLD,
+    UncommittedChangesData, UntrackedFileData,
 };
 pub use xai_grok_workspace_types::rpc::hooks::{
     HookEventNameWire, HookRegistryReq, HookRegistryWire, HookSpecWire,
@@ -97,6 +98,37 @@ pub trait WorkspaceOp: WorkspaceRpc + DeserializeOwned + Send + Sync {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PrepareWorktreeFromWorktreeReq {
     pub inner: crate::worktree::CreateWorktreeFromWorktreeRequest,
+}
+#[async_trait]
+impl WorkspaceOp for ExportGithubReq {
+    async fn execute(
+        &self,
+        ws: &WorkspaceHandle,
+        _session_id: Option<&str>,
+    ) -> WorkspaceResult<Self::Response> {
+        if std::path::Path::new(&self.project_dir).is_absolute() {
+            return Err(WorkspaceError::HubError(
+                "project_dir must be relative to the workspace root".into(),
+            ));
+        }
+        let canonical_root = ws.canonical_root().await?;
+        let project_dir = ws
+            .resolve_service_path(&self.project_dir, &canonical_root)
+            .await?;
+        crate::export_github::run_export(crate::export_github::ExportGithubParams {
+            project_dir: &project_dir,
+            repo_full_name: self.repo_full_name.as_deref(),
+            remote_url_base: "https://github.com",
+            web_url_base: "https://github.com",
+            branch: self.branch.as_deref(),
+            commit_message: self.commit_message.as_deref(),
+        })
+        .await
+        .map_err(|failure| WorkspaceError::ExportGithub {
+            kind: failure.kind,
+            message: failure.message,
+        })
+    }
 }
 /// Get all rewind points for the session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -357,13 +389,24 @@ impl WorkspaceOp for GitCommitReq {
         _session_id: Option<&str>,
     ) -> WorkspaceResult<Self::Response> {
         let cwd = git_op_cwd(ws, &self.git_root)?;
-        crate::session::git::commit(
+        crate::session::git::commit(&cwd, self)
+            .await
+            .map_err(|e| WorkspaceError::HubError(e.to_string()))
+    }
+}
+#[async_trait]
+impl WorkspaceOp for GitSyncBaseReq {
+    async fn execute(
+        &self,
+        ws: &WorkspaceHandle,
+        _session_id: Option<&str>,
+    ) -> WorkspaceResult<Self::Response> {
+        let cwd = git_op_cwd(ws, &self.git_root)?;
+        crate::session::git::sync_base(
             &cwd,
-            &self.message,
-            self.amend,
-            self.signoff,
-            self.push,
-            self.sync,
+            self.base_ref.as_deref(),
+            self.abort,
+            self.expected_branch.as_deref(),
         )
         .await
         .map_err(|e| WorkspaceError::HubError(e.to_string()))
@@ -856,10 +899,8 @@ impl WorkspaceOp for ContentSearchRequest {
         ws.run_content_search(cwd, context_id, params).await
     }
 }
-/// Convert the heavy `HookRegistry` to its wire mirror via a serde round-trip.
-/// The registry's `hooks` map is private, so reconstructing field-by-field
-/// isn't possible; the round-trip is faithful because the wire type mirrors the
-/// serde shape exactly (the compiled `matcher` is `#[serde(skip)]` either way).
+/// Convert `HookRegistry` to its wire mirror. The `hooks` map is private, so a
+/// serde round-trip stands in for field-by-field construction.
 fn hook_registry_to_wire(
     registry: &xai_grok_hooks::discovery::HookRegistry,
 ) -> WorkspaceResult<HookRegistryWire> {
@@ -867,14 +908,41 @@ fn hook_registry_to_wire(
         serde_json::to_value(registry).map_err(|e| WorkspaceError::HubError(e.to_string()))?;
     serde_json::from_value(value).map_err(|e| WorkspaceError::HubError(e.to_string()))
 }
-/// Inverse of [`hook_registry_to_wire`]. The compiled `matcher` is absent from
-/// the wire (and from this result); callers recompile it via
-/// `HookRegistry::recompile_matchers`, exactly as the proxy path already did.
+/// Inverse of [`hook_registry_to_wire`]. Unknown event keys (a newer peer) are
+/// dropped so one can't fail the whole decode, and matchers are recompiled
+/// fail-closed after the hop.
 fn wire_to_hook_registry(
     wire: &HookRegistryWire,
 ) -> WorkspaceResult<xai_grok_hooks::discovery::HookRegistry> {
-    let value = serde_json::to_value(wire).map_err(|e| WorkspaceError::HubError(e.to_string()))?;
-    serde_json::from_value(value).map_err(|e| WorkspaceError::HubError(e.to_string()))
+    let dropped: Vec<&str> = wire
+        .hooks
+        .keys()
+        .filter_map(|event| match event {
+            HookEventNameWire::Unknown(name) => Some(name.as_str()),
+            _ => None,
+        })
+        .collect();
+    if !dropped.is_empty() {
+        tracing::debug!(
+            dropped_count = dropped.len(),
+            dropped_events = ?dropped,
+            "dropping unknown hook event keys from peer wire registry"
+        );
+    }
+    let known = HookRegistryWire {
+        hooks: wire
+            .hooks
+            .iter()
+            .filter(|(event, _)| !matches!(event, HookEventNameWire::Unknown(_)))
+            .map(|(event, specs)| (event.clone(), specs.clone()))
+            .collect(),
+    };
+    let value =
+        serde_json::to_value(&known).map_err(|e| WorkspaceError::HubError(e.to_string()))?;
+    let mut registry: xai_grok_hooks::discovery::HookRegistry =
+        serde_json::from_value(value).map_err(|e| WorkspaceError::HubError(e.to_string()))?;
+    registry.recompile_matchers();
+    Ok(registry)
 }
 #[async_trait]
 impl WorkspaceOp for HookRegistryReq {
@@ -1301,10 +1369,7 @@ impl WorkspaceOps {
         };
         handle.on_session_ended(session_id);
         if let Err(e) = handle.drop_session(session_id, session_id) {
-            tracing::debug!(
-                % session_id, error = % e,
-                "end_local_session: drop_session failed (expected if never bound)"
-            );
+            tracing::debug!(%session_id, error = %e, "end_local_session: drop_session failed (expected if never bound)");
         }
     }
     pub async fn on_before_turn(
@@ -1514,7 +1579,7 @@ impl WorkspaceOps {
         }
     }
 }
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl WorkspaceOps {
     /// Test variant backed by a temp dir.
     ///
@@ -1752,7 +1817,7 @@ mod tests {
         let spec = xai_grok_hooks::config::HookSpec {
             name: "global/safety".to_string(),
             event: xai_grok_hooks::event::HookEventName::PreToolUse,
-            handler_type: "command".to_string(),
+            handler_type: xai_grok_hooks::config::HandlerType::Command,
             configured_matcher: Some("Bash".to_string()),
             matcher: None,
             enabled: true,
@@ -1763,6 +1828,7 @@ mod tests {
             timeout_ms: 5000,
             source_dir: std::path::PathBuf::from("/home/u/.grok/hooks"),
             extra_env: std::collections::HashMap::from([("FOO".to_string(), "bar".to_string())]),
+            layer: xai_grok_hooks::config::HookProvenance::File,
         };
         let mut registry = xai_grok_hooks::discovery::HookRegistry::default();
         registry.append_specs(vec![spec]);
@@ -1857,12 +1923,13 @@ mod tests {
                 timeout_ms,
                 source_dir,
                 extra_env,
+                layer,
             } = spec;
             let event = serde_json::from_value(serde_json::to_value(event).unwrap()).unwrap();
             HookSpecWire {
                 name,
                 event,
-                handler_type,
+                handler_type: handler_type.as_str().to_string(),
                 configured_matcher,
                 enabled,
                 command,
@@ -1872,12 +1939,13 @@ mod tests {
                 timeout_ms,
                 source_dir,
                 extra_env,
+                layer: layer.as_str().to_string(),
             }
         }
         let spec = HookSpec {
             name: "global/safety".to_string(),
             event: xai_grok_hooks::event::HookEventName::PreToolUse,
-            handler_type: "command".to_string(),
+            handler_type: xai_grok_hooks::config::HandlerType::Command,
             configured_matcher: Some("Bash".to_string()),
             matcher: None,
             enabled: true,
@@ -1888,6 +1956,7 @@ mod tests {
             timeout_ms: 5000,
             source_dir: std::path::PathBuf::from("/home/u/.grok/hooks"),
             extra_env: std::collections::HashMap::from([("FOO".to_string(), "bar".to_string())]),
+            layer: xai_grok_hooks::config::HookProvenance::Managed,
         };
         assert_eq!(
             serde_json::to_value(&spec).unwrap(),
@@ -2041,9 +2110,10 @@ mod tests {
     /// PutFileEntry serde round-trip with defaults.
     #[test]
     fn put_file_entry_defaults() {
-        let json = serde_json::json!(
-            { "path" : "src/main.rs", "content" : "fn main() {}" }
-        );
+        let json = serde_json::json!({
+            "path": "src/main.rs",
+            "content": "fn main() {}"
+        });
         let entry: PutFileEntry = serde_json::from_value(json).unwrap();
         assert_eq!(entry.path, "src/main.rs");
         assert_eq!(entry.content, "fn main() {}");
@@ -2089,7 +2159,7 @@ mod tests {
     /// GetFileEntry serde round-trip with defaults.
     #[test]
     fn get_file_entry_defaults() {
-        let json = serde_json::json!({ "path" : "lib.rs" });
+        let json = serde_json::json!({ "path": "lib.rs" });
         let entry: GetFileEntry = serde_json::from_value(json).unwrap();
         assert_eq!(entry.path, "lib.rs");
         assert!(entry.if_none_match.is_none());
@@ -2124,7 +2194,10 @@ mod tests {
     /// GetFileResult serialization skips None fields, defaults matched to false.
     #[test]
     fn get_file_result_defaults_and_skip() {
-        let json = serde_json::json!({ "path" : "a.txt", "exists" : true, });
+        let json = serde_json::json!({
+            "path": "a.txt",
+            "exists": true,
+        });
         let result: GetFileResult = serde_json::from_value(json).unwrap();
         assert!(!result.matched, "matched should default to false");
         assert!(result.content.is_none());

@@ -158,10 +158,8 @@ pub struct PromptStyle {
     /// Only used when `chrome` is true.
     pub chrome_pad_left: u16,
     pub chrome_pad_right: u16,
-    /// Override the background color. When `Some`, the prompt uses this bg
-    /// instead of computing one from focus state. Useful for rendering the
-    /// prompt inline within another widget (e.g., question view).
-    pub bg_override: Option<ratatui::style::Color>,
+    /// Background surface for the prompt; see [`PromptBg`].
+    pub bg: PromptBg,
     /// Override the accent line color. When `Some`, uses this color instead
     /// of the default `accent_user` / `gray_dim`. Used for plan mode (golden).
     pub accent_color_override: Option<ratatui::style::Color>,
@@ -194,6 +192,35 @@ pub struct PromptStyle {
     pub image_preview: bool,
 }
 
+/// Background for the prompt widget.
+///
+/// Paste chips bake `theme.paste_bg` — a badge color tuned for the default
+/// canvas — into their display `Line` at paste time, so the background says
+/// what *kind* of surface the prompt sits on, not just its color.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PromptBg {
+    /// The standalone prompt's default fill (`theme.bg_base`).
+    #[default]
+    Default,
+    /// Explicit canvas color for prompts rendered inline within another
+    /// widget whose surface matches the main prompt's (dashboard dispatch
+    /// box, peek reply). Chips keep their badge background.
+    Canvas(ratatui::style::Color),
+    /// Inline panel color (question freeform input, permission follow-up).
+    /// Chip cells are repainted to blend into the panel.
+    Panel(ratatui::style::Color),
+}
+
+impl PromptBg {
+    /// Effective fill color; `default` is the standalone prompt's.
+    fn color(self, default: ratatui::style::Color) -> ratatui::style::Color {
+        match self {
+            Self::Default => default,
+            Self::Canvas(c) | Self::Panel(c) => c,
+        }
+    }
+}
+
 impl Default for PromptStyle {
     fn default() -> Self {
         Self {
@@ -203,7 +230,7 @@ impl Default for PromptStyle {
             chrome: true,
             chrome_pad_left: 2,
             chrome_pad_right: 1,
-            bg_override: None,
+            bg: PromptBg::Default,
             accent_color_override: None,
             border_color_override: None,
             prefix_override: None,
@@ -237,7 +264,7 @@ impl PromptStyle {
             chrome: false,
             chrome_pad_left: 0,
             chrome_pad_right: 0,
-            bg_override: Some(bg),
+            bg: PromptBg::Panel(bg),
             accent_color_override: None,
             border_color_override: None,
             prefix_override: None,
@@ -293,22 +320,17 @@ pub struct PromptInfo<'a> {
     pub usage_warning_critical: bool,
 }
 
-/// Live voice-capture overlay state for the prompt.
+/// Live voice-capture overlay for the prompt.
 ///
-/// When voice capture is active the interim STT transcript streams
-/// directly into the prompt body (in [`color`](Self::color)) so the user
-/// sees their words land in the input box instead of a status-bar indicator.
-/// The prompt prefix stays the normal `❯` chevron; the recording state is
-/// signalled by a pulsating record indicator rendered above the prompt box.
+/// Interim STT paints as muted italic ghost text (not in the textarea).
+/// Finalized STT is real prompt content and stays editable while the mic is open.
+/// Overlay presence (even with no interim) marks voice active for callers that
+/// skip empty-state placeholders while capturing.
 #[derive(Debug, Clone, Copy)]
 pub struct VoicePromptOverlay<'a> {
-    /// Whether the mic is currently capturing (suppresses the caret while the
-    /// interim transcript stands in for it).
-    pub listening: bool,
-    /// Latest interim transcript to stream into the prompt body, if any.
+    /// Latest interim transcript, if any.
     pub interim: Option<&'a str>,
-    /// Accent color used for both the mic prefix and the streamed text so
-    /// voice input is visually distinct from typed text.
+    /// Theme accent associated with this overlay.
     pub color: ratatui::style::Color,
 }
 
@@ -991,6 +1013,17 @@ impl PromptWidget {
         self.update_file_search_context();
     }
 
+    /// [`Self::set_text`] unless the buffer already holds exactly `text`.
+    ///
+    /// Skipping the no-op swap keeps chip elements, images, and undo history
+    /// intact when a surface reloads an unchanged draft (the question view's
+    /// freeform slots); any real content change takes the normal reset path.
+    pub fn set_text_preserving(&mut self, text: &str) {
+        if self.text() != text {
+            self.set_text(text);
+        }
+    }
+
     /// Append plain text at the end without replacing existing chip elements.
     pub fn append_text(&mut self, text: &str) {
         if text.is_empty() {
@@ -1090,6 +1123,16 @@ impl PromptWidget {
         mru: std::rc::Rc<std::cell::RefCell<crate::slash::mru::SlashMru>>,
     ) {
         self.slash_controller.set_mru(mru);
+    }
+
+    /// Adopt the shared per-command tag map so this prompt's slash dropdown
+    /// renders the same tags as other agent prompts and the dashboard dispatch.
+    /// Injected by `AppView`, which owns the single process map.
+    pub(crate) fn adopt_command_tags(
+        &mut self,
+        command_tags: std::rc::Rc<std::cell::RefCell<std::collections::HashMap<String, String>>>,
+    ) {
+        self.slash_controller.set_command_tags(command_tags);
     }
 
     pub(crate) fn set_recap_visible(&mut self, visible: bool) {
@@ -1641,8 +1684,9 @@ impl PromptWidget {
 
         // ── Normal key handling ─────────────────────────────────────────
 
-        // Newline: Shift-Enter or Alt-Enter
-        if key!(Enter, SHIFT).matches(key) || key!(Enter, ALT).matches(key) {
+        // Newline: Shift/Alt+Enter, or Apple Terminal bare Enter with a
+        // newline modifier held (CoreGraphics rescue inside is_mod_enter).
+        if crate::input::is_mod_enter(key) {
             self.textarea.insert_str("\n");
             self.update_file_search_context();
             return PromptEvent::Edited;
@@ -1782,6 +1826,8 @@ impl PromptWidget {
                     terminal.multiplexer = %evt.terminal.multiplexer,
                     terminal.is_ssh = evt.terminal.is_ssh,
                     terminal.term_var = %evt.terminal.term_var,
+                    terminal.term_version = %evt.terminal.term_version,
+                    terminal.term_version_source = %evt.terminal.term_version_source,
                     key.code = %evt.key_code,
                     key.modifiers = %evt.key_modifiers,
                     key.kind = %evt.key_kind,
@@ -1970,10 +2016,11 @@ impl PromptWidget {
             // try_replace appends `/` and stays open. A file selected in dir-mode
             // falls through to the ref branch (see FileSearchState::try_replace).
             if let Some(r) = self.file_search.try_replace(self.textarea.text()) {
-                let dismiss = r.dismiss;
                 self.textarea.replace_range(r.range, &r.text);
                 self.textarea.set_cursor(r.cursor);
-                if !dismiss {
+                if r.dismiss {
+                    self.file_search.clear_context();
+                } else {
                     // Anchor the drilled child so a whitespace name stays open
                     // (reuse the buffer; only a `./` prefix re-allocs).
                     let mut p = res.path.to_string();
@@ -2850,11 +2897,7 @@ impl PromptWidget {
         }
 
         let theme = Theme::current();
-        let bg = if let Some(override_bg) = style.bg_override {
-            override_bg
-        } else {
-            theme.bg_base
-        };
+        let bg = style.bg.color(theme.bg_base);
 
         let border_color = style.border_color_override.unwrap_or(if style.focused {
             theme.prompt_border_active
@@ -2981,6 +3024,21 @@ impl PromptWidget {
 
         (&self.textarea).render_ref(ta_area, buf, &mut self.textarea_state);
 
+        // Chip bg remap (see `PromptBg::Panel`): chip `Line`s bake in
+        // `paste_bg` at paste time and the same element can render on
+        // multiple surfaces, so restyle at paint time.
+        if matches!(style.bg, PromptBg::Panel(_)) && bg != theme.paste_bg {
+            for y in ta_area.top()..ta_area.bottom() {
+                for x in ta_area.left()..ta_area.right() {
+                    if let Some(cell) = buf.cell_mut((x, y))
+                        && cell.bg == theme.paste_bg
+                    {
+                        cell.bg = bg;
+                    }
+                }
+            }
+        }
+
         // Slash overlays: teal command name + args ghost text. Both use the
         // same snapshot, so clone once. Capture flags for later ghost text
         // suppression to avoid a second clone.
@@ -3083,8 +3141,8 @@ impl PromptWidget {
             (snap.active, snap.inline_ghost.is_some())
         };
 
-        // Voice interim transcript rendered in muted text_secondary so
-        // in-progress words are visually distinct from finalized text.
+        // Interim STT: muted italic overlay (not in the textarea). Finalized
+        // text remains the real, editable draft.
         let voice_interim_shown = if let Some(v) = voice
             && let Some(interim) = v.interim.filter(|t| !t.trim().is_empty())
             && ta_area.width > 0
@@ -3092,7 +3150,10 @@ impl PromptWidget {
         {
             let interim_fg = crate::render::color::blend_color(bg, theme.text_secondary, 0.7)
                 .unwrap_or(theme.gray);
-            let interim_style = Style::default().fg(interim_fg).bg(bg);
+            let interim_style = Style::default()
+                .fg(interim_fg)
+                .bg(bg)
+                .add_modifier(Modifier::ITALIC);
             if self.textarea.text().is_empty() {
                 let lines =
                     wrap_voice_interim(interim, ta_area.width as usize, ta_area.height as usize);
@@ -3100,11 +3161,11 @@ impl PromptWidget {
                     buf.set_string(ta_area.x, ta_area.y + i as u16, line, interim_style);
                 }
             } else {
-                // Append interim as ghost-text suffix after finalized text.
-                let cursor = self.textarea.text().len();
+                // Ghost suffix after the finalized draft (not at the caret).
+                let end = self.textarea.text().len();
                 if let Some((start_x, row_y)) =
                     self.textarea
-                        .screen_position_of(cursor, ta_area, self.textarea_state)
+                        .screen_position_of(end, ta_area, self.textarea_state)
                 {
                     let display = format!(" {interim}");
                     let avail = (ta_area.x + ta_area.width).saturating_sub(start_x) as usize;
@@ -3185,8 +3246,8 @@ impl PromptWidget {
         }
 
         // Unfocused dimming: blend fg toward bg (bg already precomputed above).
-        // Skip when bg_override is set — the prompt is inline in another widget.
-        if !style.focused && style.bg_override.is_none() {
+        // Skip when the bg is overridden — the prompt is inline in another widget.
+        if !style.focused && style.bg == PromptBg::Default {
             // Dim only the content inside the box (skip all border chars).
             let dim_area = Rect {
                 x: area.x + 1,
@@ -3197,44 +3258,41 @@ impl PromptWidget {
             crate::render::color::blend_area(buf, dim_area, Some((bg, 0.66)), None);
         }
 
-        // Hide the cursor while voice capture is active — the streamed
-        // transcript stands in for the caret, so a blinking cursor over it
-        // is noise.
-        let voice_listening = voice.is_some_and(|v| v.listening);
-        let cursor_pos = if style.focused && !voice_listening {
+        // Finalized draft stays editable during voice; hide the caret only when
+        // the box is empty and interim is standing in for it.
+        let hide_caret_for_empty_interim = self.textarea.text().is_empty()
+            && voice.is_some_and(|v| v.interim.is_some_and(|t| !t.trim().is_empty()));
+        let cursor_pos = if style.focused && !hide_caret_for_empty_interim {
             self.textarea
                 .cursor_pos_with_state(ta_area, self.textarea_state)
         } else {
             None
         };
 
-        // Shell command ghost text: render suggestion suffix after cursor.
-        if let Some(ghost) = self.suggestions.ghost_text()
-            && self.textarea.cursor() == self.textarea.text().len()
-            && !slash_active
-            && !slash_has_inline_ghost
-            && let Some((cx, cy)) = cursor_pos
-        {
-            let avail = (ta_area.x + ta_area.width).saturating_sub(cx) as usize;
-            if avail > 0 {
-                let truncated = crate::render::line_utils::truncate_str(ghost, avail);
-                buf.set_string(cx, cy, &truncated, theme.ghost_text_style().bg(bg));
+        // Ghost suffixes (shell completion / predicted prompt). Voice interim
+        // owns the end-of-text cells when shown, so skip both ghosts then.
+        if !voice_interim_shown {
+            if let Some(ghost) = self.suggestions.ghost_text()
+                && self.textarea.cursor() == self.textarea.text().len()
+                && !slash_active
+                && !slash_has_inline_ghost
+                && let Some((cx, cy)) = cursor_pos
+            {
+                let avail = (ta_area.x + ta_area.width).saturating_sub(cx) as usize;
+                if avail > 0 {
+                    let truncated = crate::render::line_utils::truncate_str(ghost, avail);
+                    buf.set_string(cx, cy, &truncated, theme.ghost_text_style().bg(bg));
+                }
             }
-        }
 
-        // Predicted-next-prompt ghost (tab autocomplete): render the remainder
-        // of the suggestion after the cursor. `prompt_suggestion_ghost()`
-        // owns all gating (per-frame active flag, no competing completion UI,
-        // cursor at end-of-text); voice interim already occupies the row when
-        // shown, so it wins.
-        if !voice_interim_shown
-            && let Some(ghost) = self.prompt_suggestion_ghost()
-            && let Some((cx, cy)) = cursor_pos
-        {
-            let avail = (ta_area.x + ta_area.width).saturating_sub(cx) as usize;
-            if avail > 0 {
-                let truncated = crate::render::line_utils::truncate_str(ghost, avail);
-                buf.set_string(cx, cy, &truncated, theme.ghost_text_style().bg(bg));
+            if let Some(ghost) = self.prompt_suggestion_ghost()
+                && let Some((cx, cy)) = cursor_pos
+            {
+                let avail = (ta_area.x + ta_area.width).saturating_sub(cx) as usize;
+                if avail > 0 {
+                    let truncated = crate::render::line_utils::truncate_str(ghost, avail);
+                    buf.set_string(cx, cy, &truncated, theme.ghost_text_style().bg(bg));
+                }
             }
         }
 

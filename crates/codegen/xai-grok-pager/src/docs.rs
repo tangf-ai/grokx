@@ -64,7 +64,7 @@ pub static USER_GUIDE: &[Doc] = &[
     guide!(
         "04-slash-commands.md",
         "Slash Commands",
-        "All / commands for session management, models, memory, hooks"
+        "All / commands, including goals, research, and workflow management"
     ),
     guide!(
         "05-configuration.md",
@@ -154,7 +154,17 @@ pub static USER_GUIDE: &[Doc] = &[
     guide!(
         "22-permissions-and-safety.md",
         "Permissions and Safety",
-        "Tool approval, sandbox, security"
+        "Modes, authorization order, allow/ask/deny rules, matching, and hooks"
+    ),
+    guide!(
+        "23-dashboard.md",
+        "Agent Dashboard",
+        "Live multi-session roster: peek, dispatch, pin, stop, and search"
+    ),
+    guide!(
+        "24-monitoring-usage.md",
+        "Monitoring Usage (External OpenTelemetry)",
+        "Export usage metrics to a customer OpenTelemetry collector"
     ),
 ];
 

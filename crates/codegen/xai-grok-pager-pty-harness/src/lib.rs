@@ -35,15 +35,20 @@ pub mod scripted;
 pub mod scroll_matrix;
 pub mod timing;
 
-pub use content::{ContentController, MockModel, ScriptedResponse, SseEvent, sse};
+pub use content::{
+    AgentTurnExpectation, ContentController, InferenceEndpoint, InferenceExpectation,
+    InferenceRequestMatcher, MockModel, ScriptedResponse, SseEvent, sse,
+};
 pub use env::pager_binary;
 pub use flows::{
-    inference_request_count, oauth_env_for_pager, seed_fake_oauth, submit_turn,
-    wait_for_labels_absent, wait_for_model_via_new_sessions,
+    inference_request_count, oauth_credential_ops, seed_fake_oauth,
+    seed_fake_oauth_coding_data_opted_out, seed_fake_oauth_team_member, seed_fake_oauth_zdr_team,
+    submit_turn, wait_for_labels_absent, wait_for_model_via_new_sessions,
 };
 pub use host_clipboard::HostClipboardTextGuard;
 pub use leader::LeaderCluster;
-pub use pty::{PtyController, keys};
+use pty::PtyRead;
+pub use pty::{EnvOp, PtyController, PtyExitPoll, keys};
 pub use results::{BenchResults, compare_baseline};
 pub use scenarios::Scenario;
 pub use screen::ScreenTracker;
@@ -67,6 +72,13 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use portable_pty::PtySize;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PtyPump {
+    Chunk,
+    Timeout,
+    Closed,
+}
 
 /// High-level harness that composes PTY control, screen state, and frame timing.
 ///
@@ -96,21 +108,10 @@ pub struct PtyHarness {
 }
 
 impl PtyHarness {
-    /// Spawn the pager in a PTY and create a new harness.
-    ///
-    /// Both `rows` and `cols` follow terminal convention: `(rows, cols)`.
-    pub fn new(
-        binary: &Path,
-        rows: u16,
-        cols: u16,
-        args: &[&str],
-        env: &[(&str, &str)],
-    ) -> Result<Self> {
-        Self::new_in_dir(binary, rows, cols, args, env, None)
-    }
-
-    /// Like [`new`](Self::new), with an explicit working directory (`None` inherits).
-    pub fn new_in_dir(
+    /// Inherit the parent environment for terminal/shell behavior tests
+    /// (XTVERSION probes and grok wrap). Content-backed launches must use
+    /// [`Self::new_in_sandbox`].
+    pub fn new_inherited_env(
         binary: &Path,
         rows: u16,
         cols: u16,
@@ -124,10 +125,52 @@ impl PtyHarness {
             pixel_width: 0,
             pixel_height: 0,
         };
-        let pty = PtyController::spawn_in_dir(binary, size, args, env, cwd)
+        let pty = PtyController::spawn_inherited_env(binary, size, args, env, cwd)
             .context("failed to spawn pager in PTY")?;
+        Ok(Self::from_pty(pty, rows, cols))
+    }
 
-        Ok(Self {
+    /// Spawn from a canonical [`xai_grok_test_support::TestSandbox`] baseline
+    /// plus Set-only convenience overrides.
+    pub fn new_in_sandbox(
+        binary: &Path,
+        rows: u16,
+        cols: u16,
+        args: &[&str],
+        sandbox: &xai_grok_test_support::TestSandbox,
+        env: &[(&str, &str)],
+        cwd: Option<&Path>,
+    ) -> Result<Self> {
+        let operations: Vec<_> = env
+            .iter()
+            .map(|(key, value)| EnvOp::set(key, value))
+            .collect();
+        Self::new_in_sandbox_ops(binary, rows, cols, args, sandbox, &operations, cwd)
+    }
+
+    /// Spawn from a canonical sandbox baseline plus typed Set/Remove operations.
+    pub fn new_in_sandbox_ops(
+        binary: &Path,
+        rows: u16,
+        cols: u16,
+        args: &[&str],
+        sandbox: &xai_grok_test_support::TestSandbox,
+        operations: &[EnvOp<'_>],
+        cwd: Option<&Path>,
+    ) -> Result<Self> {
+        let size = PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        };
+        let pty = PtyController::spawn_in_sandbox(binary, size, args, sandbox, operations, cwd)
+            .context("failed to spawn pager in PTY")?;
+        Ok(Self::from_pty(pty, rows, cols))
+    }
+
+    fn from_pty(pty: PtyController, rows: u16, cols: u16) -> Self {
+        Self {
             pty,
             screen: ScreenTracker::new(rows, cols),
             timing: FrameTimingParser::new(),
@@ -136,7 +179,7 @@ impl PtyHarness {
             cast_events: Vec::new(),
             cast_size: (cols, rows),
             respond_to_queries: false,
-        })
+        }
     }
 
     /// Enable (or disable) forwarding terminal-generated replies back to the
@@ -174,7 +217,7 @@ impl PtyHarness {
         content: &ContentController,
         extra_args: &[&str],
     ) -> Result<Self> {
-        Self::spawn_with_content_in_dir(binary, rows, cols, content, extra_args, None)
+        Self::spawn_with_content_env_in_dir(binary, rows, cols, content, extra_args, &[], None)
     }
 
     /// Like [`spawn_with_content`](Self::spawn_with_content), with an explicit working directory.
@@ -186,10 +229,80 @@ impl PtyHarness {
         extra_args: &[&str],
         cwd: Option<&Path>,
     ) -> Result<Self> {
-        let env = content.env_for_pager();
-        let env_refs: Vec<(&str, &str)> =
-            env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-        Self::new_in_dir(binary, rows, cols, extra_args, &env_refs, cwd)
+        Self::spawn_with_content_env_in_dir(binary, rows, cols, content, extra_args, &[], cwd)
+    }
+
+    /// Content-backed spawn with Set-only convenience overrides applied after
+    /// the sandbox baseline. Duplicate keys are last-wins.
+    pub fn spawn_with_content_env(
+        binary: &Path,
+        rows: u16,
+        cols: u16,
+        content: &ContentController,
+        extra_args: &[&str],
+        overrides: &[(&str, &str)],
+    ) -> Result<Self> {
+        Self::spawn_with_content_env_in_dir(
+            binary, rows, cols, content, extra_args, overrides, None,
+        )
+    }
+
+    pub fn spawn_with_content_env_in_dir(
+        binary: &Path,
+        rows: u16,
+        cols: u16,
+        content: &ContentController,
+        extra_args: &[&str],
+        overrides: &[(&str, &str)],
+        cwd: Option<&Path>,
+    ) -> Result<Self> {
+        let operations: Vec<_> = overrides
+            .iter()
+            .map(|(key, value)| EnvOp::set(key, value))
+            .collect();
+        Self::spawn_with_content_env_ops_in_dir(
+            binary,
+            rows,
+            cols,
+            content,
+            extra_args,
+            &operations,
+            cwd,
+        )
+    }
+
+    /// Content-backed spawn with typed Set/Remove operations.
+    pub fn spawn_with_content_env_ops(
+        binary: &Path,
+        rows: u16,
+        cols: u16,
+        content: &ContentController,
+        extra_args: &[&str],
+        operations: &[EnvOp<'_>],
+    ) -> Result<Self> {
+        Self::spawn_with_content_env_ops_in_dir(
+            binary, rows, cols, content, extra_args, operations, None,
+        )
+    }
+
+    pub fn spawn_with_content_env_ops_in_dir(
+        binary: &Path,
+        rows: u16,
+        cols: u16,
+        content: &ContentController,
+        extra_args: &[&str],
+        operations: &[EnvOp<'_>],
+        cwd: Option<&Path>,
+    ) -> Result<Self> {
+        Self::new_in_sandbox_ops(
+            binary,
+            rows,
+            cols,
+            extra_args,
+            content.sandbox(),
+            operations,
+            cwd,
+        )
     }
 
     // ── PTY control ──────────────────────────────────────────────────
@@ -218,30 +331,32 @@ impl PtyHarness {
         let deadline = Instant::now() + timeout;
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
+            if remaining.is_zero() || !matches!(self.pump_one(remaining), PtyPump::Chunk) {
                 break;
             }
-            match self.pty.recv_chunk(remaining) {
-                Some(chunk) => {
-                    self.raw_output.extend_from_slice(&chunk);
-                    self.cast_events.push((
-                        self.spawned_at.elapsed().as_secs_f64(),
-                        self.raw_output.len(),
-                    ));
-                    self.screen.feed(&chunk);
-                    self.timing.feed(&chunk);
-                    // Answer terminal probes (cursor-position reports, …) the
-                    // emulator queued while parsing this chunk, mirroring a real
-                    // terminal. Opt-in so probe-scripting tests keep control.
-                    if self.respond_to_queries {
-                        let responses = self.screen.drain_responses();
-                        if !responses.is_empty() {
-                            let _ = self.pty.inject_keys(&responses);
-                        }
+        }
+    }
+
+    fn pump_one(&mut self, timeout: Duration) -> PtyPump {
+        match self.pty.recv_chunk(timeout) {
+            PtyRead::Chunk(chunk) => {
+                self.raw_output.extend_from_slice(&chunk);
+                self.cast_events.push((
+                    self.spawned_at.elapsed().as_secs_f64(),
+                    self.raw_output.len(),
+                ));
+                self.screen.feed(&chunk);
+                self.timing.feed(&chunk);
+                if self.respond_to_queries {
+                    let responses = self.screen.drain_responses();
+                    if !responses.is_empty() {
+                        let _ = self.pty.inject_keys(&responses);
                     }
                 }
-                None => break, // timeout or child exited
+                PtyPump::Chunk
             }
+            PtyRead::Timeout => PtyPump::Timeout,
+            PtyRead::Closed => PtyPump::Closed,
         }
     }
 
@@ -258,8 +373,8 @@ impl PtyHarness {
         self.screen.feed(bytes);
     }
 
-    /// Check whether the child process is still running.
-    pub fn is_running(&mut self) -> bool {
+    /// Return true only while the child is live; pending status is non-running.
+    pub fn is_running(&mut self) -> Result<bool> {
         self.pty.is_running()
     }
 
@@ -290,28 +405,123 @@ impl PtyHarness {
         self.screen.contains(text)
     }
 
-    /// Block until the screen contains `text` or `timeout` expires.
+    /// Pump PTY output until `condition` becomes true or `timeout` expires.
     ///
-    /// Checks the current screen state first to avoid unnecessary blocking.
-    pub fn wait_for_text(&mut self, text: &str, timeout: Duration) -> Result<()> {
-        // Fast path: text may already be on screen from a prior update().
-        if self.screen.contains(text) {
-            return Ok(());
-        }
+    /// The condition is checked before the first pump and after each output
+    /// slice. `description` names the semantic state in timeout diagnostics.
+    pub fn wait_until(
+        &mut self,
+        description: &str,
+        timeout: Duration,
+        mut condition: impl FnMut(&Self) -> bool,
+    ) -> Result<()> {
         let deadline = Instant::now() + timeout;
         loop {
+            if condition(self) {
+                return Ok(());
+            }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 anyhow::bail!(
-                    "timed out after {timeout:?} waiting for text: {text:?}\nscreen contents:\n{}",
+                    "timed out after {timeout:?} waiting for {description}\n\
+                     process running: {}\nprocess tree: {}\nscreen contents:\n{}",
+                    self.pty.is_running()?,
+                    self.pty.process_tree_diagnostics(),
                     self.screen.contents()
                 );
             }
-            self.update(Duration::from_millis(50).min(remaining));
-            if self.screen.contains(text) {
-                return Ok(());
+            match self.pump_one(Duration::from_millis(50).min(remaining)) {
+                PtyPump::Chunk | PtyPump::Timeout => {}
+                PtyPump::Closed => {
+                    anyhow::bail!(
+                        "PTY closed while waiting for {description}\n\
+                         process running: false\nscreen contents:\n{}\nraw output:\n{}",
+                        self.screen.contents(),
+                        String::from_utf8_lossy(&self.raw_output)
+                    );
+                }
             }
         }
+    }
+
+    /// Like [`Self::wait_until`], but the condition must remain true for `hold`.
+    ///
+    /// The single `timeout` covers both reaching the condition and holding it;
+    /// PTY output continues to be pumped throughout the stability window.
+    pub fn wait_until_stable(
+        &mut self,
+        description: &str,
+        timeout: Duration,
+        hold: Duration,
+        mut condition: impl FnMut(&Self) -> bool,
+    ) -> Result<()> {
+        let deadline = Instant::now() + timeout;
+        let mut true_since = None;
+        loop {
+            if condition(self) {
+                let since = true_since.get_or_insert_with(Instant::now);
+                if since.elapsed() >= hold {
+                    return Ok(());
+                }
+            } else {
+                true_since = None;
+            }
+
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                anyhow::bail!(
+                    "timed out after {timeout:?} waiting for {description} to remain true for \
+                     {hold:?}\nprocess running: {}\nprocess tree: {}\nscreen contents:\n{}",
+                    self.pty.is_running()?,
+                    self.pty.process_tree_diagnostics(),
+                    self.screen.contents()
+                );
+            }
+            match self.pump_one(Duration::from_millis(50).min(remaining)) {
+                PtyPump::Chunk | PtyPump::Timeout => {}
+                PtyPump::Closed => {
+                    anyhow::bail!(
+                        "PTY closed while waiting for {description} to remain true for {hold:?}\n\
+                         process running: false\nscreen contents:\n{}\nraw output:\n{}",
+                        self.screen.contents(),
+                        String::from_utf8_lossy(&self.raw_output)
+                    );
+                }
+            }
+        }
+    }
+
+    /// Block until the screen contains `text` or `timeout` expires.
+    pub fn wait_for_text(&mut self, text: &str, timeout: Duration) -> Result<()> {
+        self.wait_until(&format!("screen text {text:?}"), timeout, |h| {
+            h.contains_text(text)
+        })
+    }
+
+    /// Block until the visible screen no longer contains `text`.
+    pub fn wait_for_text_absent(&mut self, text: &str, timeout: Duration) -> Result<()> {
+        self.wait_until(
+            &format!("screen text {text:?} to disappear"),
+            timeout,
+            |h| !h.contains_text(text),
+        )
+    }
+
+    /// Wait for a rendered response to reach the idle prompt state.
+    ///
+    /// Call this after observing turn output: the running status and cancel
+    /// keybar disappear only after the pager finalizes the turn.
+    pub fn wait_for_turn_idle(&mut self, timeout: Duration) -> Result<()> {
+        self.wait_until_stable(
+            "turn to become idle",
+            timeout,
+            Duration::from_millis(250),
+            |h| {
+                !h.contains_text("Ctrl+c:cancel")
+                    && !h.contains_text("Waiting for response")
+                    && !h.contains_text("Responding")
+            },
+        )
     }
 
     /// Return all raw bytes emitted by the child PTY so far.
@@ -383,24 +593,22 @@ impl PtyHarness {
     /// expires. The scrollback-aware companion to [`Self::wait_for_text`] for
     /// content that may have scrolled above the viewport (minimal mode).
     pub fn wait_for_full_text(&mut self, text: &str, timeout: Duration) -> Result<()> {
-        if self.screen.full_contains(text) {
-            return Ok(());
-        }
-        let deadline = Instant::now() + timeout;
-        loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                anyhow::bail!(
-                    "timed out after {timeout:?} waiting for text in scrollback+screen: \
-                     {text:?}\nfull contents:\n{}",
-                    self.screen.full_text()
-                );
-            }
-            self.update(Duration::from_millis(50).min(remaining));
-            if self.screen.full_contains(text) {
-                return Ok(());
-            }
-        }
+        let result = self.wait_until(&format!("full text {text:?}"), timeout, |h| {
+            h.contains_full_text(text)
+        });
+        result.map_err(|error| {
+            anyhow::anyhow!("{error}\nfull contents:\n{}", self.screen.full_text())
+        })
+    }
+
+    /// Block until scrollback + visible screen no longer contains `text`.
+    pub fn wait_for_full_text_absent(&mut self, text: &str, timeout: Duration) -> Result<()> {
+        let result = self.wait_until(&format!("full text {text:?} to disappear"), timeout, |h| {
+            !h.contains_full_text(text)
+        });
+        result.map_err(|error| {
+            anyhow::anyhow!("{error}\nfull contents:\n{}", self.screen.full_text())
+        })
     }
 
     /// Count Kitty graphics APC sequences that carry image data or placement in
@@ -470,16 +678,76 @@ impl PtyHarness {
         self.pty.quit()
     }
 
-    /// Wait up to `timeout` for the child to exit, returning its exit code
-    /// (`None` if it's still running at the deadline). Call once and cache the
-    /// result — the underlying `try_wait` reaps the child.
-    pub fn wait_exit_code(&mut self, timeout: Duration) -> Option<u32> {
+    /// Wait without collapsing exit, pending-status, liveness, or poll errors.
+    /// Returns [`PtyExitPoll::PendingStatus`] immediately for an already-exited
+    /// child and [`PtyExitPoll::Running`] only when the live-child deadline expires.
+    pub fn wait_exit_code(&mut self, timeout: Duration) -> Result<PtyExitPoll<u32>> {
         self.pty.wait_exit_code(timeout)
+    }
+
+    /// Wait for child exit, then drain final PTY output through EOF or quiet.
+    ///
+    /// `exit_timeout` applies only until exit. Once exit is observed, the known
+    /// status is preserved while a separate bounded drain phase runs.
+    pub fn wait_for_exit_and_drain(
+        &mut self,
+        exit_timeout: Duration,
+        drain_timeout: Duration,
+    ) -> Result<u32> {
+        let exit_deadline = Instant::now() + exit_timeout;
+        let exit_code = loop {
+            let exit = self.pty.poll_exit_code()?;
+            if let PtyExitPoll::Exited(code) = exit {
+                break code;
+            }
+            let remaining = exit_deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                if exit == PtyExitPoll::PendingStatus {
+                    anyhow::bail!(
+                        "exit observed but status unavailable after {exit_timeout:?}\n\
+                         process tree: {}\nscreen contents:\n{}\nraw output:\n{}",
+                        self.pty.process_tree_diagnostics(),
+                        self.screen.contents(),
+                        String::from_utf8_lossy(&self.raw_output)
+                    );
+                }
+                anyhow::bail!(
+                    "timed out after {exit_timeout:?} waiting for child exit\n\
+                     process running: true\nprocess tree: {}\nscreen contents:\n{}\nraw output:\n{}",
+                    self.pty.process_tree_diagnostics(),
+                    self.screen.contents(),
+                    String::from_utf8_lossy(&self.raw_output)
+                );
+            }
+            self.update(Duration::from_millis(50).min(remaining));
+        };
+
+        let drain_deadline = Instant::now() + drain_timeout;
+        let mut last_output_at = Instant::now();
+        loop {
+            let remaining = drain_deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Ok(exit_code);
+            }
+            match self.pump_one(Duration::from_millis(50).min(remaining)) {
+                PtyPump::Chunk => last_output_at = Instant::now(),
+                PtyPump::Closed => return Ok(exit_code),
+                PtyPump::Timeout if last_output_at.elapsed() >= Duration::from_millis(200) => {
+                    return Ok(exit_code);
+                }
+                PtyPump::Timeout => {}
+            }
+        }
     }
 
     /// Child PID (see [`PtyController::child_pid`]).
     pub fn child_pid(&self) -> Option<u32> {
         self.pty.child_pid()
+    }
+
+    /// Process-group/job enrollment state for failure diagnostics.
+    pub fn process_tree_diagnostics(&self) -> String {
+        self.pty.process_tree_diagnostics()
     }
 
     /// Deliver a signal to the child (unix). See [`PtyController::send_signal`].

@@ -17,6 +17,11 @@ use xai_grok_workspace::session::git::normalize_repo_url;
 
 pub const REMOTE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Over-fetch factor: extra headroom for the cross-lane merge before truncation.
+pub(crate) fn over_fetch(limit: usize) -> usize {
+    (limit * 3).max(100)
+}
+
 /// Unified session entry returned by the merge.
 #[derive(Debug, Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -53,6 +58,14 @@ pub struct MergedSession {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_kind: Option<String>,
 }
+/// Inputs to [`merge`]. The registry page is cwd-independent, so a widen reuses
+/// it without a second RPC.
+pub(crate) struct SessionLanes {
+    pub local: Vec<Summary>,
+    pub remote: Vec<SessionRecord>,
+    pub repo_urls: Vec<String>,
+}
+
 /// Fetch sessions from both local storage and the remote registry,
 /// merge, dedup, and return a sorted list.
 pub async fn fetch_merged(
@@ -61,6 +74,39 @@ pub async fn fetch_merged(
     query: Option<&str>,
     limit: usize,
 ) -> Vec<MergedSession> {
+    let SessionLanes {
+        local,
+        remote,
+        repo_urls,
+    } = fetch_lanes(client, cwd, query, limit).await;
+    merge(remote, local, query, &repo_urls, limit)
+}
+
+/// Retain summaries matching `repo_urls`; empty `repo_urls` leaves them unfiltered.
+pub(crate) fn filter_summaries_by_repo(
+    summaries: Vec<Summary>,
+    repo_urls: &[String],
+) -> Vec<Summary> {
+    if repo_urls.is_empty() {
+        return summaries;
+    }
+    summaries
+        .into_iter()
+        .filter(|s| {
+            s.git_remotes
+                .iter()
+                .any(|u| normalize_repo_url(u).is_some_and(|n| repo_urls.contains(&n)))
+        })
+        .collect()
+}
+
+/// Fetch the three [`merge`] lanes concurrently for `cwd`.
+pub(crate) async fn fetch_lanes(
+    client: Option<&SessionRegistryClient>,
+    cwd: Option<&str>,
+    query: Option<&str>,
+    limit: usize,
+) -> SessionLanes {
     let cwd_owned = cwd.map(String::from);
 
     let local_fut = async {
@@ -93,7 +139,7 @@ pub async fn fetch_merged(
         };
         // Fetch more than the user-facing limit from the remote source to
         // avoid premature truncation before merging with local results.
-        let remote_limit = (limit * 3).max(100) as i64;
+        let remote_limit = over_fetch(limit) as i64;
         tokio::time::timeout(REMOTE_TIMEOUT, client.search(query, remote_limit))
             .await
             .unwrap_or_else(|_| {
@@ -115,8 +161,12 @@ pub async fn fetch_merged(
         .unwrap_or_default()
     };
 
-    let (local, remote, local_repo_urls) = tokio::join!(local_fut, remote_fut, repo_urls_fut);
-    merge(remote, local, query, &local_repo_urls, limit)
+    let (local, remote, repo_urls) = tokio::join!(local_fut, remote_fut, repo_urls_fut);
+    SessionLanes {
+        local,
+        remote,
+        repo_urls,
+    }
 }
 
 /// Merge remote and local results. Local entries are inserted first so
@@ -225,7 +275,7 @@ pub fn merge(
                 hostname: r.hostname,
                 source: source.to_string(),
                 model_id: r.model_id,
-                num_messages: r.last_turn_number.max(0) as usize,
+                num_messages: local.num_messages.max(r.last_turn_number.max(0) as usize),
                 last_active_at: merged_last_active,
                 branch: local.branch,
                 repo_name: local.repo_name,
@@ -328,6 +378,10 @@ mod tests {
                 id: acp::SessionId::new(id),
                 cwd: "/test".into(),
             },
+            cwd_generation: 0,
+            previous_cwd: None,
+            pending_cwd_switch_reminder: None,
+            cwd_switch_bookkeeping_generation: 0,
             session_summary: title.into(),
             created_at: Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
             updated_at: updated.parse().unwrap(),
@@ -390,6 +444,37 @@ mod tests {
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].summary, "remote title");
         assert_eq!(merged[0].source, "both");
+    }
+
+    #[test]
+    fn stale_remote_turn_counter_does_not_demote_local_sessions_to_empty() {
+        // The registry's last_turn_number is updated fire-and-forget and can
+        // stay at 0 for sessions with real local turns. The merged row must
+        // keep the local num_messages, or dedup_empty_sessions collapses every
+        // such same-cwd session into a single "empty draft" row — hiding real
+        // sessions (and their unread indicators) from every list surface.
+        let local = vec![
+            make_summary("s1", "first real session", "2026-03-01T00:00:00Z"),
+            make_summary("s2", "second real session", "2026-03-01T01:00:00Z"),
+        ];
+        let remote = vec![
+            SessionRecord {
+                last_turn_number: 0,
+                ..make_remote("s1", "first real session", "2026-03-01T00:00:00Z")
+            },
+            SessionRecord {
+                last_turn_number: 0,
+                ..make_remote("s2", "second real session", "2026-03-01T01:00:00Z")
+            },
+        ];
+        let merged = merge(remote, local, None, &[], 20);
+        assert_eq!(merged.len(), 2, "both real sessions must survive the merge");
+        for row in &merged {
+            assert_eq!(
+                row.num_messages, 10,
+                "local num_messages wins over a stale 0"
+            );
+        }
     }
 
     #[test]

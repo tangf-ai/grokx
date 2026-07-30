@@ -64,6 +64,8 @@ pub enum ContextualTipKind {
     SmallScreen,
     /// Double-click fold/nav path → tip to enable Word select in settings.
     WordSelect,
+    /// SSH session without `grok wrap` → tip to wrap the ssh command locally.
+    SshWrap,
 }
 
 #[derive(Serialize, Clone, Copy)]
@@ -144,6 +146,7 @@ pub enum Outcome {
 pub enum HookOutcome {
     Success,
     Error,
+    Blocked,
 }
 
 /// Outcome of one `PreToolUse` gate callback. Only `Denied` blocks the tool; the rest
@@ -999,6 +1002,20 @@ pub struct TurnCompleted {
     pub error_category: Option<String>,
 }
 
+/// Model issued a shell tool call whose command is `true` (keepalive thrash signal).
+#[derive(Serialize)]
+pub struct ShellTrueNoop {
+    pub tool_name: String,
+}
+
+/// Harness hard-stopped a turn after identical tool thrash (silent EndTurn).
+#[derive(Serialize)]
+pub struct ActionStationarityStop {
+    pub true_noop: bool,
+    pub run_len: u32,
+    pub tool_name: String,
+}
+
 // ---------------------------------------------------------------------------
 // Tool Calls
 // ---------------------------------------------------------------------------
@@ -1188,6 +1205,34 @@ pub struct AnnouncementCtaClicked {
     pub source: AnnouncementCtaSurface,
 }
 
+#[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CodingDataConsentSource {
+    PrivacyBanner,
+    Settings,
+}
+
+#[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CodingDataConsentChoice {
+    OptIn,
+    OptOut,
+}
+
+impl CodingDataConsentChoice {
+    pub fn from_opted_in(opted_in: bool) -> Self {
+        if opted_in { Self::OptIn } else { Self::OptOut }
+    }
+}
+
+#[derive(Serialize)]
+pub struct CodingDataConsentSelected {
+    pub source: CodingDataConsentSource,
+    pub choice: CodingDataConsentChoice,
+    pub previous_choice: CodingDataConsentChoice,
+    pub changed: bool,
+}
+
 /// Flat snapshot of the terminal environment for telemetry.
 ///
 /// Shared across pager events so terminal fields are typed once.
@@ -1201,6 +1246,15 @@ pub struct TerminalTelemetry {
     pub term_var: String,
     pub tmux_version: String,
     pub xtversion: String,
+    /// Raw, as its source reported it — shapes vary (`"3.5.6"`,
+    /// `"20240203-110809-5046fc22"`, `"7402"`). Empty when unknown.
+    pub term_version: String,
+    pub term_version_source: String,
+    /// The Kitty protocol was negotiated *without* `REPORT_EVENT_TYPES` because
+    /// `term_version` identified a build that mis-encodes key releases
+    /// (Alacritty ≤ 0.14.x). A field rather than its own event so the affected
+    /// population always has a denominator.
+    pub kitty_event_types_withheld: bool,
     pub host_os: String,
     pub display_server: String,
     pub modifier_cmd_fate: String,
@@ -1303,10 +1357,15 @@ pub struct ClipboardCopy {
     pub data_control: bool,
     pub tmux_ok: bool,
     pub osc52_ok: bool,
-    /// `native_ok || tmux_ok || osc52_ok` where tmux/osc52 are real leg outcomes.
+    /// Evidence classification: `confirmed` | `unverified` | `failed`.
+    pub delivery: &'static str,
+    /// An explicit `grok wrap` OSC 52 sink was active.
+    pub osc52_sink: bool,
+    /// The process was inside a container without a display server.
+    pub container_no_display: bool,
+    /// Historical boolean projection: true unless `delivery == failed`.
     pub reported_success: bool,
-    /// UX toast branch (route-shaped, not leg-shaped): `copied` | `copied_tmux` |
-    /// `copied_osc_remote` | `copied_osc_container` | `failed`.
+    /// Exact UX toast branch selected by the environment policy.
     pub toast_kind: &'static str,
     pub duration_ms: u64,
 }
@@ -1692,6 +1751,8 @@ telemetry_event!(
     "turn_completed",
     external = crate::external::schema::map_turn_completed
 );
+telemetry_event!(ShellTrueNoop, "shell_true_noop");
+telemetry_event!(ActionStationarityStop, "action_stationarity_stop");
 telemetry_event!(
     ToolCallCompleted,
     "tool_call_completed",
@@ -1716,6 +1777,7 @@ telemetry_event!(SuperGrokUpsellShown, "supergrok_upsell_shown");
 telemetry_event!(SuperGrokUpsellClicked, "supergrok_upsell_clicked");
 telemetry_event!(AnnouncementCtaShown, "announcement_cta_shown");
 telemetry_event!(AnnouncementCtaClicked, "announcement_cta_clicked");
+telemetry_event!(CodingDataConsentSelected, "coding_data_consent_selected");
 telemetry_event!(TerminalTelemetry, "terminal_context");
 telemetry_event!(DisplayRefreshProbe, "display_refresh_probe");
 telemetry_event!(BackspaceNoEffect, "backspace_no_effect");
@@ -1813,6 +1875,67 @@ telemetry_event!(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn terminal_telemetry_fixture() -> TerminalTelemetry {
+        TerminalTelemetry {
+            brand: "Unknown".into(),
+            multiplexer: "none".into(),
+            is_ssh: true,
+            is_byobu: false,
+            term_var: "xterm-256color".into(),
+            tmux_version: "".into(),
+            xtversion: "".into(),
+            term_version: "".into(),
+            term_version_source: "none".into(),
+            kitty_event_types_withheld: false,
+            host_os: "linux".into(),
+            display_server: "unknown".into(),
+            modifier_cmd_fate: "unknown".into(),
+            modifier_opt_fate: "unknown".into(),
+            enter_modifier_fate: "unknown".into(),
+            hyperlink_osc8: "unknown".into(),
+            hyperlink_skip_reason: "none".into(),
+            clipboard_route: "native+osc52".into(),
+            clipboard_native_tool: "arboard".into(),
+            clipboard_data_control: "n/a".into(),
+        }
+    }
+
+    #[test]
+    fn clipboard_copy_serialization_preserves_boolean_and_adds_delivery_evidence() {
+        for delivery in ["confirmed", "unverified", "failed"] {
+            let value = serde_json::to_value(ClipboardCopy {
+                terminal: terminal_telemetry_fixture(),
+                source: "copy_text",
+                text_len: 12,
+                route_native: true,
+                route_tmux: false,
+                route_osc52: true,
+                route_label: "native+osc52".into(),
+                cli_tools_tried: String::new(),
+                cli_ok_tools: String::new(),
+                cli_ok: false,
+                arboard_ok: false,
+                data_control: false,
+                tmux_ok: false,
+                osc52_ok: true,
+                delivery,
+                osc52_sink: false,
+                container_no_display: false,
+                reported_success: delivery != "failed",
+                toast_kind: "unverified_osc_remote",
+                duration_ms: 1,
+            })
+            .unwrap();
+            assert_eq!(value["delivery"], serde_json::json!(delivery));
+            assert_eq!(
+                value["reported_success"],
+                serde_json::Value::Bool(delivery != "failed")
+            );
+            assert_eq!(value["osc52_sink"], serde_json::json!(false));
+            assert_eq!(value["container_no_display"], serde_json::json!(false));
+        }
+    }
 
     #[test]
     fn manual_auth_name_and_shape() {
@@ -1928,6 +2051,30 @@ mod tests {
     fn announcement_cta_event_names() {
         assert_eq!(AnnouncementCtaShown::NAME, "announcement_cta_shown");
         assert_eq!(AnnouncementCtaClicked::NAME, "announcement_cta_clicked");
+    }
+
+    #[test]
+    fn coding_data_consent_selected_name_and_shape() {
+        assert_eq!(
+            CodingDataConsentSelected::NAME,
+            "coding_data_consent_selected"
+        );
+        let event = serde_json::to_value(CodingDataConsentSelected {
+            source: CodingDataConsentSource::Settings,
+            choice: CodingDataConsentChoice::OptIn,
+            previous_choice: CodingDataConsentChoice::OptIn,
+            changed: false,
+        })
+        .unwrap();
+        assert_eq!(
+            event,
+            serde_json::json!({
+                "source": "settings",
+                "choice": "opt_in",
+                "previous_choice": "opt_in",
+                "changed": false,
+            })
+        );
     }
 
     #[test]

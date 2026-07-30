@@ -21,16 +21,7 @@ pub const GROK_CHAT_MODE_ENV: &str = "GROK_CHAT_MODE";
 /// True when the process is a gateway light-frontend (`--chat`) agent.
 /// Hard-off in release builds so it can't be enabled via env.
 pub fn process_chat_mode_enabled() -> bool {
-    if true {
-        return false;
-    }
-    match std::env::var(GROK_CHAT_MODE_ENV) {
-        Ok(v) => {
-            let v = v.trim();
-            !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false")
-        }
-        Err(_) => false,
-    }
+    false
 }
 #[derive(Clone)]
 struct CachedModes {
@@ -116,9 +107,7 @@ impl ChatModesManager {
             }
             Ok(_) => empty_state(),
             Err(err) => {
-                tracing::warn!(
-                    error = % err, "chat modes fetch failed; serving cache/empty"
-                );
+                tracing::warn!(error = %err, "chat modes fetch failed; serving cache/empty");
                 let guard = self.inner.cache.read();
                 match guard.as_ref() {
                     Some(c) if c.user_id == user_id => modes_to_model_state(&c.response),
@@ -241,7 +230,7 @@ mod tests {
         Mode {
             id: id.to_owned(),
             availability: ModeAvailability {
-                requires_upgrade: Some(serde_json::json!({ "message" : "Upgrade" })),
+                requires_upgrade: Some(serde_json::json!({ "message": "Upgrade" })),
                 ..Default::default()
             },
             ..Default::default()

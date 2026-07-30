@@ -27,9 +27,9 @@ impl crate::types::tool_metadata::ToolMetadata for MonitorTool {
     }
 
     fn description_template(&self) -> &str {
-        r#"Start a background monitor that streams events from a long-running script. Each stdout line is an event - you can keep working and notifications arrive in the chat. Exit ends the watch.
+        r#"Start a background monitor that streams events from a long-running script. Each stdout line is an event${%- if system_reminders_enabled %} - you can keep working and notifications arrive in the chat${%- endif %}. Exit ends the watch.
 
-**Output volume**: Every stdout line becomes a message in the conversation, so write selective filters. In pipes use `grep --line-buffered` (plain `grep` buffers and delays events by minutes).
+**Output volume**: Every stdout line is a main-agent wake. Print only `DONE`/`FAILED`/`CANCELLED`. No progress or CHANGE lines. Use `grep --line-buffered` in pipes (plain `grep` buffers and delays events by minutes).
 
 Set `persistent: true` for session-length watches (PR monitoring, log tails) -- the monitor runs${%- if tools.by_kind.kill_task_action %} until you call ${{ tools.by_kind.kill_task_action }} or${%- endif %} until the session ends. Otherwise it stops at `timeout_ms` (default 10h)."#
     }
@@ -57,7 +57,7 @@ impl xai_tool_runtime::Tool for MonitorTool {
     ) -> xai_tool_types::ToolDescription {
         xai_tool_types::ToolDescription::new(
             "monitor",
-            crate::types::tool_metadata::ToolMetadata::description_template(self),
+            crate::types::tool_metadata::ToolMetadata::sanitized_description_template(self),
         )
     }
 
@@ -83,7 +83,7 @@ impl xai_tool_runtime::Tool for MonitorTool {
             .map_err(|e| xai_tool_runtime::ToolError::invalid_arguments(e.to_string()))?;
 
         let resolved_timeout = input.resolved_timeout_ms();
-        let description = input.description.clone();
+        let description = input.description;
 
         let (terminal, notification_handle, cwd, session_folder, owner_session_id) = {
             let res = resources.lock().await;
@@ -127,16 +127,18 @@ impl xai_tool_runtime::Tool for MonitorTool {
                 output_file,
                 notification_handle: notification_handle.clone(),
                 tool_call_id: ctx.call_id.as_str().to_owned(),
-                display_command: Some(format!("[monitor] {}", input.description)),
+                display_command: Some(format!("[monitor] {description}")),
                 auto_background_on_timeout: false,
                 foreground_block_budget: None,
                 kind: crate::computer::types::TaskKind::Monitor,
                 owner_session_id,
+                description: Some(description.clone()).filter(|d| !d.trim().is_empty()),
             })
             .await
             .map_err(|e| xai_tool_runtime::ToolError::custom("process_manager", e.to_string()))?;
 
         let task_id = bg_handle.task_id.clone();
+        let tray_description = Some(description.clone()).filter(|d| !d.trim().is_empty());
 
         // Notify the pager so the monitor appears in the tasks pane
         // (same notification that bash background tasks send).
@@ -155,15 +157,15 @@ impl xai_tool_runtime::Tool for MonitorTool {
             },
             output_file: bg_handle.output_file.clone(),
             task_id: task_id.clone(),
-            monitor_description: Some(input.description.clone()),
-            description: None,
+            monitor_description: tray_description.clone(),
+            description: tray_description,
         });
 
         // Spawn the stdout processing pipeline.
         // Reads the output file, processes lines through the rate limiter,
         // and emits MonitorEvent notifications.
         let pipeline_task_id = task_id.clone();
-        let pipeline_description = description.clone();
+        let pipeline_description = description;
         // Weak handle: the pipeline must not keep the session's terminal backend
         // (and the monitored process) alive past session end. See
         // `run_monitor_pipeline`.
@@ -449,6 +451,7 @@ mod tests {
                 foreground_block_budget: None,
                 kind: TaskKind::Monitor,
                 owner_session_id: Some("session-A".to_string()),
+                description: None,
             })
             .await
             .expect("spawn monitor");
@@ -525,6 +528,7 @@ mod tests {
                 foreground_block_budget: None,
                 kind: TaskKind::Monitor,
                 owner_session_id: Some("session-A".to_string()),
+                description: None,
             })
             .await
             .expect("spawn monitor");
@@ -594,6 +598,7 @@ mod tests {
                 foreground_block_budget: None,
                 kind: TaskKind::Monitor,
                 owner_session_id: Some("child-session".to_string()),
+                description: None,
             })
             .await
             .expect("spawn monitor");

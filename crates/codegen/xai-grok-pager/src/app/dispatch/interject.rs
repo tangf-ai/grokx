@@ -2,6 +2,7 @@
 //! `x.ai/interject` effect, and prompt-history recording. Split out of
 //! `dispatch.rs` verbatim (pure code motion).
 
+use super::voice::voice_stop_on_submit;
 use crate::app::actions::Effect;
 use crate::app::agent_view::AgentView;
 use crate::app::app_view::{ActiveView, AppView};
@@ -23,6 +24,8 @@ pub(super) fn dispatch_interject(
     text: String,
     images: Vec<crate::prompt_images::PastedImage>,
 ) -> Vec<Effect> {
+    // Hard-reset only — `text` may not be from the composer.
+    let _ = voice_stop_on_submit(app);
     let ActiveView::Agent(id) = app.active_view else {
         return vec![];
     };
@@ -50,9 +53,6 @@ pub(super) fn dispatch_interject(
     agent
         .scrollback
         .push_block(RenderBlock::interjection_prompt(&text));
-    // Interjecting into a parked wait continues the turn below this block —
-    // the withheld "Worked for …" marker must not fire late beneath it.
-    agent.suppress_parked_marker_on_interject();
 
     // The composer is NOT touched here: the producer that consumed composer
     // text (the InterjectPrompt registry arm) clears it at the call site;
@@ -90,6 +90,8 @@ pub(super) fn dispatch_send_prompt_now(
     text: String,
     images: Vec<crate::prompt_images::PastedImage>,
 ) -> Vec<Effect> {
+    // Hard-reset only — `text` may be a queue row, not the composer.
+    let _ = voice_stop_on_submit(app);
     let ActiveView::Agent(id) = app.active_view else {
         return vec![];
     };
@@ -140,7 +142,6 @@ pub(super) fn dispatch_send_prompt_now(
         // The arm hides the queue echo pushed below — paint the block now.
         super::queue::push_send_now_user_block(agent, &prompt_id, "prompt", &text, false);
     }
-    agent.suppress_parked_marker_on_interject();
 
     let blocks = crate::prompt_images::build_content_blocks_with_workspace(
         text.clone(),
