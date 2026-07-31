@@ -326,7 +326,7 @@ async fn connect_workspace(
         .map(PathBuf::from)
         .or(selected)
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-    // Prefer bundled engine; PATH is a last-resort fallback (see resolve_engine).
+    // Resolve a custom engine path first, then use the grok installed on PATH.
     let allow_path = true;
     // Default OFF for real permission flow; UI can opt into auto-approve.
     let auto_approve = auto_approve.unwrap_or(false);

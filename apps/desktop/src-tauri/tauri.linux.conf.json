@@ -1,0 +1,15 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "bundle": {
+    "targets": ["deb"],
+    "category": "DeveloperTool",
+    "shortDescription": "Desktop coding agent powered by Grok Build",
+    "longDescription": "Grokx is a desktop coding agent with project-aware chat and tool approvals. A separately installed Grok CLI is required.",
+    "linux": {
+      "deb": {
+        "section": "devel",
+        "priority": "optional"
+      }
+    }
+  }
+}

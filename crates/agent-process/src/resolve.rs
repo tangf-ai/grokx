@@ -148,7 +148,8 @@ mod tests {
         let bin = runtime_dir.join(if cfg!(windows) { "grok.exe" } else { "grok" });
         touch(&bin);
 
-        let settings = UserSettings::product_defaults();
+        let mut settings = UserSettings::product_defaults();
+        settings.prefer_bundled_engine = true;
         let resolved = resolve_engine(&settings, Some(&resources), false).unwrap();
         assert_eq!(resolved.source, EngineSource::Bundled);
         assert_eq!(resolved.path, bin);
@@ -164,7 +165,8 @@ mod tests {
         let bin = runtime_dir.join(if cfg!(windows) { "grok.exe" } else { "grok" });
         touch(&bin);
 
-        let settings = UserSettings::product_defaults();
+        let mut settings = UserSettings::product_defaults();
+        settings.prefer_bundled_engine = true;
         let resolved = resolve_engine(&settings, Some(&resources), false).unwrap();
         assert_eq!(resolved.source, EngineSource::Bundled);
         assert_eq!(resolved.path, bin);
@@ -178,7 +180,8 @@ mod tests {
         let bin = runtime_dir.join(if cfg!(windows) { "grok.exe" } else { "grok" });
         touch(&bin);
 
-        let settings = UserSettings::product_defaults();
+        let mut settings = UserSettings::product_defaults();
+        settings.prefer_bundled_engine = true;
         // Even with PATH fallback enabled, bundled wins when present.
         let resolved = resolve_engine(&settings, Some(&resources), true).unwrap();
         assert_eq!(resolved.source, EngineSource::Bundled);

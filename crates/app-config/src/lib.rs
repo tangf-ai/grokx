@@ -33,14 +33,18 @@ impl AppPaths {
     pub fn discover() -> Result<Self, ConfigError> {
         let base = directories::ProjectDirs::from(APP_QUALIFIER, APP_ORGANIZATION, APP_NAME)
             .ok_or(ConfigError::NoDataDir)?;
-        let data_dir = base.data_dir().to_path_buf();
-        Ok(Self {
+        Ok(Self::from_data_dir(base.data_dir().to_path_buf()))
+    }
+
+    /// Build paths under an arbitrary data directory (tests / portable installs).
+    pub fn from_data_dir(data_dir: PathBuf) -> Self {
+        Self {
             config_file: data_dir.join("settings.json"),
             sessions_db: data_dir.join("sessions.db"),
             logs_dir: data_dir.join("logs"),
             engine_data_dir: data_dir.join("engine-data"),
             data_dir,
-        })
+        }
     }
 
     pub fn ensure_dirs(&self) -> Result<(), ConfigError> {
@@ -120,7 +124,7 @@ impl Default for ModelEndpointSettings {
 pub struct UserSettings {
     /// Optional override for the grok binary (debug / power users).
     pub custom_engine_path: Option<String>,
-    /// Prefer bundled runtime when no custom path is set.
+    /// Prefer a manually provided bundled runtime when no custom path is set.
     pub prefer_bundled_engine: bool,
     /// Last selected model id (composer).
     pub model: Option<String>,
@@ -186,7 +190,7 @@ impl UserSettings {
     pub fn product_defaults() -> Self {
         Self {
             custom_engine_path: None,
-            prefer_bundled_engine: true,
+            prefer_bundled_engine: false,
             model: Some("grok-4.5".into()),
             effort: Some("medium".into()),
             endpoint: ModelEndpointSettings::default(),

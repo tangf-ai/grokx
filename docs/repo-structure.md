@@ -9,7 +9,7 @@ Monorepo for the grokx desktop product with a **git subtree** thin fork of Grok 
 | `apps/desktop` | Tauri 2 shell + React UI |
 | `crates/*` | Product Rust libraries |
 | `engine/grok-build` | Upstream Grok Build (subtree) |
-| `packaging/` | Bundle runtime into the app, sign, notarize |
+| `packaging/` | Build app packages, sign, notarize |
 | `tools/` | Dev bootstrap, upstream sync, engine build |
 | `docs/` | Architecture and policy |
 | `tests/` | e2e + app↔engine compatibility matrix |
@@ -20,7 +20,7 @@ Monorepo for the grokx desktop product with a **git subtree** thin fork of Grok 
 |-------|----------------|
 | `domain` | Pure types + `AppEvent` (no IO) |
 | `app-config` | Paths, settings, runtime `version.json` |
-| `agent-process` | Resolve + spawn bundled/custom `grok` |
+| `agent-process` | Resolve + spawn custom/installed `grok` |
 | `acp-bridge` | ACP JSON-RPC → `AppEvent` |
 | `permissions` | Policy + approval broker |
 | `session-store` | Session/project metadata |
@@ -30,7 +30,7 @@ Monorepo for the grokx desktop product with a **git subtree** thin fork of Grok 
 
 ```text
 apps/desktop → app-core → {acp-bridge, agent-process, permissions, session-store, app-config, domain}
-engine/grok-build  --build binary-->  packaging  -->  apps/desktop/src-tauri/resources/runtime/
+installed grok  --ACP stdio-->  agent-process
 ```
 
 Hard rules:
@@ -49,5 +49,7 @@ Hard rules:
 ## Runtime resolution order
 
 1. User `custom_engine_path`
-2. Bundled `resources/runtime/grok` (+ `version.json`)
-3. `PATH` lookup (dev fallback only by default)
+2. `PATH` lookup
+
+The resolver retains support for manually provided bundled runtimes for
+backward compatibility, but release packages do not include one.

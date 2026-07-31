@@ -47,9 +47,6 @@
       "icons/henry.w@example.net",
       "icons/icon.icns",
       "icons/icon.ico"
-    ],
-    "resources": [
-      "resources/runtime/*"
     ]
   },
   "plugins": {}

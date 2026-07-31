@@ -16,6 +16,11 @@ if ! command -v cargo >/dev/null 2>&1; then
   exit 1
 fi
 
+if ! command -v node >/dev/null 2>&1; then
+  echo "error: node not found. Install Node.js before building the engine" >&2
+  exit 1
+fi
+
 echo ">> building engine in $ENGINE_DIR"
 cd "$ENGINE_DIR"
 
@@ -55,9 +60,10 @@ else
 fi
 
 COMMIT="$(git -C "$ROOT" log -1 --format=%h -- engine/grok-build 2>/dev/null || echo unknown)"
+APP_VERSION="$(node -e 'const fs = require("node:fs"); const config = JSON.parse(fs.readFileSync(process.argv[1], "utf8")); process.stdout.write(config.version)' "$ROOT/apps/desktop/src-tauri/tauri.conf.json")"
 cat >"$OUT_DIR/version.json" <<EOF
 {
-  "app_version": "0.1.0",
+  "app_version": "$APP_VERSION",
   "engine_name": "grok-build",
   "engine_version": "subtree",
   "engine_commit": "$COMMIT",

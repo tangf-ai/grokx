@@ -2957,7 +2957,7 @@ export default function App() {
       const s = await invoke<PublicSettings>("save_settings", {
         update: {
           custom_engine_path: cfgEnginePath,
-          prefer_bundled_engine: true,
+          prefer_bundled_engine: false,
           model: cfgModelId,
           effort: cfgEffort,
           sync_to_grok_config: cfgSyncGrok,

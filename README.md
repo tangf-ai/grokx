@@ -6,7 +6,7 @@
 
 <p align="center">
   <strong>Open-source desktop AI coding app</strong><br />
-  Codex-style light UI · bundled Grok Build engine · Tauri + React
+  Codex-style light UI · Grok Build integration · Tauri + React
 </p>
 
 <p align="center">
@@ -17,7 +17,7 @@
 
 ---
 
-**Grokx** wraps a fully bundled, thin-forked [Grok Build](https://github.com/xai-org/grok-build) engine behind a clean desktop shell.
+**Grokx** connects a separately installed [Grok Build](https://github.com/xai-org/grok-build) CLI to a clean desktop shell.
 
 | Layer | Stack |
 |-------|--------|
@@ -69,13 +69,14 @@ User prompt, collapsible thinking trace with duration, final assistant reply.
 - Task rename / delete; chat + task list persistence across restarts
 - Bundled runtime resolution (prefer `resources/runtime/grok` over PATH)
 
+
 ## Repository layout
 
 ```text
 apps/desktop          # Tauri desktop shell + UI
 crates/               # Product Rust libraries (domain, ACP, process, permissions…)
 engine/grok-build     # Thin fork of xai-org/grok-build (subtree)
-packaging/            # Bundle / sign / notarize helpers
+packaging/            # Package / sign / notarize helpers
 tools/                # Dev + upstream sync scripts
 docs/                 # Architecture, images, contribution policy
 ```
@@ -89,8 +90,9 @@ See [docs/repo-structure.md](docs/repo-structure.md) and [docs/engine-policy.md]
 - Platform build tools for Tauri (see [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/))
   - **macOS**: Xcode Command Line Tools
   - **Windows**: Visual Studio C++ build tools, WebView2
-  - **Linux**: `webkit2gtk`, `libgtk`, and related packages (see Tauri docs)
+  - **Linux**: `webkit2gtk`, `libgtk`, and related packages (see Tauri docs)--A working `grok` CLI on `PATH`, or its executable path configured in Settings
 - Optional: a working `grok` CLI for PATH fallback during development
+
 
 ## Install (prebuilt)
 
@@ -153,10 +155,10 @@ See also [packaging/README.md](packaging/README.md).
 
 | Item | Choice |
 |------|--------|
-| Bundle | Installers can ship a pinned Grok Build runtime |
+| Distribution | Installers do not build or bundle the Grok CLI |
 | Source | `engine/grok-build` via **git subtree** |
 | Coupling | App talks to engine over ACP stdio |
-| Overrides | Settings may point at a custom `grok` binary |
+| Resolution | Settings override first, then the installed `grok` on `PATH` |
 | Upstream | Periodic merge from `https://github.com/xai-org/grok-build` |
 
 ```bash
