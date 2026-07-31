@@ -18,7 +18,7 @@ const RECAP_BODY_TOKEN: &str = "RECAP_BODY_SEL_TOKEN";
 /// scripted scenarios and this test re-inject a dummy one for OSC 52
 /// readback — same pattern as `tests/scenarios/copy_selection.yaml`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "PTY e2e; run with cargo test -p xai-grok-pager --test pty_e2e -- --ignored"]
+#[ignore = "PTY e2e; run the owning pty_e2e_* Cargo test with --ignored (see Cargo.toml)"]
 async fn recap_header_not_in_selection_pty() {
     let content = ContentController::start().await.expect("start content");
 
@@ -30,18 +30,21 @@ async fn recap_header_not_in_selection_pty() {
     ));
 
     let binary = pager_binary().expect("resolve pager binary");
-    let mut env = content.env_for_pager();
     // Force OSC 52 so we can assert clipboard contents via the PTY raw stream
     // (macOS otherwise uses the native pasteboard only).
-    env.push((
+    let overrides: Vec<(String, String)> = vec![(
         "SSH_CONNECTION".into(),
         "scripted-test 1 127.0.0.1 2".into(),
-    ));
-    let env_refs: Vec<(&str, &str)> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-    let mut harness = PtyHarness::new_in_dir(
+    )];
+    let env_refs: Vec<(&str, &str)> = overrides
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect();
+    let mut harness = PtyHarness::spawn_with_content_env_in_dir(
         &binary,
         DEFAULT_ROWS,
         DEFAULT_COLS,
+        &content,
         &[],
         &env_refs,
         Some(content.home()),

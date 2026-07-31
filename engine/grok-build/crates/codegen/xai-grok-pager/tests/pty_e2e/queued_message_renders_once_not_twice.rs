@@ -1,20 +1,13 @@
-//! PTY: the core "queued message appears 2x" regression. A message queued
-//! mid-turn HOLDS through the turn's sendable wait, rendering exactly once
-//! as a queue row (id/kind+text reconciled — no optimistic-echo duplicate),
-//! suppressing the park marker, and advertising send-now on the status row;
-//! after the wait returns and the turn ends it drains as its own turn and
-//! renders exactly once as a "❯ " block.
-//!
-//! Flag-file driven like `endline_park_two_static_markers`: background a
-//! flag-gated command, hold the turn on a flag-gated foreground command
-//! (queueing happens in this window), then block on
-//! `get_command_or_subagent_output(timeout_ms: 600000)`.
+//! PTY, flag-file driven like `endline_park_is_markerless`: the "queued
+//! message appears 2x" regression. A message queued mid-turn holds through
+//! the turn's sendable wait, then drains as its own turn — asserting it
+//! renders exactly once as a queue row and exactly once as a "❯ " block.
 #[allow(unused_imports)]
 use super::common::*;
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "PTY e2e; run with cargo test -p xai-grok-pager --test pty_e2e -- --ignored"]
+#[ignore = "PTY e2e; run the owning pty_e2e_* Cargo test with --ignored (see Cargo.toml)"]
 async fn queued_message_renders_once_not_twice() {
     const QUEUED_TEXT: &str = "queued exactly once probe";
 
@@ -33,22 +26,8 @@ async fn queued_message_renders_once_not_twice() {
         "is_background": true
     })
     .to_string();
-    content.enqueue_response(
-        "/v1/responses",
-        ScriptedResponse::sse(responses_api_tool_call_events(
-            "call_qonce_bg",
-            "run_terminal_command",
-            &bg_args,
-        )),
-    );
-    content.enqueue_response(
-        "/v1/chat/completions",
-        ScriptedResponse::sse(chat_completions_tool_call_events_with_id(
-            "call_qonce_bg",
-            "run_terminal_command",
-            &bg_args,
-        )),
-    );
+    let _background_turn =
+        expect_tool_turn(&content, "call_qonce_bg", "run_terminal_command", bg_args);
 
     // Tool call 2: the flag-gated foreground hold — the mid-turn window
     // where the follow-up is queued.
@@ -57,21 +36,11 @@ async fn queued_message_renders_once_not_twice() {
         "description": "hold for id extraction"
     })
     .to_string();
-    content.enqueue_response(
-        "/v1/responses",
-        ScriptedResponse::sse(responses_api_tool_call_events(
-            "call_qonce_id_hold",
-            "run_terminal_command",
-            &id_hold_args,
-        )),
-    );
-    content.enqueue_response(
-        "/v1/chat/completions",
-        ScriptedResponse::sse(chat_completions_tool_call_events_with_id(
-            "call_qonce_id_hold",
-            "run_terminal_command",
-            &id_hold_args,
-        )),
+    let _id_hold_turn = expect_tool_turn(
+        &content,
+        "call_qonce_id_hold",
+        "run_terminal_command",
+        id_hold_args,
     );
 
     // Fallback for both post-wait turns (the parked turn's wrap-up and the
@@ -126,27 +95,17 @@ async fn queued_message_renders_once_not_twice() {
         "timeout_ms": 600_000
     })
     .to_string();
-    content.enqueue_response(
-        "/v1/responses",
-        ScriptedResponse::sse(responses_api_tool_call_events(
-            "call_qonce_wait",
-            "get_command_or_subagent_output",
-            &wait_args,
-        )),
-    );
-    content.enqueue_response(
-        "/v1/chat/completions",
-        ScriptedResponse::sse(chat_completions_tool_call_events_with_id(
-            "call_qonce_wait",
-            "get_command_or_subagent_output",
-            &wait_args,
-        )),
+    let _wait_turn = expect_tool_turn(
+        &content,
+        "call_qonce_wait",
+        "get_command_or_subagent_output",
+        wait_args,
     );
     std::fs::write(&id_ready_flag, b"ready").expect("release id-extraction hold");
 
     // The wait parks the turn with the row HELD: the status row explains the
     // hold ("1 queued — Enter to send now"; the top row is a sendable server
-    // row), the park marker is suppressed, and the row renders exactly once.
+    // row), the park writes no marker, and the row renders exactly once.
     harness
         .wait_for_text("1 queued \u{2014} Enter to send now", Duration::from_secs(60))
         .unwrap_or_else(|_| {
@@ -158,7 +117,7 @@ async fn queued_message_renders_once_not_twice() {
         });
     assert!(
         !harness.contains_text("Worked for"),
-        "held queued rows must suppress the park marker\nscreen:\n{}",
+        "a park writes no marker\nscreen:\n{}",
         harness.screen_contents()
     );
     assert_eq!(

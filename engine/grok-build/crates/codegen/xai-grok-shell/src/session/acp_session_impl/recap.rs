@@ -18,7 +18,11 @@ impl SessionActor {
     ///
     /// Generates a unique btw session ID and persists the result to
     /// `btw_history.jsonl` in the session folder.
-    pub(super) async fn handle_side_question(&self, question: &str) -> Result<String, String> {
+    /// Returns `(answer, optional thinking/reasoning text)` for UI display.
+    pub(super) async fn handle_side_question(
+        &self,
+        question: &str,
+    ) -> Result<(String, Option<String>), String> {
         let btw_session_id = format!("btw-{}", uuid::Uuid::new_v4());
         let parent_session_id = self.session_info.id.to_string();
         let asked_at = chrono::Utc::now();
@@ -126,13 +130,26 @@ impl SessionActor {
                 msg
             })?;
         let content = response.assistant_text();
+        // Collect reasoning/thinking for side-chat UI (same surface as main chat thoughts).
+        let thinking = {
+            let parts: Vec<String> = response
+                .reasoning_items()
+                .map(xai_grok_sampling_types::conversation::reasoning_item_text)
+                .filter(|s| !s.trim().is_empty())
+                .collect();
+            if parts.is_empty() {
+                None
+            } else {
+                Some(parts.join("\n\n"))
+            }
+        };
 
         if content.is_empty() {
             persist(String::new(), false, Some("No response from model".into()));
             return Err("No response from model".to_string());
         }
         persist(content.clone(), true, None);
-        Ok(content)
+        Ok((content, thinking))
     }
 
     /// Generate a session recap and broadcast it via
@@ -243,15 +260,22 @@ impl SessionActor {
         // Clone the exact request items for the on-disk artifact (recap never
         // mutates conversation state, so this file is the only durable record).
         let chat_history_for_artifact = items.clone();
+        // Main-turn tool specs: tools serialize into the cached token prefix.
+        let tool_defs = self.prepare_tool_definitions().await;
+        let tools = self.turn_base_tool_specs(&tool_defs);
+        // Mirror the main turn's hosted tools so a recap can't search past the active cutoff.
+        let hosted_tools = self.hosted_tools_for_turn();
         let request = ConversationRequest {
             items,
-            tools: vec![],
+            tools,
+            hosted_tools,
             model: Some(model.clone()),
             temperature: None,
             x_grok_conv_id: Some(x_grok_conv_id.clone()),
             x_grok_req_id: Some(x_grok_req_id.clone()),
             x_grok_session_id: Some(self.session_info.id.to_string()),
             x_grok_agent_id: Some(xai_grok_telemetry::id::agent_id()),
+            prompt_cache_key: Some(self.session_info.id.to_string()),
             ..Default::default()
         };
 

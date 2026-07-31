@@ -267,8 +267,7 @@ impl WorkspaceHandle {
                 self.shared
                     .activity_tracker
                     .turn_started(session_id, turn_number);
-                let handle = None;
-                handle
+                None
             }
             TurnBoundary::End {
                 prompt_index: Some(idx),
@@ -392,13 +391,16 @@ impl WorkspaceHandle {
             if !git_outcome.restored {
                 crate::handle::record_rewind_restore(crate::handle::RewindDomain::Git, false);
                 tracing::warn!(
-                    session_id, target_prompt_index, reason = ? git_outcome
-                    .aborted_reason, stash_ref = ? git_outcome.stash_ref,
+                    session_id,
+                    target_prompt_index,
+                    reason = ?git_outcome.aborted_reason,
+                    stash_ref = ?git_outcome.stash_ref,
                     "rewind_to: git domain not restored; filesystem still reverted (partial rewind)"
                 );
             } else if let Some(stash_ref) = &git_outcome.stash_ref {
                 tracing::info!(
-                    session_id, stash_ref = % stash_ref,
+                    session_id,
+                    stash_ref = %stash_ref,
                     "rewind_to: git domain restored; pre-rewind changes saved to a stash"
                 );
             }

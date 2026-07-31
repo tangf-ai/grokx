@@ -23,7 +23,12 @@ use crate::permission_gate::{
 };
 use crate::BridgeError;
 
+/// Default timeout for short ACP RPCs (initialize, set_model, cancel, …).
 const DEFAULT_RPC_TIMEOUT: Duration = Duration::from_secs(120);
+/// Side questions (`x.ai/btw`) are tool-free but still model-bound.
+const BTW_RPC_TIMEOUT: Duration = Duration::from_secs(300);
+/// `session/prompt` can run tools for a long time; do not treat that as a failed turn.
+const PROMPT_RPC_TIMEOUT: Duration = Duration::from_secs(60 * 60 * 6);
 
 /// Options when connecting to a spawned agent process.
 #[derive(Debug, Clone)]
@@ -320,6 +325,43 @@ impl AcpClientHandle {
         self.shared.current_model.lock().await.clone()
     }
 
+    /// Ask a side question via Grok Build `/btw` (`x.ai/btw` ext method).
+    ///
+    /// Does **not** enqueue a main-session turn, does **not** mutate the
+    /// conversation transcript, and does **not** require `turn_busy` free.
+    /// The engine snapshots the current conversation read-only.
+    ///
+    /// Returns `(answer, optional thinking/reasoning)` for side-chat UI.
+    pub async fn send_btw(
+        &self,
+        question: &str,
+    ) -> Result<(String, Option<String>), BridgeError> {
+        let question = question.trim();
+        if question.is_empty() {
+            return Err(BridgeError::Message("empty side question".into()));
+        }
+        let engine_session_id = self
+            .engine_session_id()
+            .await
+            .ok_or_else(|| BridgeError::Message("no engine session".into()))?;
+
+        // ACP routes custom methods by a leading `_` on the JSON-RPC method
+        // name (not a nested `ext_method` envelope). The agent strips `_` and
+        // dispatches `x.ai/btw`. Params are the ExtRequest body only.
+        let result = self
+            .request_with_timeout(
+                "_x.ai/btw",
+                json!({
+                    "sessionId": engine_session_id,
+                    "question": question,
+                }),
+                BTW_RPC_TIMEOUT,
+            )
+            .await?;
+
+        parse_btw_response(&result)
+    }
+
     /// Best-effort model switch for the live session.
     pub async fn set_model(&self, model_id: &str) -> Result<(), BridgeError> {
         let engine_session_id = self
@@ -388,15 +430,53 @@ impl AcpClientHandle {
             state: TurnState::Streaming,
         });
 
-        let result = self.request("session/prompt", params).await;
+        // Long-running tools must not hit the short RPC timeout or the UI
+        // will show Ready while the engine is still working.
+        let result = self
+            .request_with_timeout("session/prompt", params, PROMPT_RPC_TIMEOUT)
+            .await;
 
         match result {
             Ok(_) => {
-                let _ = self
+                // If a permission is still parked, the prompt did not truly end.
+                let still_waiting = !self
                     .shared
-                    .events
-                    .send(turn_finished(app_session_id, TurnState::Completed));
+                    .permission_gate
+                    .lock()
+                    .await
+                    .pending_ids()
+                    .is_empty();
+                if still_waiting {
+                    let _ = self.shared.events.send(AppEvent::TurnState {
+                        session_id: app_session_id,
+                        state: TurnState::WaitingPermission,
+                    });
+                } else {
+                    let _ = self
+                        .shared
+                        .events
+                        .send(turn_finished(app_session_id, TurnState::Completed));
+                }
                 Ok(())
+            }
+            Err(BridgeError::Cancelled) => {
+                // cancel() already emitted TurnFinished(Cancelled).
+                Ok(())
+            }
+            Err(err @ BridgeError::Timeout) => {
+                // Keep the turn open: the agent may still be running tools.
+                // Surface a warning but do not mark the turn finished.
+                let _ = self.shared.events.send(AppEvent::AgentError {
+                    message: format!(
+                        "prompt RPC wait timed out after {}s — agent may still be working; status stays busy until a later update",
+                        PROMPT_RPC_TIMEOUT.as_secs()
+                    ),
+                });
+                let _ = self.shared.events.send(AppEvent::TurnState {
+                    session_id: app_session_id,
+                    state: TurnState::RunningTools,
+                });
+                Err(err)
             }
             Err(err) => {
                 let _ = self.shared.events.send(AppEvent::AgentError {
@@ -411,18 +491,43 @@ impl AcpClientHandle {
         }
     }
 
+    /// Stop the in-flight turn: tell the engine, fail pending RPCs (so
+    /// `session/prompt` unblocks), clear parked permissions, and mark cancelled.
     pub async fn cancel(&self) -> Result<(), BridgeError> {
-        let engine_session_id = match self.engine_session_id().await {
-            Some(id) => id,
-            None => return Ok(()),
-        };
-        let _ = self
-            .request(
-                "session/cancel",
-                json!({ "sessionId": engine_session_id }),
-            )
-            .await;
         let app_session_id = self.app_session_id().await;
+
+        // 1) Unblock any waiter on session/prompt (and other RPCs).
+        {
+            let mut pending = self.shared.pending.lock().await;
+            for (_, p) in pending.drain() {
+                let _ = p.tx.send(Err(BridgeError::Cancelled));
+            }
+        }
+
+        // 2) Drop parked tool-permission waits so we are not stuck on Allow/Deny.
+        {
+            let mut gate = self.shared.permission_gate.lock().await;
+            for id in gate.pending_ids() {
+                let _ = gate.resolve(&id, PermissionDecision::Deny);
+            }
+        }
+
+        // 3) Best-effort engine cancel (short timeout; do not hang the Stop button).
+        if let Some(engine_session_id) = self.engine_session_id().await {
+            let _ = self
+                .request_with_timeout(
+                    "session/cancel",
+                    json!({ "sessionId": engine_session_id }),
+                    Duration::from_secs(3),
+                )
+                .await;
+        }
+
+        // 4) Always surface cancelled to the UI so Working ends immediately.
+        let _ = self.shared.events.send(AppEvent::TurnState {
+            session_id: app_session_id.clone(),
+            state: TurnState::Cancelled,
+        });
         let _ = self
             .shared
             .events
@@ -467,6 +572,16 @@ impl AcpClientHandle {
     }
 
     async fn request(&self, method: &str, params: Value) -> Result<Value, BridgeError> {
+        self.request_with_timeout(method, params, self.shared.options.rpc_timeout)
+            .await
+    }
+
+    async fn request_with_timeout(
+        &self,
+        method: &str,
+        params: Value,
+        wait: Duration,
+    ) -> Result<Value, BridgeError> {
         let id = self.shared.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         self.shared
@@ -483,10 +598,12 @@ impl AcpClientHandle {
         });
         self.write_message(&msg).await?;
 
-        match timeout(self.shared.options.rpc_timeout, rx).await {
+        match timeout(wait, rx).await {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err(BridgeError::ChannelClosed),
             Err(_) => {
+                // Leave the pending entry in place if the agent answers later —
+                // only remove if still there so we don't double-complete.
                 self.shared.pending.lock().await.remove(&id);
                 Err(BridgeError::Timeout)
             }
@@ -500,6 +617,48 @@ impl AcpClientHandle {
         stdin.write_all(&line).await?;
         stdin.flush().await?;
         Ok(())
+    }
+}
+
+/// Extract answer (+ optional thinking) from an `x.ai/btw` ExtResponse payload.
+///
+/// Engine wraps via `ExtMethodResult { result: { answer, thinking? }, error }`.
+fn parse_btw_response(result: &Value) -> Result<(String, Option<String>), BridgeError> {
+    if let Some(err) = result.get("error").filter(|e| !e.is_null()) {
+        let msg = err
+            .as_str()
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| err.to_string());
+        if !msg.is_empty() {
+            return Err(BridgeError::Message(format!("side question failed: {msg}")));
+        }
+    }
+
+    let body = result
+        .get("result")
+        .cloned()
+        .unwrap_or_else(|| result.clone());
+
+    let answer = body
+        .get("answer")
+        .or_else(|| body.pointer("/result/answer"))
+        .and_then(|a| a.as_str())
+        .map(|s| s.to_string())
+        .or_else(|| result.as_str().map(|s| s.to_string()));
+
+    let thinking = body
+        .get("thinking")
+        .or_else(|| body.pointer("/result/thinking"))
+        .and_then(|t| t.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    match answer {
+        Some(s) if !s.is_empty() => Ok((s, thinking)),
+        Some(_) => Ok(("No response".into(), thinking)),
+        None => Err(BridgeError::Message(format!(
+            "side question returned no answer: {result}"
+        ))),
     }
 }
 
@@ -568,7 +727,7 @@ async fn handle_incoming(shared: Arc<Shared>, value: Value) -> Result<(), Bridge
                 .get("update")
                 .cloned()
                 .unwrap_or(params.clone());
-            for event in map_session_update(app_session_id, &update) {
+            for event in map_session_update(app_session_id, &update, Some(&params)) {
                 let _ = shared.events.send(event);
             }
         }
@@ -766,5 +925,40 @@ mod tests {
         assert_eq!(parse_id(Some(&json!(3))), Some(3));
         assert_eq!(parse_id(Some(&json!("12"))), Some(12));
         assert_eq!(parse_id(Some(&json!(null))), None);
+    }
+
+    #[test]
+    fn parse_btw_answer_from_ext_method_result() {
+        let v = json!({ "result": { "answer": "hello side" } });
+        let (a, t) = parse_btw_response(&v).unwrap();
+        assert_eq!(a, "hello side");
+        assert!(t.is_none());
+    }
+
+    #[test]
+    fn parse_btw_answer_with_thinking() {
+        let v = json!({
+            "result": {
+                "answer": "yes",
+                "thinking": "consider the docs"
+            }
+        });
+        let (a, t) = parse_btw_response(&v).unwrap();
+        assert_eq!(a, "yes");
+        assert_eq!(t.as_deref(), Some("consider the docs"));
+    }
+
+    #[test]
+    fn parse_btw_answer_bare() {
+        let v = json!({ "answer": "plain" });
+        let (a, _) = parse_btw_response(&v).unwrap();
+        assert_eq!(a, "plain");
+    }
+
+    #[test]
+    fn parse_btw_answer_error_field() {
+        let v = json!({ "result": null, "error": "boom" });
+        let err = parse_btw_response(&v).unwrap_err().to_string();
+        assert!(err.contains("boom"), "{err}");
     }
 }

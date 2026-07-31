@@ -52,14 +52,16 @@ impl AuthSnapshot for AuthManager {
 /// Capability to run the operator's external auth binary. Split out of
 /// [`AuthSnapshot`] so OIDC refreshers (read-only) physically cannot reach it
 /// (interface segregation); only [`ExternalBinaryRefresher`] depends on it.
+#[async_trait::async_trait]
 pub(crate) trait ExternalCommandRunner: Send + Sync {
     /// Run the external auth binary and return the parsed output.
-    fn run_external_command(&self, command: &str) -> Option<GrokAuth>;
+    async fn run_external_command(&self, command: &str) -> Option<GrokAuth>;
 }
 
+#[async_trait::async_trait]
 impl ExternalCommandRunner for AuthManager {
-    fn run_external_command(&self, command: &str) -> Option<GrokAuth> {
-        self.run_external_refresh_command(command)
+    async fn run_external_command(&self, command: &str) -> Option<GrokAuth> {
+        self.run_external_refresh_command(command).await
     }
 }
 
@@ -92,8 +94,9 @@ pub(crate) enum RefreshOutcome {
     Success(Box<GrokAuth>),
     /// Terminal failure (e.g. invalid_grant), or a transient escalated to
     /// `Other` after repeated blips. Caller records a verdict scoped to the
-    /// rejected credential and retains it (`RefreshTokenRejected` is sticky,
-    /// the rest age out past the TTL).
+    /// rejected credential. `refresh_chain` discards AT+RT only for
+    /// `RefreshTokenRejected` (sticky until login); `ClientRejected` / `Other`
+    /// retain credentials and age out past the TTL.
     PermanentFailure {
         error: crate::auth::error::RefreshTokenFailedError,
         /// Key of the credential the refresher actually sent to the IdP, so
@@ -101,6 +104,16 @@ pub(crate) enum RefreshOutcome {
         /// has no token key (external binary flow); the caller falls back to
         /// its own resolution.
         tried_key: Option<String>,
+        /// The **refresh token** actually spent at the IdP. `refresh_chain`
+        /// compares it against disk to tell "this session is revoked" apart
+        /// from "a sibling process rotated the RT out from under us" — the
+        /// latter must never discard credentials.
+        ///
+        /// `tried_key` cannot answer that question: it is the *access* token,
+        /// and a sibling's rotation changes the RT while the AT the loser
+        /// holds may be untouched. `None` when the authority does not expose
+        /// which RT it sent (external binary flow).
+        tried_refresh_token: Option<String>,
     },
     /// Transient / unknown failure. Caller may retry later. Message-only: the
     /// underlying cause is logged structurally at the refresher, then flattened
@@ -116,6 +129,12 @@ impl RefreshOutcome {
 
     /// Terminal failure for an already-classified reason against the credential
     /// `tried_key` (the one actually sent to the IdP).
+    ///
+    /// Leaves the tried **refresh token** unattributed, which disables the
+    /// sibling-rotation check in `refresh_chain`. Only correct for authorities
+    /// that genuinely cannot report which RT they spent (the external-binary
+    /// flow). Any refresher holding the [`GrokAuth`] it sent must use
+    /// [`Self::permanent_for`] instead.
     pub(crate) fn permanent(
         reason: crate::auth::error::RefreshTokenFailedReason,
         tried_key: Option<String>,
@@ -123,6 +142,23 @@ impl RefreshOutcome {
         Self::PermanentFailure {
             error: reason.into(),
             tried_key,
+            tried_refresh_token: None,
+        }
+    }
+
+    /// Terminal failure attributed to the exact credential sent to the IdP.
+    ///
+    /// Prefer this wherever the attempted [`GrokAuth`] is in hand: it captures
+    /// both the AT key (verdict scope) and the RT (sibling-rotation check), so
+    /// a lost rotation race cannot be mistaken for a revoked session.
+    pub(crate) fn permanent_for(
+        reason: crate::auth::error::RefreshTokenFailedReason,
+        tried: &GrokAuth,
+    ) -> Self {
+        Self::PermanentFailure {
+            error: reason.into(),
+            tried_key: Some(tried.key.clone()),
+            tried_refresh_token: tried.refresh_token.clone(),
         }
     }
 

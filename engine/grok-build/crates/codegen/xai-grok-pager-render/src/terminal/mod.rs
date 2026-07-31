@@ -4,18 +4,20 @@
 //! Pure env-map helpers (`detect_*_from_env`) enable full matrix testing.
 
 use std::collections::HashMap;
-use std::process::Command;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::host::HostOs;
 
+pub mod da2;
 pub mod embedded_editor;
 pub mod hyperlinks;
 pub mod image;
 pub mod keyboard;
+pub mod kitty_keyboard;
 pub mod overlay;
 pub(crate) mod probe;
+pub mod term_version;
+pub mod tmux_probe;
 pub mod xtversion;
 
 pub use embedded_editor::{EmbeddedEditor, embedded_editor_from_env};
@@ -23,7 +25,15 @@ pub use hyperlinks::{
     HyperlinkCapabilities, Osc8Support, SchemeFilter, SetDefaultCursor, SetPointerCursor,
     hyperlink_capabilities,
 };
-pub use keyboard::{KeyboardCapabilities, ModifierDelivery, ModifierFate, keyboard_capabilities};
+pub use keyboard::{
+    KeyboardCapabilities, ModifierDelivery, ModifierFate, keyboard_capabilities,
+    keyboard_capabilities_for_host,
+};
+pub use kitty_keyboard::{
+    kitty_event_types_withheld, kitty_flags_pushed, kitty_releases_reported,
+    negotiated_kitty_flags, set_pushed_kitty_flags, take_kitty_flags_pushed,
+};
+pub use term_version::{TermVersion, TermVersionSource};
 
 #[cfg(test)]
 mod test;
@@ -36,55 +46,6 @@ pub(crate) fn env_from(pairs: &[(&str, &str)]) -> HashMap<String, String> {
         .iter()
         .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
         .collect()
-}
-
-// TODO: make term seq codes invariant in a crate.
-/// Tracks whether Kitty keyboard enhancement flags were pushed during
-/// `init_terminal`, so teardown paths (`restore_terminal`, panic hook)
-/// only pop when flags were actually pushed.
-static KITTY_FLAGS_PUSHED: AtomicBool = AtomicBool::new(false);
-
-/// Whether Kitty keyboard enhancement flags were actually pushed during
-/// `init_terminal` — i.e. the brand wasn't in the skip list *and* the
-/// runtime probe (`supports_keyboard_enhancement`) succeeded. False means
-/// modified keys (Shift+Enter, Ctrl+.) arrive as legacy bytes.
-pub fn kitty_flags_pushed() -> bool {
-    KITTY_FLAGS_PUSHED.load(Ordering::Acquire)
-}
-
-/// Record whether Kitty keyboard enhancement flags were pushed during
-/// `init_terminal`.
-pub fn set_kitty_flags_pushed(v: bool) {
-    KITTY_FLAGS_PUSHED.store(v, Ordering::Release)
-}
-
-/// Atomically clear the Kitty-flags-pushed state, returning the prior value.
-/// Used by teardown paths so concurrent callers cannot both pop.
-pub fn take_kitty_flags_pushed() -> bool {
-    KITTY_FLAGS_PUSHED.swap(false, Ordering::AcqRel)
-}
-
-/// Run `tmux show-option -gqv <option>` and return the trimmed value,
-/// or `None` if the subprocess fails or returns empty / whitespace.
-/// Stderr is suppressed so startup probes don't leak shell noise.
-pub fn tmux_show_option(option: &str) -> Option<String> {
-    let mut cmd = Command::new("tmux");
-    cmd.args(["show-option", "-gqv", option])
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    xai_tty_utils::detach_std_command(&mut cmd);
-    let output = cmd.output().ok()?;
-    parse_tmux_show_option_output(output.status.success(), &output.stdout)
-}
-
-/// Pure post-processing for `tmux show-option`: collapses subprocess
-/// failure, empty stdout, and whitespace-only stdout to `None`.
-pub fn parse_tmux_show_option_output(status_success: bool, stdout: &[u8]) -> Option<String> {
-    if !status_success {
-        return None;
-    }
-    let val = String::from_utf8_lossy(stdout).trim().to_string();
-    if val.is_empty() { None } else { Some(val) }
 }
 
 /// Known terminal emulator categories.
@@ -215,6 +176,15 @@ pub enum MultiplexerKind {
     /// cmux (Ghostty-backed macOS terminal multiplexer).
     #[strum(to_string = "cmux")]
     Cmux,
+    /// herdr, a libghostty-backed agent multiplexer
+    /// ([ogulcancelik/herdr](https://github.com/ogulcancelik/herdr)).
+    ///
+    /// Its embedded emulator answers CSI queries itself, so it counts as
+    /// CSI-intercepting. The accepted cost: a herdr pane typically has no
+    /// other version signal (brand `Unknown`, no `TERM_PROGRAM_VERSION`), but
+    /// the XTVERSION reply describes herdr's engine rather than the host.
+    #[strum(to_string = "herdr")]
+    Herdr,
     /// No recognized multiplexer detected (does not rule out unknown ones).
     #[default]
     #[strum(to_string = "None detected")]
@@ -223,9 +193,10 @@ pub enum MultiplexerKind {
 
 impl MultiplexerKind {
     /// Whether this multiplexer intercepts CSI queries (e.g. XTVERSION)
-    /// instead of passing them through to the outer terminal.
+    /// instead of passing them through to the outer terminal. See
+    /// [`Self::Herdr`] for the version signal herdr gives up by being here.
     pub fn intercepts_csi_queries(self) -> bool {
-        matches!(self, Self::Tmux | Self::Screen | Self::Zellij)
+        matches!(self, Self::Tmux | Self::Screen | Self::Zellij | Self::Herdr)
     }
 }
 
@@ -282,6 +253,8 @@ pub struct TerminalContext {
     pub tmux_meta: TmuxClientMeta,
     /// Whether the session is inside a remote SSH connection.
     pub is_ssh: bool,
+    /// Positive evidence that SSH is hosted by the official VS Code remote server.
+    pub is_official_vscode_remote: bool,
     /// The raw `TERM` environment variable (e.g. `xterm-256color`, `screen`).
     pub term_var: Option<String>,
     /// The tmux server version (e.g. `"tmux 3.4"`), populated only when
@@ -293,10 +266,16 @@ pub struct TerminalContext {
     /// Value of tmux's `extended-keys` global option (`"on"`, `"off"`,
     /// `"always"`); populated only when `multiplexer == Tmux`.
     pub tmux_extended_keys: Option<String>,
-    /// The `TERM_PROGRAM_VERSION` environment variable (e.g. `"3.5.6"` for
-    /// iTerm2, `"1.1.3"` for Ghostty). Used for version-gating features
-    /// that require a minimum terminal version.
+    /// The `TERM_PROGRAM_VERSION` environment variable, falling back to
+    /// `LC_TERMINAL_VERSION` (e.g. `"3.5.6"` for iTerm2, `"1.1.3"` for
+    /// Ghostty). Used for version-gating features that require a minimum
+    /// terminal version. Raw and **ungated**: inside tmux this is tmux's own
+    /// version. For a brand-corroborated value use [`Self::env_term_version`].
     pub term_program_version: Option<String>,
+    /// The brand-corroborated counterpart to `term_program_version` (see
+    /// [`term_version`]). Resolved once in [`build_terminal_context_from_env`],
+    /// so it does not re-derive if `brand` or `vte_version` change afterwards.
+    pub env_term_version: Option<TermVersion>,
 }
 
 impl TerminalContext {
@@ -571,12 +550,21 @@ impl TerminalContext {
         }
     }
 
+    /// The best available terminal version and the source that reported it.
+    ///
+    /// Not pure: the DA2 arm reads process-global probe state, so env-precedence
+    /// tests hold only while no reply has been recorded in the process.
+    pub fn term_version(&self) -> (String, TermVersionSource) {
+        term_version::best_term_version(da2::detected(), self.env_term_version.as_ref())
+    }
+
     /// Extract a flat snapshot of terminal details for telemetry.
     pub fn telemetry_snapshot(&self) -> xai_grok_telemetry::events::TerminalTelemetry {
         let os = crate::host::HostOs::current();
         let server = crate::host::DisplayServer::current();
         let kb = self.keyboard_capabilities();
         let route = crate::clipboard::clipboard_route();
+        let (term_version, term_version_source) = self.term_version();
         xai_grok_telemetry::events::TerminalTelemetry {
             brand: self.brand.to_string(),
             multiplexer: self.multiplexer.to_string(),
@@ -590,6 +578,9 @@ impl TerminalContext {
             enter_modifier_fate: kb.enter_modifier.to_string(),
             tmux_version: self.tmux_version_or_na().to_owned(),
             xtversion: xtversion::detected().unwrap_or("").to_owned(),
+            term_version,
+            term_version_source: term_version_source.to_string(),
+            kitty_event_types_withheld: kitty_event_types_withheld(),
             hyperlink_osc8: self.hyperlink_capabilities().osc8.to_string(),
             hyperlink_skip_reason: self.hyperlink_skip_reason().unwrap_or("none").to_owned(),
             clipboard_route: route.to_string(),
@@ -607,12 +598,16 @@ impl TerminalContext {
             Some(v) if self.brand == TerminalName::Unknown => format!("Unknown (XTVERSION: {v})"),
             _ => self.brand.to_string(),
         };
+        // Raw and unlabeled by design: no provenance, and no rewrite of DA2's
+        // library version into an Alacritty release number.
+        let (term_version, _source) = self.term_version();
         FeedbackTerminalInfo {
             brand,
             multiplexer: self.multiplexer.to_string(),
             is_ssh: self.is_ssh,
             is_byobu: self.is_byobu(),
             term_var: self.term_var_or_na().to_owned(),
+            term_version: (!term_version.is_empty()).then_some(term_version),
             tmux_version: if self.is_tmux_backed() {
                 self.tmux_version.clone()
             } else {
@@ -635,6 +630,23 @@ static TERMINAL_CONTEXT: OnceLock<TerminalContext> = OnceLock::new();
 /// process environment variables.
 pub fn terminal_context() -> &'static TerminalContext {
     TERMINAL_CONTEXT.get_or_init(detect_terminal_context)
+}
+
+/// Detect terminal environment facts without any live tmux subprocesses.
+///
+/// Standalone diagnostics use this so an unhealthy tmux server cannot block
+/// before the diagnostic runner has a chance to report unavailable evidence.
+pub fn standalone_terminal_context() -> TerminalContext {
+    standalone_terminal_context_from_env(&collect_process_env(), HostOs::current())
+}
+
+fn standalone_terminal_context_from_env(
+    env: &HashMap<String, String>,
+    host: HostOs,
+) -> TerminalContext {
+    let mut ctx = build_terminal_context_from_env(env);
+    ctx.brand = refine_unknown_brand_for_host(ctx.brand, host);
+    ctx
 }
 
 /// Build a [`TerminalContext`] from the current process environment.
@@ -664,6 +676,16 @@ fn collect_process_env() -> HashMap<String, String> {
 /// values.
 fn env_get<'a>(env: &'a HashMap<String, String>, key: &str) -> Option<&'a str> {
     env.get(key).map(|v| v.as_str()).filter(|v| !v.is_empty())
+}
+
+fn is_official_vscode_remote_askpass(path: &str) -> bool {
+    std::path::Path::new(path).components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::Normal(name)
+                if name == ".vscode-server" || name == ".vscode-server-insiders"
+        )
+    })
 }
 
 /// Detect the terminal brand from an injected environment map.
@@ -870,8 +892,11 @@ fn infer_byobu_backend_from_mux_markers(env: &HashMap<String, String>) -> Option
 /// 1. Explicit `BYOBU_BACKEND` beats generic `TMUX`/`STY` clues.
 /// 2. `TMUX` beats `ZELLIJ` (tmux can nest inside Zellij but not vice-versa).
 /// 3. `STY` (GNU screen) is only chosen when neither `TMUX` nor `ZELLIJ` is set.
-/// 4. cmux markers classify only when no tmux/zellij/screen (or explicit
-///    Byobu backend) won — so a real mux nested inside cmux still wins.
+/// 4. herdr and cmux markers classify only when no tmux/zellij/screen (or
+///    explicit Byobu backend) won — a real mux nested inside either still
+///    wins. Between the two, `HERDR_ENV` beats the `CMUX_*` markers: the
+///    shape they appear in together is herdr running in a cmux panel, where
+///    the `CMUX_*` values are inherited rather than fresh.
 ///
 /// This ensures one deterministic classification even when multiple markers
 /// are present (e.g., an inherited `ZELLIJ` var inside a tmux pane).
@@ -888,7 +913,9 @@ pub fn detect_multiplexer_from_env(env: &HashMap<String, String>) -> Multiplexer
     }
 
     // Standard multiplexer markers, tmux > Zellij > screen.
-    // Nested real multiplexers inside cmux must win over cmux itself.
+    // Nested real multiplexers inside herdr/cmux must win over the host mux.
+    // A herdr daemon first started from tmux freezes that TMUX into every pane:
+    // classified tmux here, so OSC 52 gets a tmux DCS wrap herdr renders as text.
     if env_get(env, "TMUX").is_some() {
         return MultiplexerKind::Tmux;
     }
@@ -897,6 +924,12 @@ pub fn detect_multiplexer_from_env(env: &HashMap<String, String>) -> Multiplexer
     }
     if env_get(env, "STY").is_some() {
         return MultiplexerKind::Screen;
+    }
+    // herdr sets HERDR_ENV=1 in every pane, overrides TERM to xterm-256color
+    // and never sets TERM_PROGRAM, so this marker is its only documented,
+    // stable signal.
+    if env_get(env, "HERDR_ENV").is_some() {
+        return MultiplexerKind::Herdr;
     }
     // cmux sets non-empty CMUX_SOCKET_PATH / CMUX_PANEL_ID / CMUX_BUNDLE_ID;
     // CMUX_SOCKET may be present but empty — env_get filters empties.
@@ -935,12 +968,16 @@ pub fn build_terminal_context_from_env(env: &HashMap<String, String>) -> Termina
     let is_ssh = env_get(env, "SSH_CONNECTION").is_some()
         || env_get(env, "SSH_TTY").is_some()
         || env_get(env, "SSH_CLIENT").is_some();
+    let is_official_vscode_remote = is_ssh
+        && env_get(env, "VSCODE_GIT_ASKPASS_MAIN").is_some_and(is_official_vscode_remote_askpass);
     let term_var = env_get(env, "TERM").map(|s| s.to_owned());
     let vte_version = env_get(env, "VTE_VERSION").map(|s| s.to_owned());
     // SSH strips TERM_PROGRAM_VERSION; iTerm2 LC_TERMINAL_VERSION survives.
     let term_program_version = env_get(env, "TERM_PROGRAM_VERSION")
         .or_else(|| env_get(env, "LC_TERMINAL_VERSION"))
         .map(|s| s.to_owned());
+    // Resolved here: the brand each version var must corroborate is in hand.
+    let env_term_version = term_version::detect_env_term_version(env, brand);
 
     TerminalContext {
         brand,
@@ -950,11 +987,13 @@ pub fn build_terminal_context_from_env(env: &HashMap<String, String>) -> Termina
         embedded_editor,
         tmux_meta,
         is_ssh,
+        is_official_vscode_remote,
         term_var,
         tmux_version: None,
         vte_version,
         tmux_extended_keys: None,
         term_program_version,
+        env_term_version,
     }
 }
 
@@ -1005,70 +1044,24 @@ pub enum AltScreenMode {
 
 /// Detect whether the current tmux session is in control mode.
 ///
-/// tmux control mode is detected by checking the `client_flags` on the
-/// current client. In control mode, the flags contain "control-mode".
-///
 /// Returns `false` when not inside tmux or when the query fails.
 pub fn detect_tmux_control_mode(ctx: &TerminalContext) -> bool {
     if ctx.multiplexer != MultiplexerKind::Tmux {
         return false;
     }
-    detect_tmux_control_mode_subprocess()
-}
-
-/// Subprocess-based control-mode detection.
-///
-/// Queries `tmux display-message -p "#{client_flags}"` and checks whether
-/// the output contains `"control-mode"`.
-fn detect_tmux_control_mode_subprocess() -> bool {
-    let mut cmd = std::process::Command::new("tmux");
-    cmd.args(["display-message", "-p", "#{client_flags}"])
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    xai_tty_utils::detach_std_command(&mut cmd);
-    cmd.output()
-        .ok()
-        .and_then(|out| {
-            if out.status.success() {
-                let flags = String::from_utf8_lossy(&out.stdout);
-                Some(flags.contains("control-mode"))
-            } else {
-                None
-            }
-        })
+    tmux_probe::query_control_mode()
+        .into_option()
         .unwrap_or(false)
 }
 
 /// Detect the tmux server version by running `tmux -V`.
-///
-/// Returns the trimmed version string (e.g. `"tmux 3.4"`) on success,
-/// or `None` when not inside tmux or when the subprocess fails.
-/// Only call this when `ctx.is_tmux_backed()` is true.
 pub fn detect_tmux_version() -> Option<String> {
-    let mut cmd = std::process::Command::new("tmux");
-    cmd.arg("-V")
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    xai_tty_utils::detach_std_command(&mut cmd);
-    cmd.output().ok().and_then(|out| {
-        if out.status.success() {
-            let version = String::from_utf8_lossy(&out.stdout).trim().to_owned();
-            if version.is_empty() {
-                None
-            } else {
-                Some(version)
-            }
-        } else {
-            None
-        }
-    })
+    tmux_probe::query_version().into_option()
 }
 
-/// Trimmed value of tmux's global `extended-keys` option, or `None` if
-/// the subprocess fails or the option is unset / empty. Only call this
-/// when `ctx.is_tmux_backed()` is true.
+/// Trimmed value of tmux's global `extended-keys` option.
 pub fn detect_tmux_extended_keys() -> Option<String> {
-    tmux_show_option("extended-keys")
+    tmux_probe::query_option("extended-keys").into_option()
 }
 
 /// Parse major.minor from a plain semver-ish string like `"3.6.0"` or `"1.2"`.

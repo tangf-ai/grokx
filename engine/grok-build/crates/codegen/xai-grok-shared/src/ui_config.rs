@@ -39,6 +39,14 @@ pub struct UiConfig {
     /// Written by the pager's appearance persist module.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub show_timestamps: Option<bool>,
+    /// Timeline sidebar (per-turn tick rail in place of the scrollbar).
+    /// `None` = off (client default; opt-in). Written by the pager's settings modal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub show_timeline: Option<bool>,
+    /// Snap a just-sent prompt to the viewport top. `None` = on (default).
+    /// Written by the pager's settings modal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page_flip_on_send: Option<bool>,
     /// Theme to use when the OS is in dark mode. Written by the pager's theme persist module.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_dark_theme: Option<String>,
@@ -84,6 +92,11 @@ pub struct UiConfig {
     /// `[voice].language` for the session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub voice_stt_language: Option<String>,
+    /// Whether the Ctrl+Space / F8 voice-dictation shortcut is active. Written
+    /// by the settings modal; unset defaults to `true` (shortcut on). When
+    /// `false` the chord is ignored — `/voice` still starts dictation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub voice_keybind_enabled: Option<bool>,
     /// When `true`, registers `Ctrl+R` (while scrollback is focused) to toggle
     /// terminal mouse reporting (mouse capture) so users can hand selection back
     /// to the terminal for native click-drag copy/paste. Opt-in only; unset/false
@@ -137,12 +150,7 @@ pub struct UiConfig {
     /// steady block. Config-file-only knob (no /settings row).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cursor_blink: Option<bool>,
-    /// Sticky screen-mode preference (`"minimal"` | `"fullscreen"`). Written by
-    /// the pager when an explicit `--minimal`/`--fullscreen` flag or a
-    /// `/minimal`//`/fullscreen` command is used, and read at startup so plain
-    /// `grok` reopens in whatever mode was last explicitly chosen. Unset keeps
-    /// the legacy resolution (pager.toml `[terminal] minimal`, alt-screen
-    /// policy).
+    /// `"fullscreen"` | `"minimal"`; unset → product default fullscreen.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub screen_mode: Option<String>,
     /// Retired hidden opt-in for terminal-like double/triple-click word/line
@@ -157,6 +165,9 @@ pub struct UiConfig {
     /// only appears once a user toggles a tip.
     #[serde(default, skip_serializing_if = "ContextualHints::is_default")]
     pub contextual_hints: ContextualHints,
+    /// Combine consecutive queued follow-ups into one turn. `None` = off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub combine_queued_prompts: Option<bool>,
     /// Display-refresh probe + auto-cadence (`[ui.display_refresh]`). Per-field
     /// `None` inherits remote/default; skipped when untouched.
     #[serde(default, skip_serializing_if = "DisplayRefreshSettings::is_default")]
@@ -188,6 +199,10 @@ pub struct ContextualHints {
     /// is still fold/nav (`flash` / `hold`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub word_select: Option<bool>,
+    /// SSH wrap session-load tip (recommend `grok wrap ssh` when the session
+    /// runs over SSH without an OSC 52 sink).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh_wrap: Option<bool>,
 }
 
 impl ContextualHints {
@@ -200,6 +215,7 @@ impl ContextualHints {
             && self.send_now.is_none()
             && self.small_screen.is_none()
             && self.word_select.is_none()
+            && self.ssh_wrap.is_none()
     }
 }
 
@@ -239,6 +255,8 @@ impl Default for UiConfig {
             approval_mode: None,
             default_selected_permission: None,
             show_timestamps: None,
+            show_timeline: None,
+            page_flip_on_send: None,
             auto_dark_theme: None,
             auto_light_theme: None,
             scroll_speed: None,
@@ -250,6 +268,7 @@ impl Default for UiConfig {
             hunk_tracker_mode: None,
             voice_capture_mode: None,
             voice_stt_language: None,
+            voice_keybind_enabled: None,
             mouse_reporting_toggle: None,
             remember_tool_approvals: None,
             cancel_subagents_on_turn_cancel: None,
@@ -263,12 +282,39 @@ impl Default for UiConfig {
             screen_mode: None,
             double_click_action: None,
             contextual_hints: ContextualHints::default(),
+            combine_queued_prompts: None,
             display_refresh: DisplayRefreshSettings::default(),
         }
     }
 }
 
 impl UiConfig {
+    /// The single source of truth for the timeline-sidebar default (opt-in).
+    /// Flip this one line to change the default everywhere.
+    ///
+    // TODO: migrate the other boolean UI settings (show_timestamps,
+    // simple_mode, show_thinking_blocks, …) to the same const + resolver
+    // pattern. They currently duplicate their default literal across
+    // cache.rs / config.rs / defs.rs / setters.rs / registry.rs and rely on
+    // the registry drift-guard test to catch mismatches.
+    pub const SHOW_TIMELINE_DEFAULT: bool = false;
+
+    /// Resolved timeline-sidebar setting: the configured value, or
+    /// [`Self::SHOW_TIMELINE_DEFAULT`] when unset. The one place the default
+    /// is applied — every layer (cache, appearance config, settings modal)
+    /// reads through here so they cannot drift.
+    pub fn show_timeline_enabled(&self) -> bool {
+        self.show_timeline.unwrap_or(Self::SHOW_TIMELINE_DEFAULT)
+    }
+
+    /// Default for [`Self::page_flip_on_send`] when unset.
+    pub const PAGE_FLIP_ON_SEND_DEFAULT: bool = true;
+
+    pub fn page_flip_on_send_enabled(&self) -> bool {
+        self.page_flip_on_send
+            .unwrap_or(Self::PAGE_FLIP_ON_SEND_DEFAULT)
+    }
+
     /// True when the highlight should not timer-dismiss (`hold` / `word_select`,
     /// or legacy duration 0).
     pub fn keep_text_selection_enabled(&self) -> bool {
@@ -282,6 +328,16 @@ impl UiConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn page_flip_on_send_defaults_on() {
+        assert!(UiConfig::default().page_flip_on_send_enabled());
+        let off = UiConfig {
+            page_flip_on_send: Some(false),
+            ..Default::default()
+        };
+        assert!(!off.page_flip_on_send_enabled());
+    }
 
     #[test]
     fn keep_text_selection_enabled_precedence() {

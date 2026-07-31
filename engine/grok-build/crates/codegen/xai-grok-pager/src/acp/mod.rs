@@ -60,6 +60,9 @@ pub struct AcpConnection {
     pub auth_methods: Vec<acp::AuthMethod>,
     /// Cancellation token to stop the agent.
     pub cancel: CancellationToken,
+    /// In-process agent worker thread (`connect` only). Join after cancel so
+    /// session actors can flush SessionEnd hooks. `None` in leader mode.
+    pub agent_thread: Option<std::thread::JoinHandle<anyhow::Result<()>>>,
     /// ACP-advertised slash commands parsed from `InitializeResponse.meta.availableCommands`.
     /// Seeded into every new `AgentSession` so autocomplete has shell builtins
     /// and skills immediately, before any `AvailableCommandsUpdate` arrives.
@@ -159,7 +162,6 @@ pub async fn connect(cancel: &CancellationToken, flags: ConnectFlags) -> Result<
     agent_config.resolve_runtime_fields(&xai_grok_shell::agent::config::RuntimeResolutionContext {
         raw_config: &raw_config,
         remote_settings: flags.remote_settings.as_ref(),
-        cwd: None,
         is_headless: false,
         cli_subagents: Some(flags.subagents),
         cli_web_search_model: None,
@@ -210,7 +212,7 @@ pub async fn connect(cancel: &CancellationToken, flags: ConnectFlags) -> Result<
         startup_auth_metadata(&auth_methods);
 
     let (needs_login, login_label, login_method_id, auth_start_mode, auth_meta) =
-        eager_auth_or_login_fallback(
+        bounded_eager_auth(
             &tx,
             &auth_methods,
             default_auth_method_id.as_ref(),
@@ -228,6 +230,7 @@ pub async fn connect(cancel: &CancellationToken, flags: ConnectFlags) -> Result<
         is_grok_shell,
         auth_methods,
         cancel: spawned.cancel,
+        agent_thread: Some(spawned.thread_handle),
         available_commands,
         needs_login,
         login_label,
@@ -322,7 +325,7 @@ pub async fn connect_via_leader(
         startup_auth_metadata(&auth_methods);
 
     let (needs_login, login_label, login_method_id, auth_start_mode, auth_meta) =
-        eager_auth_or_login_fallback(
+        bounded_eager_auth(
             &tx,
             &auth_methods,
             default_auth_method_id.as_ref(),
@@ -354,6 +357,7 @@ pub async fn connect_via_leader(
         is_grok_shell,
         auth_methods,
         cancel: bridge.cancel,
+        agent_thread: None,
         available_commands,
         needs_login,
         login_label,
@@ -703,6 +707,49 @@ async fn eager_auth_or_login_fallback(
             let (label, method_id, mode) = find_interactive_login_method(auth_methods);
             (true, label, method_id, mode, None)
         }
+    }
+}
+
+/// [`eager_auth_or_login_fallback`] bounded by `STARTUP_AUTH_REFRESH_TIMEOUT`,
+/// so a hung agent cannot gate the first draw. On timeout the inputs pass
+/// through unchanged and the agent finishes authentication in the background.
+async fn bounded_eager_auth(
+    tx: &AcpAgentTx,
+    auth_methods: &[acp::AuthMethod],
+    default_auth_method_id: Option<&acp::AuthMethodId>,
+    needs_login: bool,
+    login_label: Option<String>,
+    login_method_id: Option<acp::AuthMethodId>,
+    auth_start_mode: AuthStartMode,
+) -> (
+    bool,
+    Option<String>,
+    Option<acp::AuthMethodId>,
+    AuthStartMode,
+    Option<serde_json::Value>,
+) {
+    match tokio::time::timeout(
+        xai_grok_shell::http::STARTUP_AUTH_REFRESH_TIMEOUT,
+        eager_auth_or_login_fallback(
+            tx,
+            auth_methods,
+            default_auth_method_id,
+            needs_login,
+            login_label.clone(),
+            login_method_id.clone(),
+            auth_start_mode,
+        ),
+    )
+    .await
+    {
+        Ok(resolved) => resolved,
+        Err(_) => (
+            needs_login,
+            login_label,
+            login_method_id,
+            auth_start_mode,
+            None,
+        ),
     }
 }
 

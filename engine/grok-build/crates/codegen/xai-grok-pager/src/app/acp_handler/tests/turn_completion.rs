@@ -231,46 +231,10 @@
     }
 
     #[test]
-    fn wake_delta_records_wake_turn_start() {
-        // The wake turn's deltas are the marker's only timing source: the
-        // stamp is pid-scoped so a later real turn's `turnStartMs` cannot
-        // masquerade as the wake turn's start.
+    fn silent_wake_turn_completed_is_markerless() {
         let mut app = make_app_with_agent("sess-wake");
-        let _ = handle(
-            make_viewer_chunk_with_turn_start("sess-wake", "task-completed-bg1", 5_000),
-            &mut app,
-        );
-        let agent = app.agents.get(&AgentId(0)).unwrap();
-        let (pid, _) = agent
-            .wake_turn_start
-            .as_ref()
-            .expect("a wake delta must record its turn start");
-        assert_eq!(pid, "task-completed-bg1");
-
-        // A real (user) turn's delta must not overwrite the record.
-        let _ = handle(
-            make_viewer_chunk_with_turn_start("sess-wake", "pid-user", 1_000),
-            &mut app,
-        );
-        let agent = app.agents.get(&AgentId(0)).unwrap();
-        assert_eq!(
-            agent.wake_turn_start.as_ref().map(|(p, _)| p.as_str()),
-            Some("task-completed-bg1"),
-            "only wake-turn deltas feed the wake start record"
-        );
-    }
-
-    #[test]
-    fn wake_turn_completed_pushes_end_marker_with_counts() {
-        let mut app = make_app_with_agent("sess-wake");
-        seed_two_bg_tasks_and_announce(&mut app, "sess-wake");
-        {
-            // Window closed (e.g. the last marker was workless) — the wake
-            // marker must REOPEN it via the shared single assignment.
-            let agent = app.agents.get_mut(&AgentId(0)).unwrap();
-            agent.end_work_announced = false;
-            agent.wake_turn_start = Some(("task-completed-bg1".into(), 1_700_000_000_000));
-        }
+        seed_two_bg_tasks(&mut app, "sess-wake");
+        let len_before = app.agents[&AgentId(0)].scrollback.len();
 
         let affected = handle_ext_notification(
             &xai_wake_turn_completed_notif(
@@ -280,93 +244,107 @@
             ),
             &mut app,
         );
-        assert!(affected, "a wake marker on the active agent redraws");
+        assert!(affected, "the wake back-to-idle point still redraws");
 
         let agent = app.agents.get(&AgentId(0)).unwrap();
         assert!(
             agent.session.state.is_idle(),
             "a wake turn is never adopted — the pager stays idle around it"
         );
-        let block = last_marker_block(&agent.scrollback);
         assert_eq!(
-            block.marker_text(),
-            "Worked for 5.0s. 2 commands still running.",
-            "elapsed spans the delta-borne start to the terminal's shell clock"
+            agent.scrollback.len(),
+            len_before,
+            "a silent wake turn pushes no marker"
         );
-        assert!(!block.parked);
         assert_eq!(
-            block.prompt_id.as_deref(),
-            Some("task-completed-bg1"),
-            "the marker carries the wake pid for hook attribution"
-        );
-        assert!(
-            agent.end_work_announced,
-            "a counted wake marker reopens the between-turns status window"
-        );
-        assert!(
-            agent.wake_turn_start.is_none(),
-            "the tracked start is consumed by its marker"
+            agent.watchers().commands,
+            2,
+            "the running commands stay on the status-row watchers cue"
         );
     }
 
     #[test]
-    fn wake_marker_without_tracked_start_omits_elapsed() {
-        // Old shells stamp no `turnStartMs` on deltas — the marker renders
-        // without a duration rather than lying with "0.0s".
+    fn chatty_wake_turn_completed_pushes_one_marker() {
+        use crate::app::agent_view::test_fixtures::count_turn_markers;
+
         let mut app = make_app_with_agent("sess-wake");
-        let _ = handle_ext_notification(
-            &make_task_backgrounded_notif("sess-wake", "tc-1", "task-1", "sleep 98"),
+        let _ = handle(
+            make_viewer_chunk_with_turn_start("sess-wake", "task-completed-bg1", 5_000),
             &mut app,
+        );
+        assert_eq!(count_turn_markers(&app.agents[&AgentId(0)]), 0);
+
+        let affected = handle_ext_notification(
+            &xai_wake_turn_completed_notif("sess-wake", "task-completed-bg1", None),
+            &mut app,
+        );
+        assert!(affected);
+
+        let agent = app.agents.get(&AgentId(0)).unwrap();
+        assert_eq!(
+            count_turn_markers(agent),
+            1,
+            "a chatty wake closes with exactly one marker"
+        );
+        assert!(matches!(
+            last_session_event(&agent.scrollback),
+            Some(SessionEvent::TurnCompleted { .. })
+        ));
+    }
+
+    #[test]
+    fn duplicate_wake_terminal_pushes_no_second_marker() {
+        // `finish_wake_turn` snapshots the output epoch, so a duplicate sees no new output.
+        use crate::app::agent_view::test_fixtures::count_turn_markers;
+
+        let mut app = make_app_with_agent("sess-wake");
+        let _ = handle(
+            make_viewer_chunk_with_turn_start("sess-wake", "task-completed-bg1", 5_000),
+            &mut app,
+        );
+        let _ = handle_ext_notification(
+            &xai_wake_turn_completed_notif("sess-wake", "task-completed-bg1", None),
+            &mut app,
+        );
+        assert_eq!(count_turn_markers(&app.agents[&AgentId(0)]), 1);
+
+        let _ = handle_ext_notification(
+            &xai_wake_turn_completed_notif("sess-wake", "task-completed-bg1", None),
+            &mut app,
+        );
+        assert_eq!(
+            count_turn_markers(&app.agents[&AgentId(0)]),
+            1,
+            "a duplicate wake terminal must not push a second marker"
+        );
+    }
+
+    #[test]
+    fn wake_terminal_finishes_in_flight_streamed_entry() {
+        // The terminal is a wake's ONLY flush site (wakes skip PromptResponse).
+        let mut app = make_app_with_agent("sess-wake");
+        let _ = handle(
+            make_viewer_chunk_with_turn_start("sess-wake", "task-completed-bg1", 5_000),
+            &mut app,
+        );
+        assert!(
+            app.agents[&AgentId(0)].scrollback.has_running_entries(),
+            "the streamed wake chunk opens a live entry"
         );
 
         let _ = handle_ext_notification(
             &xai_wake_turn_completed_notif("sess-wake", "task-completed-bg1", None),
             &mut app,
         );
-
-        let agent = app.agents.get(&AgentId(0)).unwrap();
-        assert_eq!(
-            last_marker_block(&agent.scrollback).marker_text(),
-            "Turn completed. 1 command still running."
-        );
-    }
-
-    #[test]
-    fn zero_count_wake_marker_is_plain_and_closes_window() {
-        let mut app = make_app_with_agent("sess-wake");
-        {
-            let agent = app.agents.get_mut(&AgentId(0)).unwrap();
-            agent.end_work_announced = true;
-            agent.wake_turn_start = Some(("task-completed-bg1".into(), 1_700_000_000_000));
-        }
-
-        let _ = handle_ext_notification(
-            &xai_wake_turn_completed_notif(
-                "sess-wake",
-                "task-completed-bg1",
-                Some(1_700_000_000_000 + 2_000),
-            ),
-            &mut app,
-        );
-
-        let agent = app.agents.get(&AgentId(0)).unwrap();
-        let block = last_marker_block(&agent.scrollback);
-        assert_eq!(block.marker_text(), "Worked for 2.0s.");
         assert!(
-            block.end_work.is_none(),
-            "zero counts → legacy plain marker"
-        );
-        assert!(
-            !agent.end_work_announced,
-            "a workless wake marker proves nothing is running — window closed"
+            !app.agents[&AgentId(0)].scrollback.has_running_entries(),
+            "the wake terminal must finish the streamed entry"
         );
     }
 
     #[test]
     fn wake_turn_completed_in_replay_only_records_pid() {
-        // The replay arm is untouched: a wake pid seen during a load's replay
-        // records adoption state and pushes nothing (markers are client-local
-        // and never replayed).
+        // Markers are client-local and never replayed.
         let mut app = make_app_with_agent("sess-wake");
         app.agents
             .get_mut(&AgentId(0))
@@ -397,9 +375,7 @@
 
     #[test]
     fn scheduler_fired_turn_completed_keeps_adopted_path() {
-        // `/loop` turns are synthetic but CLIENT-driven with a real finalize
-        // path — they must not take the wake-marker shortcut. Idle driver +
-        // scheduler pid → the shared finalize ignores it, no marker.
+        // `/loop` turns are client-driven with a real finalize path — never the wake shortcut.
         let mut app = make_app_with_agent("sess-cron");
         let len_before = app.agents[&AgentId(0)].scrollback.len();
 
@@ -417,15 +393,209 @@
     }
 
     #[test]
-    fn failed_wake_turn_keeps_markerless_shape() {
-        // "Worked for" would lie about an errored/cancelled wake turn, and
-        // the cancel/failure UX is driver-side context this signal lacks —
-        // those stop reasons keep today's markerless shape. The status-line
-        // re-emit on this leg self-gates silent here (closed window, no work).
+    fn silent_errored_wake_pushes_failure_marker() {
+        // Failures surface even when invisible: the standing instruction silently stopped.
         let mut app = make_app_with_agent("sess-wake");
         let len_before = app.agents[&AgentId(0)].scrollback.len();
 
-        for stop_reason in ["error", "cancelled", "rate_limit"] {
+        let _ = handle_ext_notification(
+            &xai_turn_completed_notif("sess-wake", "task-completed-bg1", "error", false),
+            &mut app,
+        );
+
+        let agent = app.agents.get(&AgentId(0)).unwrap();
+        assert_eq!(agent.scrollback.len(), len_before + 1);
+        assert!(matches!(
+            last_session_event(&agent.scrollback),
+            Some(SessionEvent::TurnFailed { .. })
+        ));
+    }
+
+    #[test]
+    fn silent_errored_wake_ignores_stale_turn_start_ms() {
+        // A silent wake streamed no deltas, so the stored `turn_start_ms` is an earlier turn's.
+        let mut app = make_app_with_agent("sess-wake");
+        app.agents.get_mut(&AgentId(0)).unwrap().turn_start_ms =
+            Some(chrono::Utc::now().timestamp_millis() - 600_000);
+
+        let _ = handle_ext_notification(
+            &xai_turn_completed_notif("sess-wake", "task-completed-bg1", "error", false),
+            &mut app,
+        );
+
+        let agent = app.agents.get(&AgentId(0)).unwrap();
+        assert!(matches!(
+            last_session_event(&agent.scrollback),
+            Some(SessionEvent::TurnFailed { elapsed: None, .. })
+        ));
+    }
+
+    #[test]
+    fn goal_terminal_snapshots_epoch_so_next_silent_wake_stays_markerless() {
+        // A dirty output epoch made the NEXT silent wake inherit the goal turn's output.
+        use crate::app::agent_view::test_fixtures::count_turn_markers;
+
+        let mut app = make_app_with_agent("sess-wake");
+        let _ = handle(
+            make_viewer_chunk_with_turn_start("sess-wake", "goal-summary-g1", 5_000),
+            &mut app,
+        );
+        let _ = handle_ext_notification(
+            &xai_turn_completed_notif("sess-wake", "goal-summary-g1", "end_turn", false),
+            &mut app,
+        );
+        let len_before = app.agents[&AgentId(0)].scrollback.len();
+
+        let _ = handle_ext_notification(
+            &xai_turn_completed_notif("sess-wake", "task-completed-bg1", "end_turn", false),
+            &mut app,
+        );
+
+        let agent = app.agents.get(&AgentId(0)).unwrap();
+        assert_eq!(
+            agent.scrollback.len(),
+            len_before,
+            "a silent wake after a goal turn must not inherit its output"
+        );
+        assert_eq!(count_turn_markers(agent), 0);
+    }
+
+    #[test]
+    fn errored_wake_terminal_during_local_turn_still_pushes_failure() {
+        // Failure visibility survives the busy skip: no tracker finish, no
+        // elapsed (the anchor is the local turn's), but the row must land.
+        use crate::app::agent::AgentState;
+
+        let mut app = make_app_with_agent("sess-wake");
+        app.agents.get_mut(&AgentId(0)).unwrap().session.state = AgentState::TurnRunning;
+        let len_before = app.agents[&AgentId(0)].scrollback.len();
+
+        for _ in 0..2 {
+            let _ = handle_ext_notification(
+                &xai_turn_completed_notif("sess-wake", "task-completed-bg1", "error", false),
+                &mut app,
+            );
+        }
+
+        let agent = app.agents.get(&AgentId(0)).unwrap();
+        assert_eq!(agent.scrollback.len(), len_before + 1, "one row, deduped");
+        assert!(matches!(
+            last_session_event(&agent.scrollback),
+            Some(SessionEvent::TurnFailed { elapsed: None, .. })
+        ));
+    }
+
+    #[test]
+    fn wake_terminal_during_command_snapshots_epoch_for_next_silent_wake() {
+        // A client command (e.g. /compact) skips the wake finish but must not
+        // leave the epoch dirty: the next silent wake would claim the skipped
+        // wake's output.
+        use crate::app::agent::{AgentCommand, AgentState};
+        use crate::app::agent_view::test_fixtures::count_turn_markers;
+
+        let mut app = make_app_with_agent("sess-wake");
+        let _ = handle(
+            make_viewer_chunk_with_turn_start("sess-wake", "task-completed-bg1", 5_000),
+            &mut app,
+        );
+        app.agents.get_mut(&AgentId(0)).unwrap().session.state = AgentState::CommandRunning {
+            command: AgentCommand::Compact,
+            started_at: std::time::Instant::now(),
+        };
+        let _ = handle_ext_notification(
+            &xai_turn_completed_notif("sess-wake", "task-completed-bg1", "end_turn", false),
+            &mut app,
+        );
+        app.agents.get_mut(&AgentId(0)).unwrap().session.state = AgentState::Idle;
+        let len_before = app.agents[&AgentId(0)].scrollback.len();
+
+        let _ = handle_ext_notification(
+            &xai_turn_completed_notif("sess-wake", "task-completed-bg2", "end_turn", false),
+            &mut app,
+        );
+
+        let agent = app.agents.get(&AgentId(0)).unwrap();
+        assert_eq!(
+            agent.scrollback.len(),
+            len_before,
+            "silent wake after a command-skipped terminal must stay markerless"
+        );
+        assert_eq!(count_turn_markers(agent), 0);
+    }
+
+    #[test]
+    fn chatty_wake_with_foreign_turn_start_anchor_omits_elapsed() {
+        // `turn_start_ms` stamped by another prompt's deltas must not become
+        // this wake's elapsed.
+        let mut app = make_app_with_agent("sess-wake");
+        let _ = handle(
+            make_viewer_chunk_with_turn_start("sess-wake", "task-completed-bg1", 600_000),
+            &mut app,
+        );
+
+        let _ = handle_ext_notification(
+            &xai_turn_completed_notif("sess-wake", "task-completed-bg2", "end_turn", false),
+            &mut app,
+        );
+
+        let agent = app.agents.get(&AgentId(0)).unwrap();
+        assert!(matches!(
+            last_session_event(&agent.scrollback),
+            Some(SessionEvent::TurnCompleted { elapsed: None })
+        ));
+    }
+
+    #[test]
+    fn silent_errored_wake_after_goal_turn_has_no_elapsed() {
+        let mut app = make_app_with_agent("sess-wake");
+        let _ = handle(
+            make_viewer_chunk_with_turn_start("sess-wake", "goal-summary-g1", 5_000),
+            &mut app,
+        );
+        let _ = handle_ext_notification(
+            &xai_turn_completed_notif("sess-wake", "goal-summary-g1", "end_turn", false),
+            &mut app,
+        );
+
+        let _ = handle_ext_notification(
+            &xai_turn_completed_notif("sess-wake", "task-completed-bg1", "error", false),
+            &mut app,
+        );
+
+        let agent = app.agents.get(&AgentId(0)).unwrap();
+        assert!(matches!(
+            last_session_event(&agent.scrollback),
+            Some(SessionEvent::TurnFailed { elapsed: None, .. })
+        ));
+    }
+
+    #[test]
+    fn duplicate_errored_wake_terminal_pushes_one_failure_marker() {
+        // Failures bypass the output-epoch dedupe, so duplicates are deduped by prompt id.
+        let mut app = make_app_with_agent("sess-wake");
+        let len_before = app.agents[&AgentId(0)].scrollback.len();
+
+        for _ in 0..2 {
+            let _ = handle_ext_notification(
+                &xai_turn_completed_notif("sess-wake", "task-completed-bg1", "error", false),
+                &mut app,
+            );
+        }
+
+        assert_eq!(
+            app.agents[&AgentId(0)].scrollback.len(),
+            len_before + 1,
+            "one failure marker for the wake, duplicates dropped"
+        );
+    }
+
+    #[test]
+    fn silent_cancelled_or_rate_limited_wake_stays_markerless() {
+        // Rate limits ride the retry notifications instead, matching the real-turn rails.
+        let mut app = make_app_with_agent("sess-wake");
+        let len_before = app.agents[&AgentId(0)].scrollback.len();
+
+        for stop_reason in ["cancelled", "rate_limit"] {
             let _ = handle_ext_notification(
                 &xai_turn_completed_notif("sess-wake", "task-completed-bg1", stop_reason, false),
                 &mut app,
@@ -435,49 +605,86 @@
         assert_eq!(
             app.agents[&AgentId(0)].scrollback.len(),
             len_before,
-            "non-completion wake terminals push nothing"
+            "cancelled/rate-limited silent wake terminals push nothing"
         );
     }
 
     #[test]
-    fn dead_wake_reemits_skipped_work_status_line() {
-        // The shell's `will_wake` promise made the chip skip its status line;
-        // the wake then died markerless (cancelled) — nothing else marks the
-        // moment, so the terminal re-emits the work-only line. The window
-        // stays open: the line announces the same still-running work.
+    fn chatty_rate_limited_wake_closes_with_failure_marker() {
         let mut app = make_app_with_agent("sess-wake");
-        seed_two_bg_tasks_and_announce(&mut app, "sess-wake");
+        let _ = handle(
+            make_viewer_chunk_with_turn_start("sess-wake", "task-completed-bg1", 5_000),
+            &mut app,
+        );
 
-        let affected = handle_ext_notification(
+        let _ = handle_ext_notification(
+            &xai_turn_completed_notif("sess-wake", "task-completed-bg1", "rate_limit", false),
+            &mut app,
+        );
+
+        let agent = app.agents.get(&AgentId(0)).unwrap();
+        assert!(matches!(
+            last_session_event(&agent.scrollback),
+            Some(SessionEvent::TurnFailed { .. })
+        ));
+    }
+
+    #[test]
+    fn chatty_errored_wake_pushes_failure_marker_not_worked_for() {
+        let mut app = make_app_with_agent("sess-wake");
+        let _ = handle(
+            make_viewer_chunk_with_turn_start("sess-wake", "task-completed-bg1", 5_000),
+            &mut app,
+        );
+
+        let _ = handle_ext_notification(
+            &xai_turn_completed_notif("sess-wake", "task-completed-bg1", "error", false),
+            &mut app,
+        );
+
+        let agent = app.agents.get(&AgentId(0)).unwrap();
+        assert!(matches!(
+            last_session_event(&agent.scrollback),
+            Some(SessionEvent::TurnFailed { .. })
+        ));
+    }
+
+    #[test]
+    fn dead_wake_pushes_no_status_line() {
+        let mut app = make_app_with_agent("sess-wake");
+        seed_two_bg_tasks(&mut app, "sess-wake");
+        let len_before = app.agents[&AgentId(0)].scrollback.len();
+
+        let _ = handle_ext_notification(
             &xai_turn_completed_notif("sess-wake", "task-completed-bg1", "cancelled", false),
             &mut app,
         );
 
-        assert!(affected, "the re-emitted status line must redraw");
         let agent = app.agents.get(&AgentId(0)).unwrap();
-        assert_eq!(
-            work_status_lines(&agent.scrollback),
-            vec!["2 commands still running.".to_string()],
-            "the dead wake's terminal re-emits the skipped work-only line"
-        );
         assert!(
-            agent.end_work_announced,
-            "a status line is not a marker — the window stays open"
+            work_status_lines(&agent.scrollback).is_empty(),
+            "a dead wake must not push a work-only status line"
+        );
+        assert_eq!(
+            agent.scrollback.len(),
+            len_before,
+            "a dead wake pushes nothing"
+        );
+        assert_eq!(
+            agent.watchers().commands,
+            2,
+            "the still-running work feeds the status-row cue instead"
         );
     }
 
     #[test]
     fn wake_terminal_during_local_turn_pushes_nothing() {
-        // Wire interleave: wake turn W streams (pager idle), the user sends a
-        // prompt locally (TurnRunning), then FIFO delivers W's terminal
-        // before the new turn's deltas. A foreign "Worked for" (or status
-        // line) under the fresh prompt would misattribute — the local turn's
-        // own marker carries the counts when it ends.
+        // FIFO can deliver a wake's terminal after a fresh local prompt starts; a
+        // foreign "Worked for" under that prompt would misattribute.
         let mut app = make_app_with_agent("sess-wake");
-        seed_two_bg_tasks_and_announce(&mut app, "sess-wake");
+        seed_two_bg_tasks(&mut app, "sess-wake");
         {
             let agent = app.agents.get_mut(&AgentId(0)).unwrap();
-            agent.wake_turn_start = Some(("task-completed-bg1".into(), 1_000));
             agent.session.start_turn(&mut agent.scrollback);
             agent.session.current_prompt_id = Some("pid-local".into());
         }
@@ -499,18 +706,10 @@
             agent.session.state.is_turn_running(),
             "the local turn is untouched"
         );
-        assert!(agent.end_work_announced, "the skip leaves the window as-is");
-        assert!(
-            agent.wake_turn_start.is_some(),
-            "the pid-scoped elapsed slot stays; it cannot misfire on other turns"
-        );
     }
 
     #[test]
-    fn wake_marker_leaves_real_turn_stash_pending() {
-        // Stop-hook stash semantics belong to real turns: a stash stamped
-        // with a REAL turn's pid must survive a wake marker untouched — no
-        // fold, no standalone flush — and wait for its own marker rail.
+    fn wake_terminal_leaves_real_turn_stash_pending() {
         use crate::scrollback::blocks::tool::{HookRunEntry, HookRunStatus};
         let mut app = make_app_with_agent("sess-wake");
         {
@@ -529,6 +728,7 @@
                 )],
             });
         }
+        let len_before = app.agents[&AgentId(0)].scrollback.len();
 
         let _ = handle_ext_notification(
             &xai_wake_turn_completed_notif("sess-wake", "task-completed-bg1", None),
@@ -537,9 +737,9 @@
 
         let agent = app.agents.get(&AgentId(0)).unwrap();
         assert_eq!(
-            last_marker_stop_hook_groups(&agent.scrollback),
-            Some(0),
-            "a real turn's stash must not attach to the wake marker"
+            agent.scrollback.len(),
+            len_before,
+            "a wake terminal pushes nothing (no marker, no stash flush)"
         );
         assert_eq!(count_lifecycle_blocks(&agent.scrollback), 0);
         assert!(
@@ -604,6 +804,69 @@
             "replayed stop hooks keep the standalone lifecycle block"
         );
         assert!(agent.pending_stop_hooks.is_none());
+    }
+
+    /// The wire `blocked` flag splits a failed run: a stop-gate block maps to
+    /// `HookRunStatus::Blocked` (a decision, not a failure), a plain failure stays `Failed`.
+    #[test]
+    fn blocked_wire_flag_maps_to_blocked_status() {
+        use crate::scrollback::blocks::tool::HookRunStatus;
+        use xai_grok_shell::extensions::notification::{HookRunEntryDto, HookRunStatusDto};
+
+        let mut app = make_app_with_agent("sess-blocked");
+        {
+            let agent = app.agents.get_mut(&AgentId(0)).unwrap();
+            agent.session.start_turn(&mut agent.scrollback);
+            agent.session.current_prompt_id = Some("pid-1".into());
+        }
+
+        let _ = handle_ext_notification(
+            &xai_hook_execution_notif_with_runs(
+                "sess-blocked",
+                "stop",
+                Some("pid-1"),
+                false,
+                vec![
+                    HookRunEntryDto {
+                        name: "gate".into(),
+                        status: HookRunStatusDto::Failed {
+                            error: "blocked stop: run the tests".into(),
+                            elapsed_ms: 7,
+                            blocked: true,
+                        },
+                        output: None,
+                    },
+                    HookRunEntryDto {
+                        name: "broken".into(),
+                        status: HookRunStatusDto::Failed {
+                            error: "exit code 1".into(),
+                            elapsed_ms: 3,
+                            blocked: false,
+                        },
+                        output: None,
+                    },
+                ],
+            ),
+            &mut app,
+        );
+
+        let agent = app.agents.get(&AgentId(0)).unwrap();
+        let pending = agent
+            .pending_stop_hooks
+            .as_ref()
+            .expect("stop hooks must be stashed for the marker");
+        let runs = &pending.groups[0].1;
+        assert!(
+            matches!(&runs[0].status, HookRunStatus::Blocked { detail, .. }
+                if detail == "blocked stop: run the tests"),
+            "blocked: true must map to Blocked, got {:?}",
+            runs[0].status
+        );
+        assert!(
+            matches!(&runs[1].status, HookRunStatus::Failed { .. }),
+            "blocked: false must stay Failed, got {:?}",
+            runs[1].status
+        );
     }
 
     #[test]
@@ -837,45 +1100,40 @@
     }
 
     #[test]
-    fn between_turns_completion_reemits_work_status_until_zero() {
-        let mut app = make_app_with_agent("sess-reemit");
-        seed_two_bg_tasks_and_announce(&mut app, "sess-reemit");
+    fn between_turns_completion_pushes_chip_only() {
+        let mut app = make_app_with_agent("sess-chip-only");
+        seed_two_bg_tasks(&mut app, "sess-chip-only");
         assert!(app.agents[&AgentId(0)].session.state.is_idle());
+        assert_eq!(app.agents[&AgentId(0)].watchers().commands, 2);
 
-        // First completion: chip, then a fresh status line with the rest.
         let _ = handle_ext_notification(
-            &make_task_completed_notif("sess-reemit", "task-1", "sleep 98", Some(0)),
+            &make_task_completed_notif("sess-chip-only", "task-1", "sleep 98", Some(0)),
             &mut app,
         );
         let agent = app.agents.get(&AgentId(0)).unwrap();
+        assert!(
+            work_status_lines(&agent.scrollback).is_empty(),
+            "no work-only status line after a between-turns completion"
+        );
         assert_eq!(
-            work_status_lines(&agent.scrollback),
-            vec!["1 command still running.".to_string()],
-            "the completion re-emits the remaining-work status line"
-        );
-        let tail_is_status = matches!(
-            agent.scrollback.get(agent.scrollback.len() - 1).map(|e| &e.block),
-            Some(RenderBlock::System(b)) if b.text.contains("still running")
-        );
-        assert!(tail_is_status, "the status line lands AFTER the chip");
-
-        // Last completion: chip only — zero left closes the story.
-        let _ = handle_ext_notification(
-            &make_task_completed_notif("sess-reemit", "task-2", "sleep 99", Some(0)),
-            &mut app,
-        );
-        let agent = app.agents.get(&AgentId(0)).unwrap();
-        assert_eq!(
-            work_status_lines(&agent.scrollback).len(),
+            agent.watchers().commands,
             1,
-            "zero remaining work must not add a status line"
+            "the status-row cue counts down instead"
         );
+
+        let _ = handle_ext_notification(
+            &make_task_completed_notif("sess-chip-only", "task-2", "sleep 99", Some(0)),
+            &mut app,
+        );
+        let agent = app.agents.get(&AgentId(0)).unwrap();
+        assert!(work_status_lines(&agent.scrollback).is_empty());
+        assert_eq!(agent.watchers().commands, 0, "zero left — cue disappears");
     }
 
     #[test]
     fn mid_turn_completion_pushes_chip_only() {
         let mut app = make_app_with_agent("sess-midturn");
-        seed_two_bg_tasks_and_announce(&mut app, "sess-midturn");
+        seed_two_bg_tasks(&mut app, "sess-midturn");
         {
             let agent = app.agents.get_mut(&AgentId(0)).unwrap();
             agent.session.start_turn(&mut agent.scrollback);
@@ -893,51 +1151,35 @@
     }
 
     #[test]
-    fn unannounced_completion_pushes_chip_only() {
-        // No turn-end marker announced work (e.g. a fresh attach): the
-        // between-turns window is closed and completions stay chip-only.
-        let mut app = make_app_with_agent("sess-unannounced");
-        seed_two_bg_tasks_and_announce(&mut app, "sess-unannounced");
-        app.agents.get_mut(&AgentId(0)).unwrap().end_work_announced = false;
-
+    fn subagent_finished_between_turns_pushes_no_status_line() {
+        let mut app = make_app_with_parent_and_child("sess-sub-quiet", "child-1");
         let _ = handle_ext_notification(
-            &make_task_completed_notif("sess-unannounced", "task-1", "sleep 98", Some(0)),
+            &make_task_backgrounded_notif("sess-sub-quiet", "tc-1", "task-1", "sleep 98"),
             &mut app,
         );
-        assert!(
-            work_status_lines(&app.agents[&AgentId(0)].scrollback).is_empty(),
-            "an unannounced window must not spawn status lines"
-        );
-    }
-
-    #[test]
-    fn subagent_finished_between_turns_reemits_work_status() {
-        let mut app = make_app_with_parent_and_child("sess-sub-reemit", "child-1");
-        let _ = handle_ext_notification(
-            &make_task_backgrounded_notif("sess-sub-reemit", "tc-1", "task-1", "sleep 98"),
-            &mut app,
-        );
-        app.agents.get_mut(&AgentId(0)).unwrap().end_work_announced = true;
 
         let _ = handle(
-            make_ext_session_notification("sess-sub-reemit", test_subagent_finished("child-1")),
+            make_ext_session_notification("sess-sub-quiet", test_subagent_finished("child-1")),
             &mut app,
         );
 
+        let agent = app.agents.get(&AgentId(0)).unwrap();
+        assert!(
+            work_status_lines(&agent.scrollback).is_empty(),
+            "a finished subagent pushes no work-only status line"
+        );
         assert_eq!(
-            work_status_lines(&app.agents[&AgentId(0)].scrollback),
-            vec!["1 command still running.".to_string()],
-            "a finished subagent re-emits the remaining-work status line"
+            agent.watchers().commands,
+            1,
+            "the remaining bg command stays on the status-row cue"
         );
     }
 
     #[test]
-    fn will_wake_completion_skips_work_status_line() {
-        // The shell stamped `will_wake`: a wake response follows the chip and
-        // its end marker carries the fresh counts — the after-chip work-only
-        // line would duplicate them.
+    fn will_wake_flag_is_ignored_wire_compat_pin() {
+        // `will_wake` is a wire-compat field the TUI no longer reads.
         let mut app = make_app_with_agent("sess-wake-skip");
-        seed_two_bg_tasks_and_announce(&mut app, "sess-wake-skip");
+        seed_two_bg_tasks(&mut app, "sess-wake-skip");
 
         let _ = handle_ext_notification(
             &task_completed_notif("sess-wake-skip", "task-1", "sleep 98", Some(0), None, true),
@@ -949,69 +1191,13 @@
             work_status_lines(&agent.scrollback).is_empty(),
             "a wake-bound completion pushes its chip only"
         );
-        assert!(
-            agent.end_work_announced,
-            "the skip leaves the window to the wake marker"
-        );
-    }
-
-    #[test]
-    fn legacy_task_completed_without_will_wake_field_emits_status() {
-        // Old shells don't stamp the field — missing reads as `false`, so the
-        // skew degrades to a transient duplicate line at worst, never a lost
-        // status.
-        let mut app = make_app_with_agent("sess-legacy");
-        seed_two_bg_tasks_and_announce(&mut app, "sess-legacy");
-
-        let notif = make_task_completed_notif("sess-legacy", "task-1", "sleep 98", Some(0));
-        let mut v: serde_json::Value = serde_json::from_str(notif.params.get()).unwrap();
-        v["update"]
-            .as_object_mut()
-            .unwrap()
-            .remove("will_wake")
-            .expect("the typed builder stamps the field");
-        let legacy = acp::ExtNotification::new(
-            "x.ai/task_completed",
-            std::sync::Arc::from(serde_json::value::to_raw_value(&v).unwrap()),
-        );
-        let _ = handle_ext_notification(&legacy, &mut app);
-
-        assert_eq!(
-            work_status_lines(&app.agents[&AgentId(0)].scrollback),
-            vec!["1 command still running.".to_string()],
-            "a stamp-less completion keeps the no-wake fallback line"
-        );
-    }
-
-    #[test]
-    fn will_wake_subagent_finished_skips_work_status_line() {
-        let mut app = make_app_with_parent_and_child("sess-sub-skip", "child-1");
-        let _ = handle_ext_notification(
-            &make_task_backgrounded_notif("sess-sub-skip", "tc-1", "task-1", "sleep 98"),
-            &mut app,
-        );
-        app.agents.get_mut(&AgentId(0)).unwrap().end_work_announced = true;
-
-        let _ = handle(
-            make_ext_session_notification(
-                "sess-sub-skip",
-                test_subagent_finished_with_wake("child-1", true),
-            ),
-            &mut app,
-        );
-
-        assert!(
-            work_status_lines(&app.agents[&AgentId(0)].scrollback).is_empty(),
-            "a wake-bound subagent completion pushes no status line"
-        );
     }
 
     #[test]
     fn child_session_completions_never_spam_root_status() {
         // A background subagent's own task traffic routes to the CHILD view;
-        // it never counts toward the root marker, so its completions must
-        // not push root status lines — no matter how many land in the open
-        // between-turns window.
+        // it never counts toward the root's watchers, so its completions must
+        // not push root status lines.
         let mut app = make_app_with_parent_and_child("sess-child-quiet", "child-1");
         let _ = handle_ext_notification(
             &make_task_backgrounded_notif("child-1", "tc-c1", "task-c1", "sleep 97"),
@@ -1021,7 +1207,6 @@
             &make_task_backgrounded_notif("child-1", "tc-c2", "task-c2", "sleep 98"),
             &mut app,
         );
-        app.agents.get_mut(&AgentId(0)).unwrap().end_work_announced = true;
         assert!(app.agents[&AgentId(0)].session.state.is_idle());
 
         let _ = handle_ext_notification(
@@ -1092,6 +1277,7 @@
                 restore_summary: None,
                 restore_degree: None,
                 running_prompt_id: Some("p-run".to_string()),
+                scheduler_background_loops: None,
             }),
             &mut app,
         );
@@ -1185,48 +1371,11 @@
     }
 
     #[test]
-    fn wake_stop_hooks_during_local_turn_stash_under_wake_pid() {
-        // A wake batch while a local turn runs keys to its OWN wake pid, never
-        // the local turn — else a late wake stop would fold onto an unrelated
-        // turn's marker.
-        let mut app = make_app_with_agent("sess-wake-park");
-        {
-            let agent = app.agents.get_mut(&AgentId(0)).unwrap();
-            agent.session.start_turn(&mut agent.scrollback);
-            agent.session.current_prompt_id = Some("pid-main".into());
-        }
-
-        let _ = handle_ext_notification(
-            &xai_hook_execution_notif_for_prompt(
-                "sess-wake-park",
-                "stop",
-                Some("task-completed-bg1"),
-                false,
-            ),
-            &mut app,
-        );
-
-        let agent = app.agents.get(&AgentId(0)).unwrap();
-        assert_eq!(count_lifecycle_blocks(&agent.scrollback), 0);
-        let pending = agent
-            .pending_stop_hooks
-            .as_ref()
-            .expect("wake batch stashes for its own end marker");
-        assert_eq!(
-            pending.prompt_id.as_deref(),
-            Some("task-completed-bg1"),
-            "keyed to the wake pid, not the running local turn"
-        );
-        assert_eq!(pending.groups.len(), 1);
-        assert_eq!(pending.groups[0].0, "stop");
-    }
-
-    #[test]
-    fn wake_stop_hooks_idle_stash_for_wake_marker() {
-        // Idle wake turn (non-adopted) whose hook beats its own TurnCompleted →
-        // stashes under the wake pid for `push_wake_end_marker`, not standalone.
+    fn wake_stop_hooks_render_standalone_at_arrival() {
+        // Never stashed: a stash keyed to a wake pid could wait for a marker that never comes.
         let mut app = make_app_with_agent("sess-wake-idle");
 
+        // Hook beats the wake terminal.
         let _ = handle_ext_notification(
             &xai_hook_execution_notif_for_prompt(
                 "sess-wake-idle",
@@ -1236,149 +1385,61 @@
             ),
             &mut app,
         );
-
         let agent = app.agents.get(&AgentId(0)).unwrap();
-        assert_eq!(
-            count_lifecycle_blocks(&agent.scrollback),
-            0,
-            "an idle wake stop batch must stash, not flush a standalone block"
-        );
-        let pending = agent
-            .pending_stop_hooks
-            .as_ref()
-            .expect("wake batch stashes for its own end marker");
-        assert_eq!(
-            pending.prompt_id.as_deref(),
-            Some("notifications-019f-abc"),
-            "keyed to the wake pid so push_wake_end_marker folds it"
-        );
-        assert_eq!(pending.groups.len(), 1);
-        assert_eq!(pending.groups[0].0, "stop");
-    }
-
-    #[test]
-    fn wake_stop_hooks_marker_first_attach() {
-        // Idle wake turn whose end marker lands before its hook → the hook
-        // attaches to the marker, not stash (guards the marker-arm-before-stash
-        // routing order).
-        let mut app = make_app_with_agent("sess-wake-marker1st");
-
-        let _ = handle_ext_notification(
-            &xai_wake_turn_completed_notif("sess-wake-marker1st", "task-completed-bg1", None),
-            &mut app,
-        );
-        assert_eq!(
-            last_marker_stop_hook_groups(&app.agents[&AgentId(0)].scrollback),
-            Some(0),
-            "wake marker starts without hooks"
-        );
-
-        let _ = handle_ext_notification(
-            &xai_hook_execution_notif_for_prompt(
-                "sess-wake-marker1st",
-                "stop",
-                Some("task-completed-bg1"),
-                false,
-            ),
-            &mut app,
-        );
-
-        let agent = app.agents.get(&AgentId(0)).unwrap();
-        assert_eq!(
-            last_marker_stop_hook_groups(&agent.scrollback),
-            Some(1),
-            "the wake stop hook must merge into the wake marker already on screen"
-        );
-        assert_eq!(
-            count_lifecycle_blocks(&agent.scrollback),
-            0,
-            "no standalone block"
-        );
-        assert!(
-            agent.pending_stop_hooks.is_none(),
-            "nothing left stashed once it attached"
-        );
-    }
-
-    #[test]
-    fn late_wake_stop_attaches_to_wake_marker_not_running_local_turn() {
-        // A wake turn finished (its marker is on screen); a new local turn is
-        // running when the wake's delayed stop hook lands. It attaches to the
-        // wake marker, never folding onto the unrelated local turn.
-        let mut app = make_app_with_agent("sess-late-wake");
-
-        let _ = handle_ext_notification(
-            &xai_wake_turn_completed_notif("sess-late-wake", "task-completed-bg1", None),
-            &mut app,
-        );
-        assert_eq!(
-            last_marker_stop_hook_groups(&app.agents[&AgentId(0)].scrollback),
-            Some(0)
-        );
-
-        {
-            let agent = app.agents.get_mut(&AgentId(0)).unwrap();
-            agent.session.start_turn(&mut agent.scrollback);
-            agent.session.current_prompt_id = Some("pid-L".into());
-        }
-
-        let _ = handle_ext_notification(
-            &xai_hook_execution_notif_for_prompt(
-                "sess-late-wake",
-                "stop",
-                Some("task-completed-bg1"),
-                false,
-            ),
-            &mut app,
-        );
-
-        let agent = app.agents.get(&AgentId(0)).unwrap();
-        assert_eq!(
-            last_marker_stop_hook_groups(&agent.scrollback),
-            Some(1),
-            "the late wake stop attaches to the wake marker"
-        );
-        assert!(
-            agent.pending_stop_hooks.is_none(),
-            "it must not stash onto the running local turn L"
-        );
-        assert_eq!(count_lifecycle_blocks(&agent.scrollback), 0);
-    }
-
-    #[test]
-    fn wake_repeat_stop_after_marker_renders_standalone() {
-        // A duplicate same-name wake stop, after its marker already folded the
-        // first, renders standalone immediately — not stashed for a marker that
-        // will never come (which would defer it to a stale flush).
-        let mut app = make_app_with_agent("sess-wake-dup");
-
-        let _ = handle_ext_notification(
-            &xai_wake_turn_completed_notif("sess-wake-dup", "task-completed-bg1", None),
-            &mut app,
-        );
-        for _ in 0..2 {
-            let _ = handle_ext_notification(
-                &xai_hook_execution_notif_for_prompt(
-                    "sess-wake-dup",
-                    "stop",
-                    Some("task-completed-bg1"),
-                    false,
-                ),
-                &mut app,
-            );
-        }
-
-        let agent = app.agents.get(&AgentId(0)).unwrap();
-        assert_eq!(
-            last_marker_stop_hook_groups(&agent.scrollback),
-            Some(1),
-            "the first stop folded onto the wake marker"
-        );
         assert_eq!(
             count_lifecycle_blocks(&agent.scrollback),
             1,
-            "the repeat renders standalone, not deferred"
+            "a wake stop batch renders standalone at arrival"
         );
+        assert!(agent.pending_stop_hooks.is_none(), "never stashed");
+
+        // Hook trails the wake terminal — same standalone shape.
+        let _ = handle_ext_notification(
+            &xai_wake_turn_completed_notif("sess-wake-idle", "task-completed-bg1", None),
+            &mut app,
+        );
+        let _ = handle_ext_notification(
+            &xai_hook_execution_notif_for_prompt(
+                "sess-wake-idle",
+                "stop",
+                Some("task-completed-bg1"),
+                false,
+            ),
+            &mut app,
+        );
+        let agent = app.agents.get(&AgentId(0)).unwrap();
+        assert_eq!(count_lifecycle_blocks(&agent.scrollback), 2);
         assert!(agent.pending_stop_hooks.is_none());
+    }
+
+    #[test]
+    fn wake_stop_hooks_never_stash_under_local_turn() {
+        let mut app = make_app_with_agent("sess-wake-local");
+        {
+            let agent = app.agents.get_mut(&AgentId(0)).unwrap();
+            agent.session.start_turn(&mut agent.scrollback);
+            agent.session.current_prompt_id = Some("pid-main".into());
+        }
+
+        let _ = handle_ext_notification(
+            &xai_hook_execution_notif_for_prompt(
+                "sess-wake-local",
+                "stop",
+                Some("task-completed-bg1"),
+                false,
+            ),
+            &mut app,
+        );
+
+        let agent = app.agents.get(&AgentId(0)).unwrap();
+        assert_eq!(
+            count_lifecycle_blocks(&agent.scrollback),
+            1,
+            "the wake batch renders standalone under the running local turn"
+        );
+        assert!(
+            agent.pending_stop_hooks.is_none(),
+            "it must not stash onto the running local turn"
+        );
     }
 

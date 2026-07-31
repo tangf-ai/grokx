@@ -12,7 +12,7 @@ const DONE_SENTINEL: &str = "VERB_GROUP_STREAM_DONE";
 /// before the 3-file label or the final completion exists — and the settled
 /// transcript then shows the final "Read 3 files".
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "PTY e2e; run with cargo test -p xai-grok-pager --test pty_e2e -- --ignored"]
+#[ignore = "PTY e2e; run the owning pty_e2e_* Cargo test with --ignored (see Cargo.toml)"]
 async fn verb_group_streaming_fold_pty() {
     let content = ContentController::start().await.expect("start content");
     // Pin ON via the config tier so the test doesn't ride the client default.
@@ -25,14 +25,18 @@ async fn verb_group_streaming_fold_pty() {
         std::fs::write(&path, "hello verb group\n").expect("write fixture file");
         paths.push(dunce::canonicalize(&path).unwrap_or(path));
     }
-    for (i, p) in paths.iter().enumerate() {
-        enqueue_tool_turn(
-            &content,
-            &format!("call_s{i}"),
-            "read_file",
-            json!({ "target_file": p.to_string_lossy() }).to_string(),
-        );
-    }
+    let _tool_turns: Vec<_> = paths
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            expect_tool_turn(
+                &content,
+                &format!("call_s{i}"),
+                "read_file",
+                json!({ "target_file": p.to_string_lossy() }).to_string(),
+            )
+        })
+        .collect();
     content.set_response(DONE_SENTINEL);
     // Hold each scripted turn open (4 SSE events x 350ms ≈ 1.4s) so the
     // mid-flight window is pollable; cleared after capture so the tail

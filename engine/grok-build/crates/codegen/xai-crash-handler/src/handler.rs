@@ -1,7 +1,12 @@
-//! Cross-platform crash handler for fatal memory faults.
+//! Cross-platform crash handler for fatal memory faults and aborts.
 //!
-//! - **Unix**: SIGBUS/SIGSEGV via `sigaction(2)`.
+//! - **Unix**: SIGBUS/SIGSEGV/SIGABRT via `sigaction(2)`. SIGABRT matters
+//!   because release builds ship with `panic = "abort"`, so every Rust panic
+//!   terminates via `abort(3)` — without a SIGABRT handler those deaths leave
+//!   no crash report.
 //! - **Windows**: `EXCEPTION_ACCESS_VIOLATION` et al. via `SetUnhandledExceptionFilter`.
+//!   `abort()` does not go through the unhandled-exception filter, so SIGABRT
+//!   capture is Unix-only.
 //!
 //! Captures crash PC + frame-pointer chain. All handler operations are
 //! minimal (raw pointer reads, direct file I/O, atomics — no allocation).
@@ -275,11 +280,16 @@ mod imp {
         }
     }
 
-    /// Register a signal handler for SIGBUS and SIGSEGV.
+    /// Register a signal handler for SIGBUS, SIGSEGV, and SIGABRT.
+    ///
+    /// SIGABRT is hooked so `panic = "abort"` deaths (every Rust panic in
+    /// release builds) produce a crash report instead of a bare `Aborted`.
     ///
     /// Flags: `SA_SIGINFO | SA_ONSTACK | SA_RESETHAND`. `SA_RESETHAND`
     /// resets disposition to `SIG_DFL` after delivery, preventing recursive
-    /// faults in the handler from looping.
+    /// faults in the handler from looping. The handlers additionally restore
+    /// `SIG_DFL` and re-raise explicitly, so the process still terminates
+    /// with the original signal's semantics (exit status, core dumps).
     ///
     /// # Safety
     ///
@@ -295,6 +305,7 @@ mod imp {
 
             libc::sigaction(libc::SIGBUS, &sa, std::ptr::null_mut());
             libc::sigaction(libc::SIGSEGV, &sa, std::ptr::null_mut());
+            libc::sigaction(libc::SIGABRT, &sa, std::ptr::null_mut());
         }
     }
 
@@ -424,7 +435,8 @@ mod imp {
         }
     }
 
-    /// Install a minimal SIGSEGV/SIGBUS handler that restores termios on crash.
+    /// Install a minimal SIGSEGV/SIGBUS/SIGABRT handler that restores termios
+    /// on crash.
     ///
     /// Does NOT write terminal escape codes — call
     /// [`enable_terminal_escape_restore`] after TUI modes are enabled.
@@ -451,14 +463,22 @@ mod imp {
             Ok(p) => p,
             Err(_) => return false,
         };
+        // Owner-only: crash blobs hold stack IPs / fault addresses.
         let fd = unsafe {
             libc::open(
                 c_path.as_ptr(),
                 libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC,
-                0o644,
+                0o600,
             )
         };
         if fd < 0 {
+            return false;
+        }
+        // open's mode is create-only; tighten upgrades of older 0644 blobs.
+        if unsafe { libc::fchmod(fd, 0o600) } != 0 {
+            unsafe {
+                libc::close(fd);
+            }
             return false;
         }
         CRASH_FD.store(fd, Ordering::Relaxed);
@@ -478,8 +498,8 @@ mod imp {
         true
     }
 
-    /// Upgrade SIGSEGV/SIGBUS handlers to include terminal escape code
-    /// restoration. Call when TUI modes are enabled.
+    /// Upgrade SIGSEGV/SIGBUS/SIGABRT handlers to include terminal escape
+    /// code restoration. Call when TUI modes are enabled.
     pub fn enable_terminal_escape_restore() {
         unsafe {
             register_crash_signals(if CRASH_FD.load(Ordering::Relaxed) >= 0 {
@@ -490,7 +510,7 @@ mod imp {
         }
     }
 
-    /// Downgrade SIGSEGV/SIGBUS handlers to termios-only restoration.
+    /// Downgrade SIGSEGV/SIGBUS/SIGABRT handlers to termios-only restoration.
     /// Call when TUI modes are disabled.
     pub fn disable_terminal_escape_restore() {
         unsafe {
@@ -848,7 +868,7 @@ pub fn disable_terminal_escape_restore() {}
 mod tests {
     use std::sync::Mutex;
 
-    // SIGSEGV/SIGBUS handlers are process-global. Tests in this binary run on
+    // SIGSEGV/SIGBUS/SIGABRT handlers are process-global. Tests in this binary run on
     // parallel threads, so any two tests that install/read these handlers race.
     // Serialize them through this lock (poison-tolerant: a real assertion
     // failure in one test must not cascade into the other).
@@ -891,6 +911,18 @@ mod tests {
                 0,
                 "SIGBUS handler must use alternate signal stack"
             );
+
+            assert_eq!(libc::sigaction(libc::SIGABRT, std::ptr::null(), &mut sa), 0);
+            assert_ne!(
+                sa.sa_sigaction,
+                libc::SIG_DFL,
+                "SIGABRT handler should not be SIG_DFL after install"
+            );
+            assert_ne!(
+                sa.sa_flags & libc::SA_ONSTACK,
+                0,
+                "SIGABRT handler must use alternate signal stack"
+            );
         }
     }
 
@@ -919,5 +951,56 @@ mod tests {
             handler_after, handler_before,
             "full install should replace the minimal handler"
         );
+    }
+
+    #[test]
+    fn install_creates_owner_only_crash_blob() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = SIGNAL_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "xai-crash-handler-test-0600-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create crash dir");
+
+        assert!(super::install(&dir, "test-version"));
+        let path = dir.join("last-crash.bin");
+        let mode = std::fs::metadata(&path).expect("meta").permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "new last-crash.bin must be owner-only");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn install_tightens_preexisting_0644_crash_blob() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = SIGNAL_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "xai-crash-handler-test-tighten-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create crash dir");
+
+        let path = dir.join("last-crash.bin");
+        std::fs::write(&path, b"old").expect("seed");
+        let mut perms = std::fs::metadata(&path).expect("meta").permissions();
+        perms.set_mode(0o644);
+        std::fs::set_permissions(&path, perms).expect("set 0644");
+        assert_eq!(
+            std::fs::metadata(&path).expect("meta").permissions().mode() & 0o777,
+            0o644
+        );
+
+        assert!(super::install(&dir, "test-version"));
+        let mode = std::fs::metadata(&path).expect("meta").permissions().mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "install must fchmod preexisting 0644 blobs to owner-only"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

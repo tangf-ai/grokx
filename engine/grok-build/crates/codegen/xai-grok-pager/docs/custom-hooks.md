@@ -51,7 +51,10 @@ Hooks are discovered from several places (all are merged):
 | Global    | `~/.claude/settings.json`         | Always       | Claude Code compatibility |
 | Project   | `<project>/.grok/hooks/*.json`    | Requires trust | Per-repo automation |
 | Project   | `<project>/.claude/settings.json` | Requires trust | Claude compatibility |
+| Config    | `config.toml`, `managed_config.toml`, `requirements.toml` | Always | Hooks shipped in your (or your organization's) config |
 | Plugin    | Bundled inside installed plugins  | Per-plugin   | Shared team hooks |
+
+Config-file hooks use the same schema in TOML form; see the [Hooks user guide](user-guide/10-hooks.md#hooks-in-config-files) for details.
 
 **Trusting a project**: Open the hooks modal (`Ctrl+L` on non–VS Code family, or `/hooks` on any terminal including VS Code family) or run `/hooks-trust` (the same folder-trust gate as `--trust`, recorded in `~/.grok/trusted_folders.toml`) the first time you open a project with hooks. This prevents untrusted repos from running arbitrary code.
 
@@ -84,10 +87,10 @@ Each `.json` file can define multiple hooks:
 Key fields:
 
 - **Event name** (top-level key): `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `Stop`, `Notification`, `SessionEnd`, etc.
-- **matcher** (optional): Regex that must match the tool name. Only applies to `PreToolUse`/`PostToolUse`. Empty = match everything.
+- **matcher** (optional): Regex tested against the event's match value — the tool name on tool events, and per-event values elsewhere (see the user guide's Hooks chapter). Empty = match everything.
 - **type**: `"command"` (run a script or shell one-liner) or `"http"` (POST the event to a URL).
 - **command**: Path to executable (relative to the JSON file) or inline shell command.
-- **timeout**: Seconds before killing the hook (default: 5). Hooks fail open on timeout.
+- **timeout**: Seconds before killing the hook (default: 5, or 600 for `Stop`/`SubagentStop` gates). Hooks fail open on timeout.
 
 **Tool name aliases**: Claude-style names like `Bash`, `Edit`, `Read` automatically match Grok's internal names (`run_terminal_cmd`, `search_replace`, `read_file`).
 
@@ -116,7 +119,7 @@ Write JSON to **stdout**:
 
 **Exit codes** (behavior differs by hook type):
 - `0` — success / allow (for blocking hooks)
-- `2` — explicit deny (blocking hooks only)
+- `2` — explicit deny (`PreToolUse`) or block-stop with stderr as feedback (`Stop`/`SubagentStop`; see Stop Decision Control in the user guide)
 - Any other (including timeout/crash/missing env var) — **fail-open**: the failure is logged and shown in the hook scrollback, but the tool call is not blocked. To block a tool call, return JSON `{"decision":"deny","reason":"..."}` on stdout.
 
 ### Passive hooks

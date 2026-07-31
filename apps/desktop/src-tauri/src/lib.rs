@@ -271,6 +271,20 @@ async fn delete_session(
         .map_err(|e| e.to_string())
 }
 
+/// Remove a project from the sidebar (and all of its tasks). Does not delete
+/// the source folder on disk.
+#[tauri::command]
+async fn delete_project(
+    core: State<'_, CoreState>,
+    project_id: String,
+) -> Result<(), String> {
+    let pid = parse_project_id(&project_id)?;
+    core.0
+        .delete_project(&pid)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 /// Persist chat transcript JSON for a task (under its work_path).
 #[tauri::command]
 async fn save_chat_history(
@@ -379,6 +393,21 @@ async fn send_prompt(core: State<'_, CoreState>, text: String) -> Result<(), Str
     core.0.send_prompt(text).await.map_err(|e| e.to_string())
 }
 
+/// Side chat / `/btw` — does not write to main session transcript.
+/// Returns `{ answer, thinking? }`.
+#[tauri::command]
+async fn send_btw(
+    core: State<'_, CoreState>,
+    question: String,
+) -> Result<serde_json::Value, String> {
+    let (answer, thinking) = core.0.send_btw(question).await.map_err(|e| e.to_string())?;
+    let mut v = serde_json::json!({ "answer": answer });
+    if let Some(t) = thinking.filter(|s| !s.trim().is_empty()) {
+        v["thinking"] = serde_json::Value::String(t);
+    }
+    Ok(v)
+}
+
 #[tauri::command]
 async fn send_prompt_rich(
     core: State<'_, CoreState>,
@@ -467,6 +496,402 @@ async fn save_settings(
         .map_err(|e| e.to_string())
 }
 
+/// Read the raw Grok engine config (`~/.grok/config.toml`) for the Settings editor.
+#[tauri::command]
+fn read_grok_config() -> Result<GrokConfigFile, String> {
+    let path = app_config::AppPaths::grok_cli_config();
+    let path_str = path.display().to_string();
+    if !path.exists() {
+        return Ok(GrokConfigFile {
+            path: path_str,
+            content: String::new(),
+            exists: false,
+        });
+    }
+    let content =
+        std::fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    Ok(GrokConfigFile {
+        path: path_str,
+        content,
+        exists: true,
+    })
+}
+
+/// Write the raw Grok engine config. Only allows the standard `~/.grok/config.toml` path.
+#[tauri::command]
+fn write_grok_config(content: String) -> Result<GrokConfigFile, String> {
+    let path = app_config::AppPaths::grok_cli_config();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("create {}: {e}", parent.display()))?;
+    }
+    // Basic sanity: reject NULs which break most editors / TOML parsers.
+    if content.contains('\0') {
+        return Err("config content must not contain null bytes".into());
+    }
+    std::fs::write(&path, content.as_bytes())
+        .map_err(|e| format!("write {}: {e}", path.display()))?;
+    Ok(GrokConfigFile {
+        path: path.display().to_string(),
+        content,
+        exists: true,
+    })
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct GrokConfigFile {
+    path: String,
+    content: String,
+    exists: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProbeEndpointArgs {
+    /// Base URL from the form, e.g. `http://host:port/v1`
+    base_url: String,
+    /// Optional key typed in the form (takes precedence over saved settings).
+    api_key: Option<String>,
+    /// Optional env var name to read the key from when form key is empty.
+    env_key: Option<String>,
+    /// When form key is blank, use the key stored in app settings.
+    use_saved_key: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct EndpointProbeResult {
+    ok: bool,
+    status: u16,
+    message: String,
+    models_url: String,
+    latency_ms: u64,
+    model_count: Option<usize>,
+    /// First few model ids for a quick glance.
+    sample_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RemoteModelInfo {
+    id: String,
+    name: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct FetchModelsResult {
+    ok: bool,
+    status: u16,
+    message: String,
+    models_url: String,
+    models: Vec<RemoteModelInfo>,
+}
+
+fn normalize_openai_base(raw: &str) -> Result<String, String> {
+    let mut s = raw.trim().to_string();
+    if s.is_empty() {
+        return Err("Base URL is empty".into());
+    }
+    // Accept host without scheme.
+    if !s.contains("://") {
+        s = format!("http://{s}");
+    }
+    while s.ends_with('/') {
+        s.pop();
+    }
+    Ok(s)
+}
+
+fn models_url_from_base(base: &str) -> String {
+    // base is expected like …/v1 (or …/v1/ already trimmed)
+    if base.ends_with("/models") {
+        base.to_string()
+    } else {
+        format!("{base}/models")
+    }
+}
+
+async fn resolve_probe_api_key(
+    core: &CoreState,
+    form_key: Option<&str>,
+    env_key: Option<&str>,
+    use_saved: bool,
+) -> Option<String> {
+    let form = form_key.map(str::trim).filter(|s| !s.is_empty());
+    if let Some(k) = form {
+        return Some(k.to_string());
+    }
+    if use_saved {
+        let settings = core.0.public_settings().await;
+        // public view masks the key — need full key from internal settings.
+        // Fall through to env / internal via a dedicated helper below.
+        let _ = settings;
+    }
+    // Read full settings via update path is not ideal; use engine_env style.
+    // Access through a small core method would be cleaner; for now re-load file.
+    if use_saved {
+        if let Ok(full) = app_config::UserSettings::load(&core.0.paths.config_file) {
+            if let Some(k) = full
+                .endpoint
+                .api_key
+                .as_ref()
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+            {
+                return Some(k.to_string());
+            }
+            if let Some(ek) = full
+                .endpoint
+                .env_key
+                .as_ref()
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+            {
+                if let Ok(v) = std::env::var(ek) {
+                    if !v.trim().is_empty() {
+                        return Some(v);
+                    }
+                }
+            }
+        }
+    }
+    if let Some(ek) = env_key.map(str::trim).filter(|s| !s.is_empty()) {
+        if let Ok(v) = std::env::var(ek) {
+            if !v.trim().is_empty() {
+                return Some(v);
+            }
+        }
+    }
+    None
+}
+
+async fn http_get_models(
+    models_url: &str,
+    api_key: Option<&str>,
+) -> Result<(u16, String, u64), String> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(12))
+        .build()
+        .map_err(|e| format!("http client: {e}"))?;
+    let mut req = client.get(models_url);
+    if let Some(k) = api_key.map(str::trim).filter(|s| !s.is_empty()) {
+        req = req.header("Authorization", format!("Bearer {k}"));
+    }
+    let started = std::time::Instant::now();
+    let resp = req.send().await.map_err(|e| format!("request failed: {e}"))?;
+    let status = resp.status().as_u16();
+    let body = resp
+        .text()
+        .await
+        .map_err(|e| format!("read body: {e}"))?;
+    let latency_ms = started.elapsed().as_millis() as u64;
+    Ok((status, body, latency_ms))
+}
+
+fn parse_models_list(body: &str) -> Vec<RemoteModelInfo> {
+    let mut out = Vec::new();
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
+        return out;
+    };
+    let arr = if let Some(a) = v.get("data").and_then(|d| d.as_array()) {
+        a.clone()
+    } else if let Some(a) = v.as_array() {
+        a.clone()
+    } else if let Some(a) = v.get("models").and_then(|d| d.as_array()) {
+        a.clone()
+    } else {
+        return out;
+    };
+    for item in arr {
+        let id = item
+            .get("id")
+            .and_then(|x| x.as_str())
+            .or_else(|| item.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if id.is_empty() {
+            continue;
+        }
+        // Prefer display_name; `name` is often JSON null on OpenAI-compatible APIs.
+        let name = ["display_name", "name", "title", "id"]
+            .into_iter()
+            .find_map(|k| {
+                item.get(k)
+                    .and_then(|x| x.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string())
+            })
+            .unwrap_or_else(|| id.clone());
+        out.push(RemoteModelInfo { id, name });
+    }
+    out
+}
+
+/// GET `{base}/models` — validates endpoint + key without sending a chat.
+#[tauri::command]
+async fn test_endpoint(
+    core: State<'_, CoreState>,
+    args: ProbeEndpointArgs,
+) -> Result<EndpointProbeResult, String> {
+    let base = normalize_openai_base(&args.base_url)?;
+    let models_url = models_url_from_base(&base);
+    let key = resolve_probe_api_key(
+        &core,
+        args.api_key.as_deref(),
+        args.env_key.as_deref(),
+        args.use_saved_key.unwrap_or(true),
+    )
+    .await;
+    if key.is_none() {
+        return Ok(EndpointProbeResult {
+            ok: false,
+            status: 0,
+            message: "No API key (type one, or save a key first / set env key)".into(),
+            models_url,
+            latency_ms: 0,
+            model_count: None,
+            sample_ids: vec![],
+        });
+    }
+    let (status, body, latency_ms) =
+        http_get_models(&models_url, key.as_deref()).await?;
+    let models = parse_models_list(&body);
+    let ok = (200..300).contains(&status);
+    let message = if ok {
+        format!(
+            "OK · HTTP {status} · {} model(s) · {latency_ms} ms",
+            models.len()
+        )
+    } else {
+        let snippet: String = body.chars().take(180).collect();
+        format!("HTTP {status} · {snippet}")
+    };
+    let sample_ids: Vec<String> = models.iter().take(8).map(|m| m.id.clone()).collect();
+    Ok(EndpointProbeResult {
+        ok,
+        status,
+        message,
+        models_url,
+        latency_ms,
+        model_count: if ok { Some(models.len()) } else { None },
+        sample_ids,
+    })
+}
+
+/// GET `{base}/models` and return the full list for the Settings form.
+#[tauri::command]
+async fn fetch_remote_models(
+    core: State<'_, CoreState>,
+    args: ProbeEndpointArgs,
+) -> Result<FetchModelsResult, String> {
+    let base = normalize_openai_base(&args.base_url)?;
+    let models_url = models_url_from_base(&base);
+    let key = resolve_probe_api_key(
+        &core,
+        args.api_key.as_deref(),
+        args.env_key.as_deref(),
+        args.use_saved_key.unwrap_or(true),
+    )
+    .await;
+    if key.is_none() {
+        return Ok(FetchModelsResult {
+            ok: false,
+            status: 0,
+            message: "No API key (type one, or save a key first / set env key)".into(),
+            models_url,
+            models: vec![],
+        });
+    }
+    let (status, body, _ms) = http_get_models(&models_url, key.as_deref()).await?;
+    let models = parse_models_list(&body);
+    let ok = (200..300).contains(&status) && !models.is_empty();
+    let message = if (200..300).contains(&status) {
+        if models.is_empty() {
+            "HTTP OK but no models in response".into()
+        } else {
+            format!("Fetched {} model(s)", models.len())
+        }
+    } else {
+        let snippet: String = body.chars().take(180).collect();
+        format!("HTTP {status} · {snippet}")
+    };
+    Ok(FetchModelsResult {
+        ok,
+        status,
+        message,
+        models_url,
+        models,
+    })
+}
+
+/// Guess mime when mime_guess is weak (Office Open XML, etc.).
+fn mime_from_path_or_name(path: &std::path::Path, name: &str) -> Option<String> {
+    if let Some(m) = mime_guess::from_path(path).first() {
+        let s = m.essence_str().to_string();
+        if s != "application/octet-stream" {
+            return Some(s);
+        }
+    }
+    mime_from_filename(name)
+}
+
+fn mime_from_filename(name: &str) -> Option<String> {
+    let lower = name.to_ascii_lowercase();
+    let ext = lower.rsplit('.').next().unwrap_or("");
+    let mime = match ext {
+        "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "doc" => "application/msword",
+        "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "xls" => "application/vnd.ms-excel",
+        "pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "ppt" => "application/vnd.ms-powerpoint",
+        "pdf" => "application/pdf",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "txt" => "text/plain",
+        "md" => "text/markdown",
+        "json" => "application/json",
+        "csv" => "text/csv",
+        _ => return None,
+    };
+    Some(mime.to_string())
+}
+
+/// Sanitize a display filename for use on disk while keeping readable names
+/// (including Chinese). Only strips path separators and control chars.
+fn safe_filename_for_disk(name: &str, fallback_ext: &str) -> String {
+    let trimmed = name.trim();
+    let base = if trimmed.is_empty() {
+        format!("file.{fallback_ext}")
+    } else {
+        trimmed.to_string()
+    };
+    let mut out: String = base
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | '\0' => '_',
+            c if c.is_control() => '_',
+            c => c,
+        })
+        .collect();
+    // Avoid empty / dot-only names.
+    if out.trim_matches('.').is_empty() {
+        out = format!("file.{fallback_ext}");
+    }
+    // Ensure extension if missing and we know one.
+    if !fallback_ext.is_empty()
+        && !out
+            .to_ascii_lowercase()
+            .ends_with(&format!(".{}", fallback_ext.to_ascii_lowercase()))
+        && !out.contains('.')
+    {
+        out = format!("{out}.{fallback_ext}");
+    }
+    out
+}
+
 #[tauri::command]
 async fn pick_attachments(app: AppHandle) -> Result<Vec<AttachmentInput>, String> {
     use tauri_plugin_dialog::DialogExt;
@@ -475,12 +900,23 @@ async fn pick_attachments(app: AppHandle) -> Result<Vec<AttachmentInput>, String
         .file()
         .set_title("Attach files")
         .add_filter(
-            "Common",
+            "Documents",
             &[
-                "png", "jpg", "jpeg", "gif", "webp", "pdf", "txt", "md", "json", "rs", "ts",
-                "tsx", "js", "py", "go", "toml", "yaml", "yml", "csv", "html", "css",
+                "docx", "doc", "xlsx", "xls", "pptx", "ppt", "pdf", "txt", "md", "csv",
             ],
         )
+        .add_filter(
+            "Images",
+            &["png", "jpg", "jpeg", "gif", "webp", "bmp", "svg"],
+        )
+        .add_filter(
+            "Code",
+            &[
+                "json", "rs", "ts", "tsx", "js", "py", "go", "toml", "yaml", "yml", "html",
+                "css",
+            ],
+        )
+        .add_filter("All", &["*"])
         .blocking_pick_files();
     let Some(files) = files else {
         return Ok(vec![]);
@@ -490,14 +926,13 @@ async fn pick_attachments(app: AppHandle) -> Result<Vec<AttachmentInput>, String
         let path = f
             .into_path()
             .map_err(|e| format!("invalid path: {e}"))?;
+        // Always keep the on-disk original basename for display (Word, etc.).
         let name = path
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| path.display().to_string());
         let size = std::fs::metadata(&path).ok().map(|m| m.len());
-        let mime = mime_guess::from_path(&path)
-            .first()
-            .map(|m| m.essence_str().to_string());
+        let mime = mime_from_path_or_name(&path, &name);
         out.push(AttachmentInput {
             path: path.display().to_string(),
             name: Some(name),
@@ -520,17 +955,26 @@ fn mime_to_ext(mime: &str) -> &'static str {
         "text/plain" => "txt",
         "text/markdown" => "md",
         "application/json" => "json",
+        "application/msword" => "doc",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document" => "docx",
+        "application/vnd.ms-excel" => "xls",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" => "xlsx",
+        "application/vnd.ms-powerpoint" => "ppt",
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation" => {
+            "pptx"
+        }
         _ if mime.starts_with("image/") => "png",
         _ => "bin",
     }
 }
 
 /// Save a clipboard-pasted image/file into a temp path for the agent to read.
+/// `name` on the result is the **original display name** (e.g. `报告.docx`), not the temp path.
 #[tauri::command]
 async fn save_pasted_attachment(
     payload: PastedAttachmentInput,
 ) -> Result<AttachmentInput, String> {
-    let mime = payload
+    let mut mime = payload
         .mime
         .as_deref()
         .map(str::trim)
@@ -563,48 +1007,55 @@ async fn save_pasted_attachment(
         return Err("pasted file too large (max 25MB)".into());
     }
 
-    let ext = mime_to_ext(&mime);
-    let name = payload
+    // Prefer original filename; refine mime from it when browser only sent octet-stream.
+    let display_name_raw = payload
         .name
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| {
-            let stamp = chrono_like_stamp();
-            format!("paste-{stamp}.{ext}")
-        });
+        .map(|s| s.to_string());
+
+    if mime == "application/octet-stream" || mime.is_empty() {
+        if let Some(ref n) = display_name_raw {
+            if let Some(m) = mime_from_filename(n) {
+                mime = m;
+            }
+        }
+    }
+
+    let ext = mime_to_ext(&mime);
+    let display_name = display_name_raw.unwrap_or_else(|| {
+        let stamp = chrono_like_stamp();
+        format!("paste-{stamp}.{ext}")
+    });
+    // Keep original basename for the user-visible name (Word keeps 报告.docx).
+    let display_name = {
+        let leaf = display_name
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or(&display_name)
+            .trim();
+        if leaf.is_empty() {
+            format!("file.{ext}")
+        } else {
+            leaf.to_string()
+        }
+    };
 
     let dir = std::env::temp_dir().join("grokx-pastes");
     std::fs::create_dir_all(&dir).map_err(|e| format!("create paste dir: {e}"))?;
-    let safe_name = name
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect::<String>();
+    // Unique on-disk path; display name stays original.
+    let disk_name = safe_filename_for_disk(&display_name, ext);
     let path = dir.join(format!(
         "{}-{}",
         &Uuid::new_v4().to_string()[..8],
-        if safe_name.is_empty() {
-            format!("paste.{ext}")
-        } else {
-            safe_name
-        }
+        disk_name
     ));
     std::fs::write(&path, &bytes).map_err(|e| format!("write paste file: {e}"))?;
 
     Ok(AttachmentInput {
         path: path.display().to_string(),
-        name: Some(
-            path.file_name()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or(name),
-        ),
+        name: Some(display_name),
         mime: Some(mime),
         size: Some(bytes.len() as u64),
     })
@@ -731,6 +1182,385 @@ async fn session_info(core: State<'_, CoreState>) -> Result<SessionInfo, String>
     })
 }
 
+/// Whether a task still has a live agent process (can receive prompts without respawn).
+#[tauri::command]
+async fn is_session_live(
+    core: State<'_, CoreState>,
+    session_id: String,
+) -> Result<bool, String> {
+    let sid = parse_session_id(&session_id)?;
+    Ok(core.0.is_session_live(&sid).await)
+}
+
+/// Whether a task currently has a turn in progress (sidebar Working indicator).
+#[tauri::command]
+async fn is_session_busy(
+    core: State<'_, CoreState>,
+    session_id: String,
+) -> Result<bool, String> {
+    let sid = parse_session_id(&session_id)?;
+    Ok(core.0.is_session_busy(&sid).await)
+}
+
+/// All session ids with a live agent (parallel multi-task).
+#[tauri::command]
+async fn list_live_sessions(core: State<'_, CoreState>) -> Result<Vec<String>, String> {
+    Ok(core
+        .0
+        .live_session_ids()
+        .await
+        .into_iter()
+        .map(|s| s.0.to_string())
+        .collect())
+}
+
+/// Processes the agent has spawned for a task (tool shells / servers).
+#[tauri::command]
+async fn list_session_processes(
+    core: State<'_, CoreState>,
+    session_id: String,
+) -> Result<Vec<app_core::SessionProcessInfo>, String> {
+    let sid = parse_session_id(&session_id)?;
+    core.0
+        .list_session_processes(&sid)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn stop_session_process(
+    core: State<'_, CoreState>,
+    session_id: String,
+    pid: u32,
+) -> Result<(), String> {
+    let sid = parse_session_id(&session_id)?;
+    core.0
+        .stop_session_process(&sid, pid)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn pause_session_process(
+    core: State<'_, CoreState>,
+    session_id: String,
+    pid: u32,
+) -> Result<(), String> {
+    let sid = parse_session_id(&session_id)?;
+    core.0
+        .pause_session_process(&sid, pid)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn resume_session_process(
+    core: State<'_, CoreState>,
+    session_id: String,
+    pid: u32,
+) -> Result<(), String> {
+    let sid = parse_session_id(&session_id)?;
+    core.0
+        .resume_session_process(&sid, pid)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn restart_session_process(
+    core: State<'_, CoreState>,
+    session_id: String,
+    pid: u32,
+) -> Result<app_core::RestartedProcessInfo, String> {
+    let sid = parse_session_id(&session_id)?;
+    core.0
+        .restart_session_process(&sid, pid)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[derive(Debug, Serialize)]
+struct DirEntryInfo {
+    name: String,
+    path: String,
+    is_dir: bool,
+    size: Option<u64>,
+    /// ISO-ish modified time when available.
+    modified: Option<String>,
+}
+
+/// List one directory level for the Files tab (task workspace / project root).
+/// Skips hidden names (leading `.`) and caps entry count for UI.
+#[tauri::command]
+fn list_directory(
+    path: String,
+    max_entries: Option<usize>,
+) -> Result<Vec<DirEntryInfo>, String> {
+    let root = PathBuf::from(path.trim());
+    if root.as_os_str().is_empty() {
+        return Err("empty path".into());
+    }
+    if !root.is_dir() {
+        return Err(format!("not a directory: {}", root.display()));
+    }
+    let limit = max_entries.unwrap_or(200).clamp(1, 500);
+    let mut entries = Vec::new();
+    let read = std::fs::read_dir(&root).map_err(|e| format!("read_dir {}: {e}", root.display()))?;
+    for ent in read {
+        let ent = match ent {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        let name = ent.file_name().to_string_lossy().into_owned();
+        if name.starts_with('.') {
+            continue;
+        }
+        // Skip heavy / uninteresting dirs in task workspaces.
+        if name == "node_modules" || name == "target" || name == ".git" {
+            continue;
+        }
+        let path = ent.path();
+        let meta = ent.metadata().ok();
+        let is_dir = meta.as_ref().map(|m| m.is_dir()).unwrap_or(path.is_dir());
+        let size = meta.as_ref().and_then(|m| {
+            if m.is_file() {
+                Some(m.len())
+            } else {
+                None
+            }
+        });
+        let modified = meta.and_then(|m| m.modified().ok()).map(|t| {
+            match t.duration_since(std::time::UNIX_EPOCH) {
+                Ok(d) => format!("{}", d.as_secs()),
+                Err(_) => String::new(),
+            }
+        });
+        entries.push(DirEntryInfo {
+            name,
+            path: path.display().to_string(),
+            is_dir,
+            size,
+            modified: modified.filter(|s| !s.is_empty()),
+        });
+        if entries.len() >= limit {
+            break;
+        }
+    }
+    // Dirs first, then files; alphabetical within group.
+    entries.sort_by(|a, b| match (a.is_dir, b.is_dir) {
+        (true, false) => std::cmp::Ordering::Less,
+        (false, true) => std::cmp::Ordering::Greater,
+        _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+    });
+    Ok(entries)
+}
+
+#[derive(Debug, Serialize)]
+struct GitCommitRow {
+    hash: String,
+    short: String,
+    subject: String,
+    author: String,
+    relative: String,
+}
+
+#[derive(Debug, Serialize)]
+struct GitStatusInfo {
+    /// Absolute path that was queried (repo root or project/task path).
+    path: String,
+    /// True when `path` is inside a git work tree.
+    is_repo: bool,
+    branch: Option<String>,
+    /// Short HEAD sha (7 chars) when available.
+    head_short: Option<String>,
+    /// Full HEAD sha when available.
+    head: Option<String>,
+    /// Upstream tracking ref if configured.
+    upstream: Option<String>,
+    /// Working tree dirty (any unstaged/untracked/staged changes).
+    dirty: bool,
+    /// Counts from `git status --porcelain`.
+    staged: u32,
+    unstaged: u32,
+    untracked: u32,
+    /// First few porcelain lines for UI (path status).
+    changes: Vec<String>,
+    /// Recent commits on the current branch.
+    recent: Vec<GitCommitRow>,
+    /// Human-readable error if git failed (not a hard command error).
+    note: Option<String>,
+}
+
+fn run_git(cwd: &std::path::Path, args: &[&str]) -> Result<String, String> {
+    let out = std::process::Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .map_err(|e| format!("git: {e}"))?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        return Err(if err.is_empty() {
+            format!("git {:?} failed", args)
+        } else {
+            err
+        });
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// Git summary for the Outputs panel (branch, dirty files, recent commits).
+#[tauri::command]
+fn git_status(path: String) -> Result<GitStatusInfo, String> {
+    let root = PathBuf::from(path.trim());
+    if root.as_os_str().is_empty() {
+        return Err("empty path".into());
+    }
+    // Prefer directory; if a file was passed, use parent.
+    let cwd = if root.is_file() {
+        root.parent().map(|p| p.to_path_buf()).unwrap_or(root.clone())
+    } else {
+        root.clone()
+    };
+    if !cwd.exists() {
+        return Err(format!("path does not exist: {}", cwd.display()));
+    }
+
+    let is_repo = run_git(&cwd, &["rev-parse", "--is-inside-work-tree"])
+        .map(|s| s == "true")
+        .unwrap_or(false);
+
+    if !is_repo {
+        return Ok(GitStatusInfo {
+            path: cwd.display().to_string(),
+            is_repo: false,
+            branch: None,
+            head_short: None,
+            head: None,
+            upstream: None,
+            dirty: false,
+            staged: 0,
+            unstaged: 0,
+            untracked: 0,
+            changes: vec![],
+            recent: vec![],
+            note: Some("Not a git repository".into()),
+        });
+    }
+
+    let branch = run_git(&cwd, &["rev-parse", "--abbrev-ref", "HEAD"]).ok();
+    let head = run_git(&cwd, &["rev-parse", "HEAD"]).ok();
+    let head_short = head
+        .as_ref()
+        .map(|h| h.chars().take(7).collect::<String>());
+    let upstream = run_git(
+        &cwd,
+        &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"],
+    )
+    .ok();
+
+    let porcelain = run_git(&cwd, &["status", "--porcelain", "-uall"]).unwrap_or_default();
+    let mut staged = 0u32;
+    let mut unstaged = 0u32;
+    let mut untracked = 0u32;
+    let mut changes = Vec::new();
+    for line in porcelain.lines() {
+        if line.len() < 2 {
+            continue;
+        }
+        let x = line.as_bytes()[0] as char;
+        let y = line.as_bytes()[1] as char;
+        if x == '?' && y == '?' {
+            untracked += 1;
+        } else {
+            if x != ' ' && x != '?' {
+                staged += 1;
+            }
+            if y != ' ' && y != '?' {
+                unstaged += 1;
+            }
+        }
+        if changes.len() < 12 {
+            changes.push(line.to_string());
+        }
+    }
+    let dirty = staged + unstaged + untracked > 0;
+
+    let log = run_git(
+        &cwd,
+        &[
+            "log",
+            "-8",
+            "--pretty=format:%H%x09%h%x09%s%x09%an%x09%ar",
+        ],
+    )
+    .unwrap_or_default();
+    let mut recent = Vec::new();
+    for line in log.lines() {
+        let parts: Vec<&str> = line.splitn(5, '\t').collect();
+        if parts.len() < 5 {
+            continue;
+        }
+        recent.push(GitCommitRow {
+            hash: parts[0].to_string(),
+            short: parts[1].to_string(),
+            subject: parts[2].to_string(),
+            author: parts[3].to_string(),
+            relative: parts[4].to_string(),
+        });
+    }
+
+    Ok(GitStatusInfo {
+        path: cwd.display().to_string(),
+        is_repo: true,
+        branch,
+        head_short,
+        head,
+        upstream,
+        dirty,
+        staged,
+        unstaged,
+        untracked,
+        changes,
+        recent,
+        note: None,
+    })
+}
+
+/// Open a file or folder with the OS default app (Finder / Explorer / …).
+#[tauri::command]
+fn open_path(path: String) -> Result<(), String> {
+    let p = path.trim();
+    if p.is_empty() {
+        return Err("empty path".into());
+    }
+    let pb = PathBuf::from(p);
+    if !pb.exists() {
+        return Err(format!("path does not exist: {p}"));
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg(p)
+            .spawn()
+            .map_err(|e| format!("open: {e}"))?;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("cmd")
+            .args(["/C", "start", "", p])
+            .spawn()
+            .map_err(|e| format!("open: {e}"))?;
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        std::process::Command::new("xdg-open")
+            .arg(p)
+            .spawn()
+            .map_err(|e| format!("open: {e}"))?;
+    }
+    Ok(())
+}
+
 fn spawn_event_forwarder(app: AppHandle, core: Arc<AppCore>) {
     tauri::async_runtime::spawn(async move {
         let Some(mut rx) = core.take_event_receiver().await else {
@@ -806,18 +1636,24 @@ pub fn run() {
             list_sessions_for_project,
             rename_session,
             delete_session,
+            delete_project,
             save_chat_history,
             load_chat_history,
             connect_workspace,
             reconnect_session,
             send_prompt,
             send_prompt_rich,
+            send_btw,
             list_models,
             current_model,
             set_model,
             list_efforts,
             get_settings,
             save_settings,
+            test_endpoint,
+            fetch_remote_models,
+            read_grok_config,
+            write_grok_config,
             pick_attachments,
             save_pasted_attachment,
             read_clipboard_image,
@@ -825,6 +1661,17 @@ pub fn run() {
             resolve_permission,
             permission_is_pending,
             session_info,
+            is_session_live,
+            is_session_busy,
+            list_live_sessions,
+            list_session_processes,
+            stop_session_process,
+            pause_session_process,
+            resume_session_process,
+            restart_session_process,
+            list_directory,
+            open_path,
+            git_status,
         ])
         .run(tauri::generate_context!())
         .expect("error while running grokx desktop");

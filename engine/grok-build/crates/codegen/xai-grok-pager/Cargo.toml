@@ -1,6 +1,6 @@
 [package]
 name = "xai-grok-pager"
-version = "0.1.220-alpha.4"
+version = "0.2.114"
 edition.workspace = true
 license = "Apache-2.0"
 authors = ["xAI"]
@@ -54,6 +54,7 @@ portable-pty = "0.9"
 # Utilities
 derive_more = { workspace = true, features = ["deref", "deref_mut"] }
 anyhow = { workspace = true }
+shlex = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 clap_complete = { workspace = true }
 rand = { workspace = true }
@@ -160,8 +161,8 @@ core-foundation = { workspace = true }
 windows-sys = { version = "0.59", features = ["Win32_System_Console"] }
 
 [dev-dependencies]
-# Enable the render crate's test-only helpers for the pager's test build.
-xai-grok-pager-render = { path = "../xai-grok-pager-render", features = [] }
+xai-grok-pager-render = { path = "../xai-grok-pager-render", features = ["test-support"] }
+xai-grok-shell = { workspace = true, features = ["test-support"] }
 pretty_assertions = { workspace = true }
 insta = { workspace = true }
 criterion = { workspace = true }
@@ -195,13 +196,48 @@ harness = false
 name = "edit_highlight"
 harness = false
 
-# Integration testing.
+# PTY integration tests are split into coherent scheduling families. The test
+# modules remain under tests/pty_e2e/; these roots only define which cases share
+# one Cargo/Bazel process. All cases stay #[ignore]d for ordinary Cargo runs.
+# Selected Cargo runs must provide PAGER_BINARY; Bazel wires the sibling binary.
 [[test]]
-name = "pty_e2e"
-path = "tests/pty_e2e/mod.rs"
+name = "doctor_early_dispatch"
+path = "tests/doctor_early_dispatch.rs"
 
-# Leader-mode PTY e2e — split from pty_e2e so multi-process cluster bring-up
-# never contends with the main PTY pool (the LEADER_TIMEOUT flake root).
+[[test]]
+name = "pty_e2e_smoke"
+path = "tests/pty_e2e_smoke.rs"
+
+[[test]]
+name = "pty_e2e_queue"
+path = "tests/pty_e2e_queue.rs"
+
+[[test]]
+name = "pty_e2e_scroll_selection"
+path = "tests/pty_e2e_scroll_selection.rs"
+
+[[test]]
+name = "pty_e2e_minimal"
+path = "tests/pty_e2e_minimal.rs"
+
+[[test]]
+name = "pty_e2e_config_ui"
+path = "tests/pty_e2e_config_ui.rs"
+
+[[test]]
+name = "pty_e2e_shell_tools"
+path = "tests/pty_e2e_shell_tools.rs"
+
+[[test]]
+name = "pty_e2e_persistence"
+path = "tests/pty_e2e_persistence.rs"
+
+[[test]]
+name = "pty_e2e_clipboard"
+path = "tests/pty_e2e_clipboard.rs"
+
+# Leader-mode PTY e2e — split from ordinary PTY families so multi-process
+# cluster bring-up never contends with their bounded pools.
 [[test]]
 name = "leader_pty_e2e"
 path = "tests/leader_pty_e2e/mod.rs"
@@ -238,11 +274,18 @@ path = "src/bin/question_view_playground.rs"
 name = "todo-pane-playground"
 path = "src/bin/todo_pane_playground.rs"
 
+# Opt into [workspace.lints.clippy] (too_many_arguments etc.). Without this,
+# `cargo clippy --workspace -- -D warnings` on this package is stricter than
+# the workspace-default clippy allows used in CI.
+[lints]
+workspace = true
+
 [features]
 default = ["jemalloc", "sandbox-enforce"]
 default-bazel = [
     "jemalloc",
     "sandbox-enforce",
+    "test-support",
     ]
 # No-op on this crate: the actual `#[global_allocator]` (and the
 # `tikv-jemallocator` dep) live on the composition-root binary
@@ -252,3 +295,7 @@ default-bazel = [
 jemalloc = []
 sandbox-enforce = ["xai-grok-sandbox/enforce"]
 release-dist = []
+# Exposes test-only view-model constructors/setters (e.g. `test_agent_view`,
+# `AgentSession::set_yolo_mode_for_test`) to sibling crates' test builds — used
+# by `xai-grok-pager-minimal`'s unit tests. Never enabled in production builds.
+test-support = ["xai-grok-pager-render/test-support"]

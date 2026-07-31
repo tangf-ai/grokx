@@ -37,7 +37,7 @@ use xai_grok_tools::types::{
     tool::{ToolKind, ToolNamespace},
     tool_metadata::ToolMetadata,
 };
-use xai_grok_tools::util::ProcessGroup;
+use xai_grok_tools::util::{ProcessGroup, ProcessScope};
 
 /// MCP tool name delimiter: server names are qualified as `"server__tool"`.
 /// Canonical definition lives in `xai_grok_workspace_types`; re-exported here
@@ -1044,15 +1044,31 @@ pub fn parse_mcp_meta_config(
 /// here so existing call sites continue to work.
 pub use xai_grok_telemetry::enums::McpInitStrategy;
 
-/// Parse MCP tool name in format "server__tool"
-/// Returns (server_name, tool_name) if valid MCP tool, None otherwise
-pub fn parse_mcp_tool_name(name: &str) -> Option<(String, String)> {
-    let parts: Vec<&str> = name.splitn(2, MCP_TOOL_NAME_DELIMITER).collect();
-    if parts.len() == 2 {
-        Some((parts[0].to_string(), parts[1].to_string()))
-    } else {
-        None
+/// Parse a non-empty `server__tool` ID with one overlap-aware delimiter and
+/// valid [`xai_tool_protocol::ToolId`] syntax.
+pub fn parse_mcp_qualified_name(name: &str) -> Option<(xai_tool_protocol::ToolId, &str, &str)> {
+    let delimiter = MCP_TOOL_NAME_DELIMITER.as_bytes();
+    // Byte windows preserve both overlapping `__` boundaries in `___`.
+    let mut boundaries = name
+        .as_bytes()
+        .windows(delimiter.len())
+        .enumerate()
+        .filter_map(|(index, window)| (window == delimiter).then_some(index));
+    let boundary = boundaries.next()?;
+    if boundaries.next().is_some() {
+        return None;
     }
+    let (server, tool_with_delimiter) = name.split_at(boundary);
+    let tool = &tool_with_delimiter[MCP_TOOL_NAME_DELIMITER.len()..];
+    if server.is_empty() || tool.is_empty() {
+        return None;
+    }
+    Some((xai_tool_protocol::ToolId::new(name).ok()?, server, tool))
+}
+
+/// Parse an MCP tool name in `server__tool` format into owned segments.
+pub fn parse_mcp_tool_name(name: &str) -> Option<(String, String)> {
+    parse_mcp_qualified_name(name).map(|(_, server, tool)| (server.to_owned(), tool.to_owned()))
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1237,36 +1253,24 @@ impl McpTool {
 
     /// Convert into the data needed for `ToolBridge::register_erased()`.
     ///
-    /// Returns `None` if the tool name is invalid (doesn't match LLM API requirements).
-    /// Invalid tools are logged and skipped — fix the upstream connector.
-    ///
-    /// Also rejects qualified names that contain the delimiter
-    /// (`MCP_TOOL_NAME_DELIMITER`) more than once. The underlying tool-name
-    /// regex permits underscores in each segment, so a server like
-    /// `"foo__bar"`, a tool like `"my__thing"`, or even a `"foo_"`/`"_bar"`
-    /// pair (which concatenates to `"foo___bar"` — two valid `__`
-    /// positions) would produce a qualified name that downstream
-    /// `split_once("__")` consumers would split at the wrong boundary.
-    /// The "exactly one delimiter" check covers all three cases with a
-    /// single rule.
+    /// Invalid or ambiguous qualified IDs and provider-invalid names are logged
+    /// and skipped; the upstream connector must provide non-empty `server` and
+    /// `tool` segments separated by exactly one `__` boundary.
     pub fn into_registration(self) -> Option<McpToolRegistration> {
-        // Qualify MCP tool name with server name: "server__tool"
         let qualified_name = format!(
             "{}{}{}",
             self.server_name, MCP_TOOL_NAME_DELIMITER, self.name
         );
 
-        // Reject ambiguous qualified names — see doc-comment above.
-        if qualified_name.matches(MCP_TOOL_NAME_DELIMITER).count() != 1 {
+        if parse_mcp_qualified_name(&qualified_name).is_none() {
             tracing::error!(
                 server = %self.server_name,
                 tool = %self.name,
                 qualified = %qualified_name,
-                "Skipping MCP tool: qualified name contains '{MCP_TOOL_NAME_DELIMITER}' more than once (server, tool, or their boundary collides with the reserved delimiter)"
+                "Skipping MCP tool with invalid or ambiguous qualified name"
             );
             return None;
         }
-
         if let Err(reason) = validate_tool_name(&qualified_name) {
             tracing::error!(
                 tool_name = %qualified_name,
@@ -2013,16 +2017,19 @@ where
 /// grandchildren (e.g. `npx` -> `node`) before reaping the leader.
 pub struct SafeTokioChildProcess {
     child: Option<tokio::process::Child>,
-    process_group: Option<ProcessGroup>,
+    /// Strong `Arc` owner; the scope holds only a `Weak`, dropped on reap.
+    process_group: Option<Arc<ProcessGroup>>,
     transport: ResilientRwTransport<tokio::process::ChildStdout, tokio::process::ChildStdin>,
 }
 
 impl SafeTokioChildProcess {
     /// `server_name` + `event_writer` are threaded into the transport so a
     /// skipped (undecodable) stdout line emits an `McpTransportDecodeError`
-    /// event for that server.
+    /// event for that server. `scope`, when set, enrolls the child's group for
+    /// session-close reaping.
     fn spawn(
         mut cmd: Command,
+        scope: Option<&ProcessScope>,
         server_name: String,
         event_writer: xai_file_utils::events::EventWriter,
     ) -> std::io::Result<(Self, Option<ChildStderr>)> {
@@ -2044,7 +2051,7 @@ impl SafeTokioChildProcess {
         // Best-effort: a missing group just degrades to direct-child-only cleanup.
         let process_group = match ProcessGroup::new() {
             Ok(mut group) => match group.attach(&child) {
-                Ok(()) => Some(group),
+                Ok(()) => Some(Arc::new(group)),
                 Err(e) => {
                     tracing::warn!("Failed to attach MCP child to process group: {e}");
                     None
@@ -2055,6 +2062,30 @@ impl SafeTokioChildProcess {
                 None
             }
         };
+        // Enrollment ties this child to the *spawning* session's lifetime.
+        // `SharedMcpPool` may hand the resulting client Arc to subagent
+        // sessions, but subagents inherit the root session's scope, so the
+        // root's kill_all cannot strand an in-tree subagent. Residual: any
+        // detached holder of the Arc loses the transport when the spawning
+        // session closes — session close is deliberately the reap boundary.
+        if let (Some(scope), Some(group)) = (scope, process_group.as_ref())
+            && !scope.register(group)
+        {
+            // The scope latched closed (spawn raced session teardown), so
+            // `register` already killpg'd the child. Fail fast with a clear
+            // error instead of proceeding into a doomed rmcp handshake; the
+            // reap below mirrors `Drop`'s best-effort leader cleanup.
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move {
+                    let _ = child.kill().await;
+                });
+            } else if let Err(e) = child.start_kill() {
+                tracing::warn!("Error signaling MCP child killed by closed scope: {e}");
+            }
+            return Err(std::io::Error::other(
+                "session is closing (process scope already reclaimed); MCP server not started",
+            ));
+        }
 
         Ok((
             Self {
@@ -4039,14 +4070,45 @@ fn stdio_path_override(env: &[acp::EnvVariable]) -> Option<&str> {
         .map(|e| e.value.as_str())
 }
 
+/// Borrowed cross-cutting spawn context whose `scope`, when set, enrolls the stdio child for session-close reaping.
+pub struct McpSpawnCtx<'a> {
+    pub(crate) session_id: Option<&'a str>,
+    pub(crate) event_writer: &'a xai_file_utils::events::EventWriter,
+    pub(crate) mode: OauthInteractivity,
+    pub(crate) scope: Option<&'a ProcessScope>,
+}
+
+impl<'a> McpSpawnCtx<'a> {
+    pub fn for_session(
+        session_id: &'a str,
+        event_writer: &'a xai_file_utils::events::EventWriter,
+        mode: OauthInteractivity,
+        scope: Option<&'a ProcessScope>,
+    ) -> Self {
+        Self {
+            session_id: Some(session_id),
+            event_writer,
+            mode,
+            scope,
+        }
+    }
+
+    pub fn session_less(event_writer: &'a xai_file_utils::events::EventWriter) -> Self {
+        Self {
+            session_id: None,
+            event_writer,
+            mode: OauthInteractivity::Interactive,
+            scope: None,
+        }
+    }
+}
+
 pub async fn start_mcp_server(
     mcp_server: acp::McpServer,
-    session_id: Option<&str>,
     overrides: Option<&McpClientTimeoutOverrides>,
     meta_config: Option<&McpServerMetaConfig>,
     byo_config: Option<&McpOAuthConfig>,
-    event_writer: &xai_file_utils::events::EventWriter,
-    mode: OauthInteractivity,
+    ctx: &McpSpawnCtx<'_>,
 ) -> Result<McpClient, McpError> {
     let _per_server_timer = xai_grok_telemetry::instrumentation::timer("mcp_start_one_server");
     match mcp_server {
@@ -4082,24 +4144,27 @@ pub async fn start_mcp_server(
             }
             xai_grok_tools::util::detach_command(&mut cmd);
 
-            let (transport, stderr_handle) =
-                SafeTokioChildProcess::spawn(cmd, name.clone(), event_writer.clone()).map_err(
-                    |e| {
-                        tracing::error!("Failed to spawn MCP server '{}': {}", name, e);
-                        xai_grok_telemetry::session_ctx::log_event(
-                            xai_grok_telemetry::events::McpServerFailed {
-                                server_name: name.clone(),
-                                error_type: xai_grok_telemetry::events::McpErrorType::SpawnFailed,
-                                duration_ms: spawn_start.elapsed().as_millis() as u64,
-                                timeout_sec: startup_timeout,
-                            },
-                        );
-                        McpError::SpawnFailed {
-                            server: name.clone(),
-                            source: e,
-                        }
+            let (transport, stderr_handle) = SafeTokioChildProcess::spawn(
+                cmd,
+                ctx.scope,
+                name.clone(),
+                ctx.event_writer.clone(),
+            )
+            .map_err(|e| {
+                tracing::error!("Failed to spawn MCP server '{}': {}", name, e);
+                xai_grok_telemetry::session_ctx::log_event(
+                    xai_grok_telemetry::events::McpServerFailed {
+                        server_name: name.clone(),
+                        error_type: xai_grok_telemetry::events::McpErrorType::SpawnFailed,
+                        duration_ms: spawn_start.elapsed().as_millis() as u64,
+                        timeout_sec: startup_timeout,
                     },
-                )?;
+                );
+                McpError::SpawnFailed {
+                    server: name.clone(),
+                    source: e,
+                }
+            })?;
 
             tracing::debug!("MCP server '{}' spawned: PID={:?}", name, transport.id());
 
@@ -4124,7 +4189,7 @@ pub async fn start_mcp_server(
                 tracing::info!(server = %name, %url, ?mc, "MCP http: meta config override");
             }
 
-            let headers = expand_session_id_headers(headers, session_id);
+            let headers = expand_session_id_headers(headers, ctx.session_id);
             let http_config = HttpConfig {
                 url: url.clone(),
                 headers,
@@ -4146,7 +4211,7 @@ pub async fn start_mcp_server(
                     xai_grok_telemetry::instrumentation::timer("mcp_http_auth_discovery");
                 match tokio::time::timeout(
                     OAUTH_DISCOVERY_TIMEOUT,
-                    discover_and_prepare_auth(&name, &url, mode),
+                    discover_and_prepare_auth(&name, &url, ctx.mode),
                 )
                 .await
                 {
@@ -4155,17 +4220,17 @@ pub async fn start_mcp_server(
                         tracing::warn!(
                             server = %name,
                             url = %url,
-                            ?mode,
+                            mode = ?ctx.mode,
                             timeout_secs = OAUTH_DISCOVERY_TIMEOUT.as_secs(),
                             "OAuth discovery timed out"
                         );
-                        event_writer.emit(
+                        ctx.event_writer.emit(
                             xai_file_utils::events::Event::McpOAuthDiscoveryTimeout {
                                 server_name: name.clone(),
                                 url: url.clone(),
                             },
                         );
-                        HttpOauthPrep::on_probe_failure(mode)
+                        HttpOauthPrep::on_probe_failure(ctx.mode)
                     }
                 }
             };
@@ -4199,12 +4264,10 @@ pub async fn start_mcp_server(
 
 pub async fn start_mcp_servers(
     mcp_servers: Vec<acp::McpServer>,
-    session_id: Option<&str>,
     overrides_map: &HashMap<String, McpClientTimeoutOverrides>,
     meta_config_map: &McpMetaConfigMap,
     oauth_config_map: &crate::oauth_config::McpOAuthConfigMap,
-    event_writer: &xai_file_utils::events::EventWriter,
-    mode: OauthInteractivity,
+    ctx: &McpSpawnCtx<'_>,
 ) -> Vec<Result<McpClient, McpError>> {
     let _mcp_start_timer = xai_grok_telemetry::instrumentation::timer("mcp_start_servers");
 
@@ -4222,7 +4285,7 @@ pub async fn start_mcp_servers(
             let overrides = overrides_map.get(server_name);
             let mc = meta_config_map.get(server_name);
             let byo = oauth_config_map.get(server_name);
-            start_mcp_server(server, session_id, overrides, mc, byo, event_writer, mode)
+            start_mcp_server(server, overrides, mc, byo, ctx)
         })
         .buffer_unordered(8)
         .collect::<Vec<_>>()
@@ -4581,6 +4644,7 @@ mod tests {
             xai_grok_tools::util::detach_command(&mut cmd);
             let (transport, _stderr) = SafeTokioChildProcess::spawn(
                 cmd,
+                None,
                 "test".to_string(),
                 xai_file_utils::events::EventWriter::noop(),
             )
@@ -4610,6 +4674,55 @@ mod tests {
             return true;
         }
         std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+    }
+
+    /// `scope.kill_all()` reaps an enrolled MCP child even when its owner never
+    /// runs Drop. Non-vacuous: dropping the `Some(&scope)` enrollment makes this
+    /// time out.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn scope_kill_all_reaps_enrolled_mcp_child_while_owner_wedged() {
+        use std::time::Duration;
+
+        let scope = ProcessScope::new();
+
+        let mut cmd = Command::new("sleep");
+        cmd.arg("600").kill_on_drop(true);
+        xai_grok_tools::util::detach_command(&mut cmd);
+        let (mut child_process, _stderr) = SafeTokioChildProcess::spawn(
+            cmd,
+            Some(&scope),
+            "wedge-test".to_string(),
+            xai_file_utils::events::EventWriter::noop(),
+        )
+        .expect("spawn enrolled MCP child");
+        assert_eq!(
+            scope.live_count(),
+            1,
+            "the enrolled MCP child group must be tracked by the scope"
+        );
+
+        // Wedge: owner never runs Drop, so kill_all is the only reclaim path.
+        scope.kill_all();
+
+        // Take only the handle, not the group, so kill-on-drop can't mask a
+        // missing enrollment.
+        let mut child = child_process.child.take().expect("child handle present");
+        // Null the strong Arc<ProcessGroup> before reaping the leader below:
+        // holding it across the reap would let `child_process`'s later Drop
+        // killpg a reusable pgid — the PID-reuse pattern the Weak ownership
+        // contract exists to prevent.
+        child_process.process_group = None;
+        let status = tokio::time::timeout(Duration::from_secs(5), child.wait())
+            .await
+            .expect("scope.kill_all must have SIGKILL'd the enrolled MCP child group")
+            .expect("wait on the reclaimed child succeeds");
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(
+            status.signal(),
+            Some(libc::SIGKILL),
+            "the MCP child must have been SIGKILL'd by the scope, not have exited cleanly"
+        );
     }
 
     #[test]
@@ -5720,28 +5833,83 @@ mod tests {
     }
 
     #[test]
-    fn into_registration_accepts_well_formed_segments() {
-        // Positive guard: the count check rejects `__`-anywhere-but-the-delimiter
-        // names but must not reject legitimate ones. If the rejection rule is
-        // ever tightened too far, this test breaks before any of the negative
-        // cases below.
-        let tool = make_mcp_tool("linear", "list_issues");
-        let reg = tool.into_registration().expect("should register");
-        assert_eq!(reg.name, "linear__list_issues");
+    fn qualified_mcp_name_parser_accepts_structurally_valid_tool_ids() {
+        for (name, expected) in [
+            ("linear__list_issues", ("linear", "list_issues")),
+            ("123__lookup", ("123", "lookup")),
+            ("server:scope__tool", ("server:scope", "tool")),
+        ] {
+            let (id, server, tool) = parse_mcp_qualified_name(name).expect("valid qualified ID");
+            assert_eq!(id.as_str(), name);
+            assert_eq!((server, tool), expected);
+            assert_eq!(
+                parse_mcp_tool_name(name),
+                Some((expected.0.to_owned(), expected.1.to_owned()))
+            );
+        }
     }
 
     #[test]
-    fn into_registration_rejects_boundary_ambiguity() {
-        // `"foo_"` + `"__"` + `"_bar"` => `"foo___bar"` has two valid
-        // `__` positions (indices 3 and 4), so `split_once("__")` would
-        // misparse it as `("foo", "_bar")` and silently auto-allow a
-        // future legitimate `"foo"` server. The naïve per-segment check
-        // (each side individually has no `__`) misses this — the count
-        // check catches it. Same rule also rejects "__-in-segment" cases
-        // (`"weird__server"` + `"list"`, `"linear"` + `"my__weird__tool"`)
-        // which are covered by the same `count() != 1` line of code.
-        let tool = make_mcp_tool("foo_", "_bar");
-        assert!(tool.into_registration().is_none());
+    fn qualified_mcp_name_parser_rejects_malformed_names() {
+        for name in [
+            "server__part__tool",
+            "server__tool__part",
+            "foo___bar",
+            "foo____bar",
+            "__tool",
+            "server__",
+            "server",
+            "",
+            "server__bad.tool",
+        ] {
+            assert!(
+                parse_mcp_qualified_name(name).is_none(),
+                "unexpectedly accepted {name:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn into_registration_validates_qualified_name() {
+        let registration = make_mcp_tool("linear", "list_issues")
+            .into_registration()
+            .expect("should register");
+        assert_eq!(registration.name, "linear__list_issues");
+
+        for (server, tool) in [
+            ("server__part", "tool"),
+            ("server", "tool__part"),
+            ("foo_", "bar"),
+            ("foo", "_bar"),
+            ("foo_", "_bar"),
+            ("", "tool"),
+            ("server", ""),
+        ] {
+            assert!(
+                make_mcp_tool(server, tool).into_registration().is_none(),
+                "unexpectedly registered {server:?} and {tool:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn into_registration_preserves_provider_name_policy() {
+        for qualified in ["123__lookup", "server:scope__tool"] {
+            assert!(parse_mcp_qualified_name(qualified).is_some());
+            let (server, tool) = qualified.split_once("__").unwrap();
+            assert!(make_mcp_tool(server, tool).into_registration().is_none());
+        }
+
+        let server_61 = format!("a{}", "b".repeat(60));
+        let server_62 = format!("a{}", "b".repeat(61));
+        let valid_64 = format!("{server_61}__b");
+        let invalid_65 = format!("{server_62}__b");
+        assert_eq!(valid_64.len(), 64);
+        assert_eq!(invalid_65.len(), 65);
+        assert!(parse_mcp_qualified_name(&valid_64).is_some());
+        assert!(parse_mcp_qualified_name(&invalid_65).is_some());
+        assert!(make_mcp_tool(&server_61, "b").into_registration().is_some());
+        assert!(make_mcp_tool(&server_62, "b").into_registration().is_none());
     }
 
     // ── is_retriable_transport_error tests ───────────────────────────

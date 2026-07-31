@@ -27,7 +27,15 @@ mod dispatch;
 /// Display-refresh probe + motion cadence + terminal telemetry at startup.
 mod display_refresh_startup;
 mod effects;
+pub mod roster;
+pub mod session_startup;
+pub(crate) mod session_title_resolve;
+pub mod status_blocks;
+pub mod subagent;
+pub mod subscription;
+pub(crate) use effects::sanitize_user_error;
 mod event_loop;
+pub(crate) mod external_editor;
 mod foreign_sessions;
 mod inline_edit;
 #[cfg(all(test, unix))]
@@ -35,19 +43,14 @@ mod leader_cluster;
 mod modals;
 mod mouse;
 mod queue_edit;
-pub mod roster;
 pub(crate) mod screen_mode_relaunch;
-pub mod session_startup;
-mod signal_handler;
-pub mod status_blocks;
-pub mod subagent;
-pub mod subscription;
+pub mod signal_handler;
 mod turn_completion;
 mod xt_filter;
-pub(crate) use crate::terminal::kitty_flags_pushed;
+pub(crate) use crate::terminal::{kitty_flags_pushed, kitty_releases_reported};
 pub use cli::{
-    AgentArgs, AgentCmd, Command, HeadlessArgs, LeaderArgs, LeaderTargetArgs, OutputFormat,
-    PagerArgs, ServeArgs, WrapArgs,
+    AgentArgs, AgentCmd, Command, HeadlessArgs, LeaderArgs, LeaderMgmtArgs, LeaderMgmtCommand,
+    LeaderTargetArgs, OutputFormat, PagerArgs, ServeArgs, WrapArgs,
 };
 pub use cli::{WorkspaceMgmtArgs, WorkspaceMgmtCommand, WorkspaceStartArgs};
 use crossterm::cursor::{self, SetCursorStyle};
@@ -56,7 +59,6 @@ use crossterm::execute;
 use crossterm::terminal::{
     self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, SetTitle,
 };
-pub(crate) use dispatch::{FREE_USAGE_USER_MESSAGE, acp_error_is_free_usage_exhausted};
 pub use foreign_sessions::ForeignScanCoordinator;
 pub(crate) use foreign_sessions::{
     badge_for_picker_source, foreign_tool_display_label, is_foreign_picker_source,
@@ -68,8 +70,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tokio_util::sync::CancellationToken;
 use xai_grok_shell::util::config;
 /// Tracks the extra Kitty keyboard layer pushed while the `/gboom` game is
-/// open (see [`push_gboom_keyboard_flags`]). Kept separate from
-/// `KITTY_FLAGS_PUSHED` so teardown pops both, in LIFO order.
+/// open (see [`push_gboom_keyboard_flags`]). Kept separate from the base layer
+/// (`terminal::kitty_keyboard`) so teardown pops both, in LIFO order.
 static GBOOM_KEYBOARD_PUSHED: AtomicBool = AtomicBool::new(false);
 /// While the `/gboom` game owns input, additionally request
 /// `REPORT_ALL_KEYS_AS_ESCAPE_CODES` so plain letter keys (WASD) emit
@@ -107,6 +109,15 @@ static MINIMAL_AUTO_SET_FOR_MOUSE_LEAK: AtomicBool = AtomicBool::new(false);
 pub fn minimal_auto_set_for_mouse_leak() -> bool {
     MINIMAL_AUTO_SET_FOR_MOUSE_LEAK.load(Ordering::Acquire)
 }
+/// Set after a `/minimal` re-exec that actually stayed minimal (idle-status cue).
+static MINIMAL_SHOW_SWITCH_BACK_TO_FULLSCREEN: AtomicBool = AtomicBool::new(false);
+pub fn minimal_show_switch_back_to_fullscreen() -> bool {
+    MINIMAL_SHOW_SWITCH_BACK_TO_FULLSCREEN.load(Ordering::Acquire)
+}
+#[cfg(any(test, feature = "test-support"))]
+pub fn set_minimal_show_switch_back_to_fullscreen_for_test(on: bool) {
+    MINIMAL_SHOW_SWITCH_BACK_TO_FULLSCREEN.store(on, Ordering::Release);
+}
 /// Whether startup actually applied a forced cursor style. Teardown (and the
 /// panic hook, which can't thread parameters) resets the style only when
 /// true: under inherit, `0 q` would clobber a shell-chosen style.
@@ -135,6 +146,19 @@ pub(crate) fn minimal_mode_active() -> bool {
 pub(crate) fn set_minimal_mode_active_for_test(on: bool) {
     MINIMAL_MODE_ACTIVE.store(on, Ordering::Release);
 }
+/// Whether a bare Esc cancels a running turn: minimal mode and non-vim
+/// fullscreen get the single-Esc cancel; fullscreen vim mode keeps the
+/// mid-turn swallow (Ctrl+C stays the cancel gesture there).
+///
+/// Pure over its inputs — production callers pass the agent's injected
+/// effective screen mode (`AgentView::is_minimal_mode`, seeded by
+/// `apply_app_scoped_gates`; never the [`minimal_mode_active`] process
+/// global) and tests pass explicit booleans. `vim_mode` is the
+/// scrollback-nav setting (`[ui].vim_mode` / `/vim-mode`), not the prompt
+/// `simple_mode`.
+pub(crate) fn esc_cancels_turn(is_minimal: bool, vim_mode: bool) -> bool {
+    is_minimal || !vim_mode
+}
 /// Whether the opt-in mouse-reporting toggle feature is enabled
 /// (`[ui] mouse_reporting_toggle` / `GROK_MOUSE_REPORTING_TOGGLE`). Seeded once
 /// at startup; gates both the `Ctrl+R` shortcut registration and the
@@ -145,56 +169,103 @@ pub(crate) static MOUSE_REPORTING_TOGGLE_ENABLED: AtomicBool = AtomicBool::new(f
 pub(crate) fn mouse_reporting_toggle_enabled() -> bool {
     MOUSE_REPORTING_TOGGLE_ENABLED.load(Ordering::Acquire)
 }
-/// Whether voice mode is available (GA default on; remote/`GROK_VOICE_MODE` can
-/// kill or force). Mirrored from
-/// [`crate::app::app_view::AppView::apply_voice_mode_enabled`] so view-layer
-/// code that has no `AppView` handle — the shortcuts cheatsheet — can hide
-/// voice UI when the kill switch is active. Kept in sync on every gate change
-/// (startup + remote settings updates).
-///
-/// Only `apply_voice_mode_enabled` writes it, so tests that gate UI on voice
-/// must drive the flag through that method — setting `AppView::voice_mode_enabled`
-/// directly leaves this stale.
+/// Process-global voice gate for view code without an `AppView`.
+/// Written only by [`crate::app::app_view::AppView::apply_voice_mode_enabled`].
 pub(crate) static VOICE_MODE_ENABLED: AtomicBool = AtomicBool::new(false);
-/// Read the cached voice-mode gate (see [`VOICE_MODE_ENABLED`]).
 pub(crate) fn voice_mode_enabled() -> bool {
     VOICE_MODE_ENABLED.load(Ordering::Acquire)
 }
-/// Resolve whether voice mode is enabled from layered sources.
+/// Test helper for the process-global voice gate.
+pub fn set_voice_mode_enabled_for_test(on: bool) {
+    VOICE_MODE_ENABLED.store(on, Ordering::Release);
+}
+/// Process-global gate for the Ctrl+Space / F8 voice chord, for key-routing
+/// and view code without an `AppView` (`resolve_action`, the cheatsheet).
+/// Default ON. Seeded at startup from `[ui].voice_keybind_enabled` and
+/// updated live by the settings setter; unlike [`VOICE_MODE_ENABLED`] it only
+/// silences the keybinding — `/voice` and the other voice surfaces stay up.
+pub(crate) static VOICE_KEYBIND_ENABLED: AtomicBool = AtomicBool::new(true);
+pub(crate) fn voice_keybind_enabled() -> bool {
+    VOICE_KEYBIND_ENABLED.load(Ordering::Acquire)
+}
+/// Test helper for the process-global voice-keybind gate.
+pub fn set_voice_keybind_enabled_for_test(on: bool) {
+    VOICE_KEYBIND_ENABLED.store(on, Ordering::Release);
+}
+/// `[features] voice_mode` from merged `requirements.toml`.
+pub(crate) fn voice_mode_requirement_pin() -> Option<bool> {
+    xai_grok_config::load_merged_requirements().and_then(|req| {
+        req.get("features")
+            .and_then(|f| f.get("voice_mode"))
+            .and_then(|v| v.as_bool())
+    })
+}
+/// `[features] voice_mode` from effective config (user + managed).
+pub(crate) fn voice_mode_config_value() -> Option<bool> {
+    xai_grok_shell::config::load_effective_config()
+        .ok()
+        .and_then(|cfg| {
+            cfg.get("features")
+                .and_then(|f| f.get("voice_mode"))
+                .and_then(|v| v.as_bool())
+        })
+}
+/// Resolve voice availability.
 ///
-/// Precedence: `env` override (`GROK_VOICE_MODE`) > `remote` (`voice_mode_enabled`)
-/// > default **on**. Remote `Some(false)` is a kill switch; `None` means GA
-/// default (on). Free-tier SuperGrok upsell for `/voice` / Ctrl+Space is a
-/// separate gate (`is_voice_tier_restricted`).
-pub(crate) fn resolve_voice_mode_enabled(env: Option<bool>, remote: Option<bool>) -> bool {
-    env.or(remote).unwrap_or(true)
+/// Precedence: requirements > `GROK_VOICE_MODE` > config/managed
+/// `[features] voice_mode` > remote `voice_mode_enabled` > default on.
+///
+/// When `is_api_key` and the only off-source is remote, force on. Requirement /
+/// env / config `false` still wins.
+pub(crate) fn resolve_voice_mode_enabled(
+    requirement: Option<bool>,
+    config: Option<bool>,
+    remote: Option<bool>,
+    is_api_key: bool,
+) -> bool {
+    use xai_grok_shell::agent::config::{BoolFlag, ConfigSource};
+    let resolved = BoolFlag::env("GROK_VOICE_MODE")
+        .requirement(requirement)
+        .config(config)
+        .feature_flag(remote)
+        .default(true)
+        .resolve();
+    if resolved.value {
+        return true;
+    }
+    is_api_key && resolved.source == ConfigSource::Remote
+}
+/// Resolve from live policy + env + remote + API-key state.
+pub(crate) fn resolve_voice_mode_live(remote: Option<bool>, is_api_key: bool) -> bool {
+    resolve_voice_mode_enabled(
+        voice_mode_requirement_pin(),
+        voice_mode_config_value(),
+        remote,
+        is_api_key,
+    )
 }
 #[cfg(test)]
 mod voice_gate_tests {
     use super::resolve_voice_mode_enabled;
     #[test]
-    fn voice_defaults_on_when_env_and_remote_absent() {
-        assert!(resolve_voice_mode_enabled(None, None));
+    fn api_key_force_on_over_remote_kill_only() {
+        assert!(resolve_voice_mode_enabled(None, None, Some(false), true));
+        assert!(!resolve_voice_mode_enabled(None, None, Some(false), false));
     }
     #[test]
-    fn voice_remote_false_is_kill_switch() {
-        assert!(!resolve_voice_mode_enabled(None, Some(false)));
-    }
-    #[test]
-    fn voice_remote_true_enables() {
-        assert!(resolve_voice_mode_enabled(None, Some(true)));
-    }
-    #[test]
-    fn voice_env_overrides_remote_kill_switch() {
-        assert!(resolve_voice_mode_enabled(Some(true), Some(false)));
-    }
-    #[test]
-    fn voice_env_force_off_overrides_remote_true() {
-        assert!(!resolve_voice_mode_enabled(Some(false), Some(true)));
-    }
-    #[test]
-    fn voice_env_force_off_overrides_default_on() {
-        assert!(!resolve_voice_mode_enabled(Some(false), None));
+    fn policy_false_outranks_api_key_force_on() {
+        assert!(!resolve_voice_mode_enabled(
+            Some(false),
+            Some(true),
+            Some(true),
+            true
+        ));
+        assert!(!resolve_voice_mode_enabled(
+            None,
+            Some(false),
+            Some(false),
+            true
+        ));
     }
 }
 /// Sticky banner shown while mouse reporting is off, telling the user how to
@@ -303,38 +374,132 @@ fn finish_theme_after_probe(requested_minimal: bool, effective_mode: ScreenMode)
 pub(crate) struct ExitInfo {
     pub session_id: String,
     pub minimal: bool,
+    /// Glanceable session tail; `Some` exactly when it should print. The
+    /// presence policy lives at the sole construction site, `make_run_result`.
+    pub summary: Option<ExitSummary>,
 }
-/// Resolve leader mode → `(use_leader, policy_disable_reason)`.
+/// Session tail printed above the resume command on fullscreen quits.
+///
+/// Invariant: every field is a pre-sanitized single line (built from the
+/// `views::session_title` helpers), so the printer only width-truncates.
+pub(crate) struct ExitSummary {
+    /// Display title (rename > generated > first prompt).
+    pub title: String,
+    pub last_prompt: Option<String>,
+    /// `None` when the newest prompt is still unanswered.
+    pub last_response: Option<String>,
+}
+/// Resolve leader mode, reporting both why it is off and what turned it off.
+///
+/// Precedence (highest first): `--no-leader` → `--leader` → eligibility → local
+/// config `use_leader` → remote `leader_mode` (release-dist) → default off.
+/// `requested_confinement` then vetoes leader use when `Some` (in-process tools
+/// stay under the OS sandbox) without reclaiming a shared leader on its own.
 ///
 /// `policy_disable_reason` is `Some("config"|"remote")` only when leader mode is
 /// *definitively* off by policy (local `use_leader = false`, or remote
 /// `leader_mode` fetched as `false`). Unknown remote state (`None` / prefetch
 /// timeout), the default, `--no-leader`, and ineligibility are `None` — never
 /// reclaim a leader on an unknown signal.
-pub fn resolve_use_leader(
+pub fn resolve_leader_mode<'p>(
     leader_flag: bool,
     no_leader_flag: bool,
     raw_config: &toml::Value,
     _remote_settings: Option<&xai_grok_shell::util::config::RemoteSettings>,
     eligible: bool,
+    requested_confinement: Option<&'p str>,
+) -> LeaderMode<'p> {
+    let (use_leader, policy_disable_reason) = 'policy: {
+        if no_leader_flag {
+            break 'policy (false, None);
+        }
+        if leader_flag {
+            break 'policy (true, None);
+        }
+        if !eligible {
+            break 'policy (false, None);
+        }
+        if let Some(v) = config::use_leader_from_toml_opt(raw_config) {
+            break 'policy (v, (!v).then_some("config"));
+        }
+        #[cfg(feature = "release-dist")]
+        if let Some(remote_val) = _remote_settings.and_then(|s| s.leader_mode) {
+            break 'policy (remote_val, (!remote_val).then_some("remote"));
+        }
+        (false, None)
+    };
+    if let Some(profile) = requested_confinement {
+        return LeaderMode {
+            use_leader: false,
+            policy_disable_reason,
+            disabled_by_confinement: use_leader.then_some(profile),
+        };
+    }
+    LeaderMode {
+        use_leader,
+        policy_disable_reason,
+        disabled_by_confinement: None,
+    }
+}
+/// Leader mode as resolved, plus the sandbox profile that overrode it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LeaderMode<'p> {
+    pub use_leader: bool,
+    /// `Some` only when leader mode is *definitively* off by policy, which is
+    /// what licenses reclaiming a leftover leader.
+    pub policy_disable_reason: Option<&'static str>,
+    /// The profile that turned leader mode off, set only when leader mode was
+    /// otherwise on — the case worth telling the user about.
+    pub disabled_by_confinement: Option<&'p str>,
+}
+/// The leader-mode decision alone, for callers with nothing to report.
+///
+/// See [`resolve_leader_mode`] for the precedence chain and the
+/// `policy_disable_reason` contract.
+pub fn resolve_use_leader(
+    leader_flag: bool,
+    no_leader_flag: bool,
+    raw_config: &toml::Value,
+    remote_settings: Option<&xai_grok_shell::util::config::RemoteSettings>,
+    eligible: bool,
+    requested_confinement: Option<&str>,
 ) -> (bool, Option<&'static str>) {
-    if no_leader_flag {
-        return (false, None);
-    }
-    if leader_flag {
-        return (true, None);
-    }
-    if !eligible {
-        return (false, None);
-    }
-    if let Some(v) = config::use_leader_from_toml_opt(raw_config) {
-        return (v, (!v).then_some("config"));
-    }
-    #[cfg(feature = "release-dist")]
-    if let Some(remote_val) = _remote_settings.and_then(|s| s.leader_mode) {
-        return (remote_val, (!remote_val).then_some("remote"));
-    }
-    (false, None)
+    let resolved = resolve_leader_mode(
+        leader_flag,
+        no_leader_flag,
+        raw_config,
+        remote_settings,
+        eligible,
+        requested_confinement,
+    );
+    (resolved.use_leader, resolved.policy_disable_reason)
+}
+/// How long the sandbox note stays uncovered before a fullscreen TUI opens over
+/// it. Paid only when the note was printed and the screen is about to hide it.
+const SANDBOX_NOTICE_LINGER: std::time::Duration = std::time::Duration::from_millis(1_200);
+/// Tell the user at startup that the sandbox turned leader mode off.
+///
+/// Writes to the dup'd terminal stderr, which survives the TUI's fd-2 redirect
+/// (`redirect_native_stderr`). A fullscreen TUI still paints over it, leaving
+/// the line to be read on exit; `leader_disabled_by_sandbox` on the
+/// leader-mode decision log is the durable record.
+pub fn warn_leader_disabled_by_sandbox(profile: &str) {
+    xai_grok_shell::util::with_locked_stderr(|stderr| {
+        print_leader_disabled_by_sandbox(profile, stderr)
+    });
+}
+/// Says only that the profile was *requested*: enforcement can still fail
+/// (`apply_sandbox` warns and continues) while the leader is refused either way.
+///
+/// Write errors are dropped — `eprintln!` would panic on a closed stderr.
+fn print_leader_disabled_by_sandbox(profile: &str, w: &mut impl Write) {
+    let _ = writeln!(
+        w,
+        "note: sandbox profile '{profile}' was requested, so leader mode is off for this \
+         session and tool calls stay in this process instead of the shared leader. \
+         Disable the profile at the source that selected it (CLI, env, config, or a \
+         managed requirement) to use the leader."
+    );
 }
 /// Join early prefetch to get remote settings (with timeout).
 ///
@@ -373,6 +538,23 @@ fn resolve_hunk_tracker_mode(
         .find(|s| !s.is_empty())
         .map(str::to_owned)
 }
+/// Run a connect future bounded by cancellation and `timeout`, so a hung leader
+/// or embedded spawn cannot strand the user on a blank screen.
+async fn bounded_connect(
+    cancel: &CancellationToken,
+    timeout: std::time::Duration,
+    target: &str,
+    connect: impl std::future::Future<Output = anyhow::Result<crate::acp::AcpConnection>>,
+) -> anyhow::Result<crate::acp::AcpConnection> {
+    tokio::select! {
+        biased;
+        () = cancel.cancelled() => Err(anyhow::anyhow!("startup cancelled before {target} connected")),
+        r = connect => r,
+        () = tokio::time::sleep(timeout) => {
+            Err(anyhow::anyhow!("timed out after {}s connecting to {target}", timeout.as_secs()))
+        }
+    }
+}
 /// Main entry point: connect to agent, init terminal, run event loop, restore.
 ///
 /// If a session ID is provided via `--resume` / `--load` / `--continue`, the
@@ -393,19 +575,25 @@ pub async fn run(
     let startup_start = std::time::Instant::now();
     let raw_config = xai_grok_shell::config::load_effective_config()
         .map_err(|e| anyhow::anyhow!("Failed to load config: {e}"))?;
-    let grok_com_config =
-        match xai_grok_shell::agent::config::Config::new_from_toml_cfg(&raw_config) {
-            Ok(c) => c.grok_com_config,
-            Err(e) => {
-                tracing::warn!(
-                    error = % e, "failed to parse config for auth refresh, using defaults"
-                );
-                xai_grok_shell::auth::GrokComConfig::default()
-            }
-        };
-    let refreshed_auth = xai_grok_shell::auth::try_ensure_fresh_auth(&grok_com_config).await;
-    let early_prefetch =
-        xai_grok_shell::agent::models::start_early_prefetch_with_auth(refreshed_auth);
+    let grok_com_config = match xai_grok_shell::agent::config::Config::new_from_toml_cfg(
+        &raw_config,
+    ) {
+        Ok(c) => c.grok_com_config,
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to parse config for auth refresh, using defaults");
+            xai_grok_shell::auth::GrokComConfig::default()
+        }
+    };
+    let refreshed_auth = tokio::time::timeout(
+        xai_grok_shell::http::STARTUP_AUTH_REFRESH_TIMEOUT,
+        xai_grok_shell::auth::try_ensure_fresh_auth(&grok_com_config),
+    )
+    .await
+    .unwrap_or(None);
+    let early_prefetch = match refreshed_auth {
+        Some(auth) => xai_grok_shell::agent::models::start_early_prefetch_with_auth(Some(auth)),
+        None => xai_grok_shell::agent::models::start_early_prefetch(Some(grok_com_config.clone())),
+    };
     xai_grok_shell::agent::mvp_agent::warm_async_http_client();
     tokio::task::spawn_blocking(|| {});
     if let Ok(cwd) = std::env::current_dir() {
@@ -419,19 +607,32 @@ pub async fn run(
     let raw_config = xai_grok_shell::config::load_effective_config()
         .map_err(|e| anyhow::anyhow!("Failed to load config: {e}"))?;
     let prefetch_elapsed = startup_start.elapsed();
-    let (use_leader, policy_disable_reason) = resolve_use_leader(
+    let requested_confinement = xai_grok_sandbox::requested_confinement_profile();
+    let LeaderMode {
+        use_leader,
+        policy_disable_reason,
+        disabled_by_confinement,
+    } = resolve_leader_mode(
         args.leader,
         args.no_leader,
         &raw_config,
         remote_settings.as_ref(),
         true,
+        requested_confinement,
     );
     tracing::info!(
         use_leader,
         ?policy_disable_reason,
+        sandbox_profile = ?requested_confinement,
+        // The other fields cannot distinguish this from leader mode being off
+        // already while a sandbox is on.
+        leader_disabled_by_sandbox = disabled_by_confinement.is_some(),
         prefetch_ms = prefetch_elapsed.as_millis() as u64,
         "pager TUI leader mode resolved"
     );
+    if let Some(profile) = disabled_by_confinement {
+        warn_leader_disabled_by_sandbox(profile);
+    }
     if session_startup::chat_mode_conflicts_with_leader(args.chat(), use_leader) {
         anyhow::bail!("{}", session_startup::CHAT_MODE_LEADER_CONFLICT);
     }
@@ -439,9 +640,7 @@ pub async fn run(
         match std::env::current_dir() {
             Ok(cwd) => xai_grok_shell::agent::folder_trust::grant_folder_trust(&cwd),
             Err(e) => {
-                tracing::warn!(
-                    error = % e, "--trust: failed to resolve cwd; folder not trusted"
-                )
+                tracing::warn!(error = %e, "--trust: failed to resolve cwd; folder not trusted")
             }
         }
     }
@@ -559,21 +758,6 @@ pub async fn run(
         default_yolo_mode: launch_yolo.yolo,
         default_auto_mode: launch_auto && !launch_yolo.yolo,
     };
-    let connection = if use_leader {
-        let conn = crate::acp::connect_via_leader(&cancel, connect_flags, &raw_config).await?;
-        tracing::info!(
-            elapsed_ms = startup_start.elapsed().as_millis() as u64,
-            "Connected via leader"
-        );
-        conn
-    } else {
-        let conn = crate::acp::connect(&cancel, connect_flags).await?;
-        tracing::info!(
-            elapsed_ms = startup_start.elapsed().as_millis() as u64,
-            "Connected directly (non-leader)"
-        );
-        conn
-    };
     let mut config_watcher = crate::appearance::ConfigWatcher::start().await?;
     let alt_screen_config_mode = config_watcher.current().alt_screen;
     let term_ctx = crate::terminal::terminal_context();
@@ -604,36 +788,31 @@ pub async fn run(
         screen_mode.is_minimal() && explicit_minimal.is_none() && screen_mode_override.is_none(),
         Ordering::Release,
     );
-    if args.minimal || args.fullscreen {
-        let want = if args.minimal {
-            "minimal"
-        } else {
-            "fullscreen"
-        };
-        if config_screen_mode != Some(want) {
-            tokio::spawn(async move {
-                if let Err(e) =
-                    xai_grok_shell::util::config::set_screen_mode(want.to_string()).await
-                {
-                    tracing::warn!("failed to persist screen mode preference: {e}");
-                }
-            });
-        }
-    }
     let minimal = screen_mode.is_minimal();
     let relaunched_into_minimal = screen_mode_override == Some(ScreenMode::Minimal);
+    let relaunched_into_fullscreen = screen_mode_override == Some(ScreenMode::Fullscreen);
     tracing::info!(
-        use_alt_screen = screen_mode.is_fullscreen(), minimal = screen_mode.is_minimal(),
-        mouse_capture = ! screen_mode.is_minimal(), minimal_live_rows = config_watcher
-        .current().minimal_live_rows, is_control_mode, no_alt_screen_cli = args
-        .no_alt_screen, minimal_cli = args.minimal, fullscreen_cli = args.fullscreen,
-        config_screen_mode = ? config_screen_mode, auto_minimal_mouse_leak, config_mode =
-        ? alt_screen_config_mode, multiplexer = ? term_ctx.multiplexer,
+        use_alt_screen = screen_mode.is_fullscreen(),
+        minimal = screen_mode.is_minimal(),
+        mouse_capture = !screen_mode.is_minimal(),
+        minimal_live_rows = config_watcher.current().minimal_live_rows,
+        is_control_mode,
+        no_alt_screen_cli = args.no_alt_screen,
+        minimal_cli = args.minimal,
+        fullscreen_cli = args.fullscreen,
+        config_screen_mode = ?config_screen_mode,
+        auto_minimal_mouse_leak,
+        config_mode = ?alt_screen_config_mode,
+        multiplexer = ?term_ctx.multiplexer,
         "resolved fullscreen policy"
     );
+    if disabled_by_confinement.is_some() && screen_mode.is_fullscreen() {
+        tokio::time::sleep(SANDBOX_NOTICE_LINGER).await;
+    }
     engage_startup_theme(screen_mode);
     let minimal_live_rows = config_watcher.current().minimal_live_rows;
-    let (frame_tx, writer_sync, writer_thread) = crate::render::draw::spawn_writer_thread();
+    let (frame_tx, writer_sync, writer_event_rx, writer_thread) =
+        crate::render::draw::spawn_writer_thread();
     let cursor_blink = event_loop::load_initial_ui_config().cursor_blink;
     let (mut terminal, screen_mode) = init_terminal(
         screen_mode,
@@ -643,11 +822,62 @@ pub async fn run(
         writer_sync,
         cursor_blink,
     )?;
+    MINIMAL_SHOW_SWITCH_BACK_TO_FULLSCREEN.store(
+        relaunched_into_minimal && screen_mode.is_minimal(),
+        Ordering::Release,
+    );
     apply_screen_mode_globals(screen_mode);
     finish_theme_after_probe(minimal, screen_mode);
     if let Some(ref t) = session_title {
         set_terminal_title(t);
     }
+    const CONNECT_UI_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+    let fallback_flags = use_leader.then(|| connect_flags.clone());
+    let primary_target = if use_leader {
+        "the grok leader"
+    } else {
+        "the embedded agent"
+    };
+    let connect_result = bounded_connect(&cancel, CONNECT_UI_TIMEOUT, primary_target, async {
+        if use_leader {
+            crate::acp::connect_via_leader(&cancel, connect_flags, &raw_config).await
+        } else {
+            crate::acp::connect(&cancel, connect_flags).await
+        }
+    })
+    .await;
+    let (connect_result, embedded_fallback) = match connect_result {
+        Err(e) if use_leader && !cancel.is_cancelled() => {
+            tracing::warn!(error = %e, "leader connect failed; falling back to embedded agent");
+            let flags = fallback_flags.expect("set on the use_leader path");
+            let fallback =
+                bounded_connect(&cancel, CONNECT_UI_TIMEOUT, "the embedded agent", async {
+                    crate::acp::connect(&cancel, flags).await
+                })
+                .await;
+            (fallback, true)
+        }
+        other => (other, false),
+    };
+    let mut connection = match connect_result {
+        Ok(conn) => {
+            tracing::info!(
+                elapsed_ms = startup_start.elapsed().as_millis() as u64,
+                use_leader = use_leader && !embedded_fallback,
+                embedded_fallback,
+                "Connected"
+            );
+            conn
+        }
+        Err(e) => {
+            crate::unified_log::flush_blocking().await;
+            let _ = restore_terminal(terminal, writer_thread, screen_mode);
+            cancel.cancel();
+            return Err(e);
+        }
+    };
+    let agent_guard =
+        crate::acp::spawn::AgentShutdownGuard::new(cancel.clone(), connection.agent_thread.take());
     let effective_args = PagerArgs {
         resume_session: None,
         load_session: None,
@@ -660,6 +890,7 @@ pub async fn run(
         is_control_mode,
         screen_mode,
         relaunched_into_minimal,
+        relaunched_into_fullscreen,
         initial_theme: crate::theme::cache::current_kind(),
     };
     let result = event_loop::run(
@@ -672,12 +903,30 @@ pub async fn run(
         term_state,
         materialized,
         bg_update_rx,
+        writer_event_rx,
     )
     .await;
     crate::unified_log::flush_blocking().await;
-    let _ = restore_terminal(terminal, writer_thread, screen_mode);
-    cancel.cancel();
+    let restore_result = restore_terminal(terminal, writer_thread, screen_mode);
+    drop(agent_guard);
     xai_tty_utils::global_process_scope().kill_all();
+    if let Err(cleanup_error) = restore_result {
+        match &result {
+            Ok(_) => {
+                tracing::warn!(
+                    error = %cleanup_error,
+                    "terminal cleanup failed after successful event loop"
+                )
+            }
+            Err(run_error) => {
+                tracing::warn!(
+                    error = %cleanup_error,
+                    run_error = %run_error,
+                    "terminal cleanup also failed"
+                )
+            }
+        }
+    }
     match result {
         Ok(run_result) => {
             if run_result.quit_for_update {
@@ -688,7 +937,7 @@ pub async fn run(
                     &relaunch.session_id,
                     relaunch.minimal,
                 ) {
-                    tracing::error!(error = % e, "screen-mode relaunch failed");
+                    tracing::error!(error = %e, "screen-mode relaunch failed");
                     print_relaunch_failure_hint(
                         &e,
                         &relaunch.session_id,
@@ -699,22 +948,42 @@ pub async fn run(
                 return Ok(false);
             }
             if let Some(info) = run_result.exit_info {
-                print_exit_resume_hint(&info.session_id, info.minimal, &mut io::stderr());
+                let width = crossterm::terminal::size().map_or(80, |(cols, _)| cols as usize);
+                print_exit_resume_hint(&info, width, &mut io::stderr());
             }
             Ok(false)
         }
-        Err(e) => Err(e),
+        Err(run_error) => Err(run_error),
     }
 }
 /// Plain-quit "Resume this session with…" lines (after terminal restore).
+///
+/// A summary, when present — title, last prompt, last response, one line
+/// each, width-truncated — precedes the command so a glance at the pane
+/// shows which session lives there and where it left off.
 /// Best-effort: closed-pane EIO/BrokenPipe must not panic (`panic = "abort"`).
-fn print_exit_resume_hint(session_id: &str, minimal: bool, w: &mut impl Write) {
+fn print_exit_resume_hint(info: &ExitInfo, max_width: usize, w: &mut impl Write) {
+    use crate::render::line_utils::truncate_str;
     let _ = writeln!(w);
+    if let Some(summary) = &info.summary {
+        let _ = writeln!(w, "{}", truncate_str(&summary.title, max_width));
+        if let Some(prompt) = summary.last_prompt.as_deref() {
+            let _ = writeln!(w, "> {}", truncate_str(prompt, max_width.saturating_sub(2)));
+        }
+        if let Some(response) = summary.last_response.as_deref() {
+            let _ = writeln!(
+                w,
+                "  {}",
+                truncate_str(response, max_width.saturating_sub(2))
+            );
+        }
+        let _ = writeln!(w);
+    }
     let _ = writeln!(w, "Resume this session with:");
-    if minimal {
-        let _ = writeln!(w, "  grok --minimal --resume {session_id}");
+    if info.minimal {
+        let _ = writeln!(w, "  grok --minimal --resume {}", info.session_id);
     } else {
-        let _ = writeln!(w, "  grok --resume {session_id}");
+        let _ = writeln!(w, "  grok --resume {}", info.session_id);
     }
 }
 /// Screen-mode relaunch failure fallback (same quit tail as plain resume).
@@ -982,7 +1251,7 @@ fn init_terminal(
     mode: ScreenMode,
     minimal_live_rows: u16,
     clear_main_screen: bool,
-    frame_tx: std::sync::mpsc::Sender<Vec<u8>>,
+    frame_tx: crate::render::draw::WriterSender,
     writer_sync: crate::render::draw::WriterSync,
     cursor_blink: Option<bool>,
 ) -> io::Result<(PagerTerminal, ScreenMode)> {
@@ -1059,29 +1328,36 @@ fn init_terminal(
                     Ok(true) => None,
                     _ => Some("unsupported"),
                 });
-        let use_keyboard_enhancement = skip_reason.is_none();
-        if use_keyboard_enhancement {
-            let flags = event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-                | event::KeyboardEnhancementFlags::REPORT_EVENT_TYPES;
-            xai_grok_shell::util::with_locked_stderr(|stderr| {
-                let _ = execute!(stderr, event::PushKeyboardEnhancementFlags(flags));
-            });
-            tracing::info!(
-                kitty.flags = ? flags, kitty.disambiguate = true, kitty
-                .report_event_types = true, kitty.report_all_keys = false,
-                "kitty keyboard protocol pushed"
-            );
-        } else {
+        crate::terminal::da2::probe_at_startup();
+        let flags = crate::terminal::negotiated_kitty_flags(
+            skip_reason,
+            crate::terminal::da2::detected_packed(),
+        );
+        if flags.is_empty() {
             tracing::info!(
                 kitty.flags = "none",
                 kitty.skipped_reason = skip_reason.unwrap_or("unknown"),
                 "kitty keyboard protocol skipped"
             );
+        } else {
+            xai_grok_shell::util::with_locked_stderr(|stderr| {
+                let _ = execute!(stderr, event::PushKeyboardEnhancementFlags(flags));
+            });
+            tracing::info!(
+                kitty.flags = ?flags,
+                kitty.disambiguate = true,
+                kitty.report_event_types =
+                    flags.contains(event::KeyboardEnhancementFlags::REPORT_EVENT_TYPES),
+                kitty.report_all_keys = false,
+                "kitty keyboard protocol pushed"
+            );
         }
-        crate::terminal::set_kitty_flags_pushed(use_keyboard_enhancement);
+        crate::terminal::set_pushed_kitty_flags(flags);
         if mode.is_fullscreen() {
-            let backend =
-                CrosstermBackend::new(crate::render::draw::TermWriter::new(frame_tx, writer_sync));
+            let backend = CrosstermBackend::new(
+                crate::render::draw::TermWriter::new(frame_tx, writer_sync)
+                    .map_err(io::Error::other)?,
+            );
             Ok((
                 xai_ratatui_inline::Terminal::new(backend)?,
                 ScreenMode::Fullscreen,
@@ -1093,10 +1369,10 @@ fn init_terminal(
             } else {
                 rows
             };
-            let probe_backend = CrosstermBackend::new(crate::render::draw::TermWriter::new(
-                frame_tx.clone(),
-                writer_sync.clone(),
-            ));
+            let probe_backend = CrosstermBackend::new(
+                crate::render::draw::TermWriter::new(frame_tx.clone(), writer_sync.clone())
+                    .map_err(io::Error::other)?,
+            );
             if let Ok(term) = xai_ratatui_inline::Terminal::with_options(
                 probe_backend,
                 ratatui::TerminalOptions {
@@ -1120,10 +1396,10 @@ fn init_terminal(
                     execute!(stderr, event::EnableMouseCapture)
                 })?;
                 MOUSE_CAPTURE_ENABLED.store(true, Ordering::Release);
-                let retry_backend = CrosstermBackend::new(crate::render::draw::TermWriter::new(
-                    frame_tx.clone(),
-                    writer_sync.clone(),
-                ));
+                let retry_backend = CrosstermBackend::new(
+                    crate::render::draw::TermWriter::new(frame_tx.clone(), writer_sync.clone())
+                        .map_err(io::Error::other)?,
+                );
                 if let Ok(term) = xai_ratatui_inline::Terminal::with_options(
                     retry_backend,
                     ratatui::TerminalOptions {
@@ -1142,8 +1418,10 @@ fn init_terminal(
                     cursor::MoveTo(0, 0),
                 )
             })?;
-            let backend =
-                CrosstermBackend::new(crate::render::draw::TermWriter::new(frame_tx, writer_sync));
+            let backend = CrosstermBackend::new(
+                crate::render::draw::TermWriter::new(frame_tx, writer_sync)
+                    .map_err(io::Error::other)?,
+            );
             let term = xai_ratatui_inline::Terminal::with_options(
                 backend,
                 ratatui::TerminalOptions {
@@ -1168,9 +1446,9 @@ fn init_terminal(
 fn drain_writer_thread_before_teardown(
     terminal: PagerTerminal,
     writer_thread: crate::render::draw::WriterThread,
-) {
+) -> io::Result<()> {
     drop(terminal);
-    writer_thread.join();
+    writer_thread.join()
 }
 /// Inline teardown escape sequences in the canonical order, shared by
 /// `restore_terminal` and `set_panic_hook` so the on-wire byte order is
@@ -1231,16 +1509,18 @@ fn emit_terminal_teardown_sequences(mode: ScreenMode, inline_cursor_row: Option<
     #[cfg(windows)]
     win_native_selection::restore_stdin_mode();
 }
-/// Consumes `terminal` and `writer_thread`: queues a final clear in
-/// fullscreen mode, drains the writer thread, then emits the inline
-/// teardown sequences. The drain ordering guarantees no late frame can
-/// land after `LeaveAlternateScreen`.
-fn restore_terminal(
+/// Consumes `terminal` and `writer_thread`: queues a final fullscreen clear,
+/// drains every accepted frame, then emits teardown sequences. Teardown still
+/// runs if draining fails, so terminal state is restored before returning that
+/// error. Draining first prevents a late frame after `LeaveAlternateScreen`.
+fn restore_terminal_with(
     mut terminal: PagerTerminal,
     writer_thread: crate::render::draw::WriterThread,
     mode: ScreenMode,
+    drain: impl FnOnce(PagerTerminal, crate::render::draw::WriterThread) -> io::Result<()>,
+    teardown: impl FnOnce(ScreenMode, Option<u16>),
 ) -> io::Result<()> {
-    if mode.is_fullscreen() {
+    if mode.is_fullscreen() && !writer_thread.writer_sync().failed() {
         let _ = terminal.clear();
         {
             use std::io::Write;
@@ -1248,14 +1528,27 @@ fn restore_terminal(
         }
     }
     let inline_cursor_row = (!mode.is_fullscreen()).then(|| terminal.viewport_area().bottom());
-    drain_writer_thread_before_teardown(terminal, writer_thread);
-    emit_terminal_teardown_sequences(mode, inline_cursor_row);
+    let drain_result = drain(terminal, writer_thread);
+    teardown(mode, inline_cursor_row);
     drain_pending_events_with_timeout(std::time::Duration::from_millis(10));
     let _ = terminal::disable_raw_mode();
     signal_handler::mark_restored();
     xai_crash_handler::disable_terminal_escape_restore();
     xai_tty_utils::restore_native_stderr();
-    Ok(())
+    drain_result
+}
+fn restore_terminal(
+    terminal: PagerTerminal,
+    writer_thread: crate::render::draw::WriterThread,
+    mode: ScreenMode,
+) -> io::Result<()> {
+    restore_terminal_with(
+        terminal,
+        writer_thread,
+        mode,
+        drain_writer_thread_before_teardown,
+        emit_terminal_teardown_sequences,
+    )
 }
 pub(crate) fn set_terminal_title(title: &str) {
     let full = terminal_title_string(title);
@@ -1292,6 +1585,39 @@ fn set_panic_hook(mode: ScreenMode) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn restore_runs_teardown_even_when_writer_failed() {
+        use ratatui::{TerminalOptions, Viewport};
+        let (tx, _rx) = std::sync::mpsc::channel::<crate::render::draw::WriterPayload>();
+        let sync = crate::render::draw::WriterSync::new();
+        let backend = CrosstermBackend::new(
+            crate::render::draw::TermWriter::new(tx, sync).expect("single test writer"),
+        );
+        let terminal = xai_ratatui_inline::Terminal::with_options(
+            backend,
+            TerminalOptions {
+                viewport: Viewport::Fixed(ratatui::layout::Rect::new(0, 0, 80, 24)),
+            },
+        )
+        .expect("test terminal");
+        let (writer_tx, _writer_sync, _events, writer_thread) =
+            crate::render::draw::spawn_writer_thread();
+        drop(writer_tx);
+        let teardown_called = std::cell::Cell::new(false);
+        let result = restore_terminal_with(
+            terminal,
+            writer_thread,
+            ScreenMode::Inline,
+            |terminal, writer_thread| {
+                drop(terminal);
+                drop(writer_thread);
+                Err(io::Error::other("injected drain failure"))
+            },
+            |_, _| teardown_called.set(true),
+        );
+        assert!(result.is_err());
+        assert!(teardown_called.get());
+    }
     /// `[ui].cursor_blink` tri-state → startup cursor policy; the `None`
     /// default must be Inherit (emit nothing).
     #[test]
@@ -1312,6 +1638,31 @@ mod tests {
     fn config_with_leader(enabled: bool) -> toml::Value {
         let toml_str = format!("[cli]\nuse_leader = {enabled}");
         toml::from_str(&toml_str).unwrap()
+    }
+    #[tokio::test]
+    async fn bounded_connect_times_out_when_the_target_stalls() {
+        let cancel = CancellationToken::new();
+        let r = bounded_connect(
+            &cancel,
+            std::time::Duration::from_millis(20),
+            "the test target",
+            std::future::pending::<anyhow::Result<crate::acp::AcpConnection>>(),
+        )
+        .await;
+        assert!(r.is_err_and(|e| e.to_string().contains("timed out")));
+    }
+    #[tokio::test]
+    async fn bounded_connect_returns_err_on_cancel() {
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let r = bounded_connect(
+            &cancel,
+            std::time::Duration::from_secs(60),
+            "the test target",
+            std::future::pending::<anyhow::Result<crate::acp::AcpConnection>>(),
+        )
+        .await;
+        assert!(r.is_err_and(|e| e.to_string().contains("cancelled")));
     }
     #[test]
     fn terminal_title_strips_control_characters() {
@@ -1362,49 +1713,127 @@ mod tests {
     #[test]
     fn no_leader_flag_wins_over_leader_flag_and_config() {
         let cfg = config_with_leader(true);
-        let (use_leader, reason) = resolve_use_leader(true, true, &cfg, None, true);
+        let (use_leader, reason) = resolve_use_leader(true, true, &cfg, None, true, None);
         assert!(!use_leader);
         assert_eq!(reason, None);
     }
     #[test]
     fn leader_flag_enables() {
-        let (use_leader, reason) = resolve_use_leader(true, false, &empty_config(), None, true);
+        let (use_leader, reason) =
+            resolve_use_leader(true, false, &empty_config(), None, true, None);
         assert!(use_leader);
         assert_eq!(reason, None);
     }
     #[test]
     fn not_eligible_returns_false() {
         let cfg = config_with_leader(true);
-        let (use_leader, reason) = resolve_use_leader(false, false, &cfg, None, false);
+        let (use_leader, reason) = resolve_use_leader(false, false, &cfg, None, false, None);
         assert!(!use_leader);
         assert_eq!(reason, None);
     }
     #[test]
     fn config_toml_enables() {
         let cfg = config_with_leader(true);
-        let (use_leader, reason) = resolve_use_leader(false, false, &cfg, None, true);
+        let (use_leader, reason) = resolve_use_leader(false, false, &cfg, None, true, None);
         assert!(use_leader);
         assert_eq!(reason, None);
     }
     #[test]
     fn config_toml_disables() {
         let cfg = config_with_leader(false);
-        let (use_leader, reason) = resolve_use_leader(false, false, &cfg, None, true);
+        let (use_leader, reason) = resolve_use_leader(false, false, &cfg, None, true, None);
         assert!(!use_leader);
         assert_eq!(reason, Some("config"));
     }
     #[test]
     fn default_is_false() {
-        let (use_leader, reason) = resolve_use_leader(false, false, &empty_config(), None, true);
+        let (use_leader, reason) =
+            resolve_use_leader(false, false, &empty_config(), None, true, None);
         assert!(!use_leader);
         assert_eq!(reason, None);
     }
     #[test]
     fn cli_flag_overrides_config() {
         let cfg = config_with_leader(false);
-        let (use_leader, reason) = resolve_use_leader(true, false, &cfg, None, true);
+        let (use_leader, reason) = resolve_use_leader(true, false, &cfg, None, true, None);
         assert!(use_leader);
         assert_eq!(reason, None);
+    }
+    #[test]
+    fn sandbox_confinement_refuses_leader_even_with_leader_flag_and_config_on() {
+        let cfg = config_with_leader(true);
+        let (use_leader, reason) =
+            resolve_use_leader(true, false, &cfg, None, true, Some("strict"));
+        assert!(!use_leader);
+        assert_eq!(reason, None);
+    }
+    /// `disabled_by_confinement` for the four leader × sandbox cells, driven by
+    /// every input that can decide leader mode — not just `[cli] use_leader`.
+    #[test]
+    fn matrix_reports_the_profile_only_when_the_sandbox_takes_leader_mode_away() {
+        let on = config_with_leader(true);
+        let off = config_with_leader(false);
+        let sandbox = Some("strict");
+        for (label, leader_flag, cfg) in [
+            ("config on", false, &on),
+            ("--leader", true, &empty_config()),
+            ("--leader over config off", true, &off),
+        ] {
+            let resolved = resolve_leader_mode(leader_flag, false, cfg, None, true, sandbox);
+            assert!(!resolved.use_leader, "{label}: leader must be vetoed");
+            assert_eq!(
+                resolved.disabled_by_confinement,
+                Some("strict"),
+                "{label}: the profile that took leader mode away must be named"
+            );
+        }
+        for (label, cfg, expect_leader) in [("leader on", &on, true), ("leader off", &off, false)] {
+            let resolved = resolve_leader_mode(false, false, cfg, None, true, None);
+            assert_eq!(resolved.use_leader, expect_leader, "{label}");
+            assert_eq!(resolved.disabled_by_confinement, None, "{label}");
+        }
+        for (label, leader_flag, no_leader_flag, cfg, eligible) in [
+            ("config off", false, false, &off, true),
+            ("--no-leader over config on", false, true, &on, true),
+            ("default", false, false, &empty_config(), true),
+            ("ineligible mode with config on", false, false, &on, false),
+        ] {
+            let resolved =
+                resolve_leader_mode(leader_flag, no_leader_flag, cfg, None, eligible, sandbox);
+            assert!(!resolved.use_leader, "{label}");
+            assert_eq!(
+                resolved.disabled_by_confinement, None,
+                "{label}: the sandbox took nothing away, so it must stay silent"
+            );
+        }
+    }
+    #[test]
+    fn sandbox_notice_names_the_profile_without_promising_enforcement() {
+        let mut out = Vec::new();
+        print_leader_disabled_by_sandbox("strict", &mut out);
+        let msg = String::from_utf8(out).expect("utf-8");
+        assert!(msg.contains("'strict'"), "must name the profile: {msg}");
+        assert!(
+            msg.contains("was requested"),
+            "must describe the request, not enforcement: {msg}"
+        );
+        assert!(
+            !msg.contains("is active"),
+            "must not claim the profile is enforced: {msg}"
+        );
+        assert!(
+            msg.contains("Disable the profile at the source"),
+            "must say how to get leader mode back: {msg}"
+        );
+        assert_eq!(msg.lines().count(), 1, "single line: {msg}");
+    }
+    #[test]
+    fn sandbox_confinement_preserves_config_off_reclaim_reason() {
+        let cfg = config_with_leader(false);
+        let (use_leader, reason) =
+            resolve_use_leader(false, false, &cfg, None, true, Some("strict"));
+        assert!(!use_leader);
+        assert_eq!(reason, Some("config"));
     }
     fn try_parse_pager(args: &[&str]) -> Result<PagerArgs, clap::Error> {
         use clap::Parser;
@@ -1436,7 +1865,7 @@ mod tests {
     #[test]
     fn no_leader_flag_overrides_config_for_tui_fallback() {
         let cfg = config_with_leader(true);
-        let (use_leader, reason) = resolve_use_leader(false, true, &cfg, None, true);
+        let (use_leader, reason) = resolve_use_leader(false, true, &cfg, None, true, None);
         assert!(!use_leader);
         assert_eq!(reason, None);
     }
@@ -1456,7 +1885,8 @@ mod tests {
     }
     #[test]
     fn remote_settings_none_falls_through_to_default() {
-        let (use_leader, reason) = resolve_use_leader(false, false, &empty_config(), None, true);
+        let (use_leader, reason) =
+            resolve_use_leader(false, false, &empty_config(), None, true, None);
         assert!(!use_leader);
         assert_eq!(reason, None);
     }
@@ -1468,7 +1898,7 @@ mod tests {
             ..Default::default()
         };
         let (use_leader, reason) =
-            resolve_use_leader(false, false, &empty_config(), Some(&rs), true);
+            resolve_use_leader(false, false, &empty_config(), Some(&rs), true, None);
         assert!(use_leader);
         assert_eq!(reason, None);
     }
@@ -1480,7 +1910,7 @@ mod tests {
             ..Default::default()
         };
         let (use_leader, reason) =
-            resolve_use_leader(false, false, &empty_config(), Some(&rs), true);
+            resolve_use_leader(false, false, &empty_config(), Some(&rs), true, None);
         assert!(!use_leader);
         assert_eq!(reason, Some("remote"));
     }
@@ -1492,7 +1922,7 @@ mod tests {
             ..Default::default()
         };
         let (use_leader, reason) =
-            resolve_use_leader(false, false, &empty_config(), Some(&rs), true);
+            resolve_use_leader(false, false, &empty_config(), Some(&rs), true, None);
         assert!(!use_leader);
         assert_eq!(reason, None);
     }
@@ -1504,7 +1934,7 @@ mod tests {
             ..Default::default()
         };
         let cfg = config_with_leader(false);
-        let (use_leader, reason) = resolve_use_leader(false, false, &cfg, Some(&rs), true);
+        let (use_leader, reason) = resolve_use_leader(false, false, &cfg, Some(&rs), true, None);
         assert!(!use_leader);
         assert_eq!(reason, Some("config"));
     }
@@ -1735,10 +2165,18 @@ mod tests {
             Err(io::Error::from_raw_os_error(5))
         }
     }
+    /// [`ExitInfo`] with no summary, as built for inline/minimal quits.
+    fn bare_exit_info(session_id: &str, minimal: bool) -> ExitInfo {
+        ExitInfo {
+            session_id: session_id.to_string(),
+            minimal,
+            summary: None,
+        }
+    }
     #[test]
     fn print_exit_resume_hint_writes_expected_lines() {
         let mut buf = Vec::new();
-        print_exit_resume_hint("sess-abc", false, &mut buf);
+        print_exit_resume_hint(&bare_exit_info("sess-abc", false), 80, &mut buf);
         assert_eq!(
             String::from_utf8(buf).unwrap(),
             "\nResume this session with:\n  grok --resume sess-abc\n"
@@ -1747,11 +2185,56 @@ mod tests {
     #[test]
     fn print_exit_resume_hint_includes_minimal_flag() {
         let mut buf = Vec::new();
-        print_exit_resume_hint("sess-abc", true, &mut buf);
+        print_exit_resume_hint(&bare_exit_info("sess-abc", true), 80, &mut buf);
         assert_eq!(
             String::from_utf8(buf).unwrap(),
             "\nResume this session with:\n  grok --minimal --resume sess-abc\n"
         );
+    }
+    #[test]
+    fn print_exit_resume_hint_includes_session_summary() {
+        let info = ExitInfo {
+            session_id: "sess-abc".to_string(),
+            minimal: false,
+            summary: Some(ExitSummary {
+                title: "Fix flaky CI test".to_string(),
+                last_prompt: Some("make the suite deterministic".to_string()),
+                last_response: Some("Pinned the seed; 200 consecutive green runs.".to_string()),
+            }),
+        };
+        let mut buf = Vec::new();
+        print_exit_resume_hint(&info, 80, &mut buf);
+        assert_eq!(
+            String::from_utf8(buf).unwrap(),
+            concat!(
+                "\n",
+                "Fix flaky CI test\n",
+                "> make the suite deterministic\n",
+                "  Pinned the seed; 200 consecutive green runs.\n",
+                "\n",
+                "Resume this session with:\n",
+                "  grok --resume sess-abc\n",
+            )
+        );
+    }
+    #[test]
+    fn print_exit_resume_hint_truncates_summary_to_width() {
+        let info = ExitInfo {
+            session_id: "sess-abc".to_string(),
+            minimal: false,
+            summary: Some(ExitSummary {
+                title: "t".repeat(50),
+                last_prompt: Some("p".repeat(50)),
+                last_response: Some("r".repeat(50)),
+            }),
+        };
+        let mut buf = Vec::new();
+        print_exit_resume_hint(&info, 20, &mut buf);
+        let out = String::from_utf8(buf).unwrap();
+        assert!(out.contains(&format!("\n{}…\n", "t".repeat(19))));
+        assert!(out.contains(&format!("\n> {}…\n", "p".repeat(17))));
+        assert!(out.contains(&format!("\n  {}…\n", "r".repeat(17))));
+        assert!(out.contains("  grok --resume sess-abc\n"));
     }
     #[test]
     fn print_relaunch_failure_hint_writes_expected_lines() {
@@ -1766,12 +2249,25 @@ mod tests {
             )
         );
     }
+    /// [`ExitInfo`] with a full summary, for the failing-writer tests.
+    fn full_exit_info(session_id: &str) -> ExitInfo {
+        ExitInfo {
+            summary: Some(ExitSummary {
+                title: "title".to_string(),
+                last_prompt: Some("prompt".to_string()),
+                last_response: Some("response".to_string()),
+            }),
+            ..bare_exit_info(session_id, false)
+        }
+    }
     #[test]
     fn print_hints_survive_eio() {
         let mut w = AlwaysFailWrite;
-        print_exit_resume_hint("sess-abc", false, &mut w);
-        print_exit_resume_hint("sess-abc", true, &mut w);
+        print_exit_resume_hint(&bare_exit_info("sess-abc", false), 80, &mut w);
+        print_exit_resume_hint(&bare_exit_info("sess-abc", true), 80, &mut w);
+        print_exit_resume_hint(&full_exit_info("sess-abc"), 80, &mut w);
         print_relaunch_failure_hint(&"exec failed", "sess-xyz", true, &mut w);
+        print_leader_disabled_by_sandbox("strict", &mut w);
     }
     /// Close the *read* end so writes on the write end get EPIPE
     /// (SIGPIPE is SIG_IGN → BrokenPipe, not process death).
@@ -1786,8 +2282,10 @@ mod tests {
             libc::close(fds[0]);
         }
         let mut writer = unsafe { std::fs::File::from_raw_fd(fds[1]) };
-        print_exit_resume_hint("pipe-sid", false, &mut writer);
-        print_exit_resume_hint("pipe-sid", true, &mut writer);
+        print_exit_resume_hint(&bare_exit_info("pipe-sid", false), 80, &mut writer);
+        print_exit_resume_hint(&bare_exit_info("pipe-sid", true), 80, &mut writer);
+        print_exit_resume_hint(&full_exit_info("pipe-sid"), 80, &mut writer);
         print_relaunch_failure_hint(&"exec failed", "pipe-sid", false, &mut writer);
+        print_leader_disabled_by_sandbox("strict", &mut writer);
     }
 }

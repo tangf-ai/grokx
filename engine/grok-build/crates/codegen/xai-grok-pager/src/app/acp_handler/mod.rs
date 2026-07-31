@@ -34,7 +34,7 @@ use crate::views::permission_view::{
 };
 use crate::views::plan_approval_view::PlanReviewSource;
 
-use super::agent_view::{AgentView, InputMode};
+use super::agent_view::{AgentPane, AgentView, InputMode};
 use super::app_view::{ActiveView, AppView};
 
 mod background;
@@ -48,6 +48,7 @@ mod routing;
 mod session_notification;
 mod settings;
 mod subagent_activity;
+mod workflow_ingest;
 
 #[cfg(test)]
 use permissions::{MCP_ARGS_MAX_LINE_CHARS, MCP_ARGS_MAX_LINES, mcp_args_lines};
@@ -59,13 +60,16 @@ use routing::{
     mcp_target_agent, resolve_notif_agent, resolve_target_view,
 };
 
+use prompt_origin::{finish_wake_turn, viewer_turn_anchor};
 pub(crate) use prompt_origin::{
-    is_server_initiated_prompt, is_wake_prompt, should_adopt_running_prompt,
+    is_scheduler_fired_prompt, is_server_initiated_prompt, is_wake_prompt,
+    should_adopt_running_prompt,
 };
-use prompt_origin::{push_wake_end_marker, viewer_turn_anchor, wake_turn_elapsed};
 
 pub(crate) use subagent_activity::finalize_killed_subagent;
 use subagent_activity::{subagent_activity_label, sync_subagent_activity};
+
+use workflow_ingest::ingest_workflow_update;
 
 #[cfg(test)]
 pub(crate) use session_notification::apply_session_event_for_test;
@@ -126,6 +130,9 @@ use settings::*;
 #[cfg(test)]
 #[allow(unused_imports)]
 use subagent_activity::*;
+#[cfg(test)]
+#[allow(unused_imports)]
+use workflow_ingest::*;
 
 /// Handle an ACP notification (session update, permission request, etc.).
 ///
@@ -139,13 +146,9 @@ pub(crate) fn handle(msg: AcpClientMessage, app: &mut AppView) -> bool {
         AcpClientMessage::SessionNotification(notif) => {
             let mut meta = NotificationMeta::from_json(notif.request.meta.as_ref());
 
-            // Wait-state bookkeeping after the agent borrow ends (parked marker).
-            let mut wait_state_agent: Option<AgentId> = None;
-
             let affected = match find_session_match(app, &notif.request.session_id) {
                 Some(SessionMatch::Root(id)) => {
                     let is_active = is_matched_agent_active(app, id);
-                    wait_state_agent = Some(id);
                     // Read before the agent borrow below.
                     let stashed_adoption_pid = app
                         .pending_running_adoptions
@@ -244,24 +247,12 @@ pub(crate) fn handle(msg: AcpClientMessage, app: &mut AppView) -> bool {
                         }
                         if let Some(ts) = meta.turn_start_ms {
                             agent.turn_start_ms = Some(ts);
-                            // A wake turn's end marker derives elapsed from its
-                            // deltas — non-adopted turns have no other timing
-                            // source. `turnStartMs` is constant per turn, so
-                            // record once per pid (the equality check also
-                            // skips the classifier on the turn's later deltas).
-                            if let Some(pid) = meta.prompt_id.as_deref()
-                                && agent.wake_turn_start.as_ref().map(|(p, _)| p.as_str())
-                                    != Some(pid)
-                                && is_wake_prompt(pid)
-                            {
-                                agent.wake_turn_start = Some((pid.to_string(), ts));
-                            }
+                            agent.turn_start_ms_prompt = meta.prompt_id.clone();
                         }
                     }
 
-                    // Track CurrentModeUpdate to refresh settings modals
-                    // after the per-agent borrow releases.
                     let mut plan_mode_modal_refresh_needed = false;
+                    let mut workflows_modal_refresh = false;
 
                     // Extract Plan updates before passing to tracker (tracker skips them).
                     let mutated = if dedup_drop {
@@ -381,9 +372,6 @@ pub(crate) fn handle(msg: AcpClientMessage, app: &mut AppView) -> bool {
                             && agent.session.current_prompt_id.as_ref() != Some(notif_pid)
                             && agent.attached_as_viewer
                         {
-                            // The driver's next turn closes the between-turns
-                            // status window on this pane too.
-                            agent.end_work_announced = false;
                             agent.session.current_prompt_id = Some(notif_pid.clone());
                             // A viewer adopting another client's new turn: drop
                             // the prior turn's chips but KEEP the seen ring so a
@@ -443,8 +431,13 @@ pub(crate) fn handle(msg: AcpClientMessage, app: &mut AppView) -> bool {
                         // This is the SINGLE generation bump site — ensures exactly
                         // one bump per AvailableCommandsUpdate received.
                         if let Some(commands) = agent.session.tracker.take_pending_acp_commands() {
+                            let workflows_changed = workflow_commands(&commands)
+                                != workflow_commands(&agent.session.available_commands);
                             agent.session.available_commands = commands;
                             agent.session.available_commands_generation += 1;
+                            refresh_workflow_run_capabilities(agent);
+                            workflows_modal_refresh =
+                                workflows_changed && agent.extensions_modal.is_some();
                         }
                         // Tools list arrives in the same update's `meta` payload.
                         // Stash it on the session so the per-frame sync in
@@ -517,6 +510,9 @@ pub(crate) fn handle(msg: AcpClientMessage, app: &mut AppView) -> bool {
                     if plan_mode_modal_refresh_needed {
                         crate::app::dispatch::refresh_open_settings_modals(app);
                     }
+                    if workflows_modal_refresh {
+                        queue_open_workflows_modal_refresh(app, id);
+                    }
 
                     // Mutation always happens; redraw only when the matched
                     // agent is the visible one.
@@ -567,12 +563,6 @@ pub(crate) fn handle(msg: AcpClientMessage, app: &mut AppView) -> bool {
                     false
                 }
             };
-            if let Some(aid) = wait_state_agent {
-                // Parked marker (any tab — the update that created the wait state stamps the park time).
-                if let Some(agent) = app.agents.get_mut(&aid) {
-                    agent.maybe_push_parked_marker();
-                }
-            }
             notif.response_tx.send(Ok(())).ok();
             affected
         }
@@ -593,10 +583,85 @@ pub(crate) fn handle(msg: AcpClientMessage, app: &mut AppView) -> bool {
     }
 }
 
+fn workflow_commands(
+    commands: &[acp::AvailableCommand],
+) -> Vec<(&str, &str, Option<&str>, Option<&str>)> {
+    commands
+        .iter()
+        .filter_map(|command| {
+            let meta = command.meta.as_ref()?;
+            let source = meta.get("workflowSource")?.as_str();
+            Some((
+                command.name.as_str(),
+                command.description.as_str(),
+                source,
+                meta.get("workflowPath").and_then(serde_json::Value::as_str),
+            ))
+        })
+        .collect()
+}
+
+pub(super) fn is_builtin_workflow_handle(
+    commands: &[acp::AvailableCommand],
+    display_name: &str,
+) -> bool {
+    let is_builtin = |command: &acp::AvailableCommand| {
+        command.meta.as_ref().is_some_and(|meta| {
+            meta.get("workflowSource")
+                .and_then(serde_json::Value::as_str)
+                == Some("builtin")
+        })
+    };
+    if let Some(exact) = commands.iter().find(|command| command.name == display_name) {
+        return is_builtin(exact);
+    }
+    commands.iter().any(|command| {
+        is_builtin(command)
+            && display_name
+                .strip_prefix(command.name.as_str())
+                .and_then(|suffix| suffix.strip_prefix('-'))
+                .is_some_and(|ordinal| ordinal.parse::<u32>().is_ok_and(|n| n >= 2))
+    })
+}
+
+pub(crate) fn refresh_workflow_run_capabilities(agent: &mut AgentView) {
+    let management_available = agent
+        .session
+        .available_commands
+        .iter()
+        .any(|command| command.name == "workflow");
+    for run in &mut agent.workflow_runs {
+        run.management_available = management_available;
+        run.builtin = is_builtin_workflow_handle(&agent.session.available_commands, &run.name);
+    }
+}
+
+fn queue_open_workflows_modal_refresh(app: &mut AppView, agent_id: AgentId) {
+    let Some(session_id) = app
+        .agents
+        .get(&agent_id)
+        .and_then(|agent| agent.session.session_id.clone())
+    else {
+        return;
+    };
+    let already_pending = app.pending_effects.iter().any(|effect| {
+        matches!(
+            effect,
+            Effect::FetchWorkflowsList {
+                agent_id: pending_id,
+                ..
+            } if *pending_id == agent_id
+        )
+    });
+    if !already_pending {
+        app.pending_effects.push(Effect::FetchWorkflowsList {
+            agent_id,
+            session_id,
+        });
+    }
+}
+
 /// Handle an xAI extension notification.
-///
-/// Dispatches on method string:
-/// - `x.ai/session_notification` / `x.ai/session/update` → per-agent session updates
 fn handle_ext_notification(notif: &acp::ExtNotification, app: &mut AppView) -> bool {
     match notif.method.as_ref() {
         "x.ai/session_notification" | "x.ai/session/update" => {
@@ -675,11 +740,6 @@ fn handle_interjection(notif: &acp::ExtNotification, app: &mut AppView) -> bool 
     agent
         .scrollback
         .push_block(RenderBlock::interjection_prompt(text));
-    // Interjecting into a parked wait continues the turn below this block —
-    // the withheld "Worked for …" marker must not fire late beneath it
-    // (shared-queue interjects render only via this broadcast, and the shell
-    // emits the queue-emptying `x.ai/queue/changed` right after it).
-    agent.suppress_parked_marker_on_interject();
     is_active
 }
 

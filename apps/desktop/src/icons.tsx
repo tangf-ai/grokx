@@ -95,6 +95,15 @@ export function IconFolder(props: IconProps) {
   );
 }
 
+export function IconFile(props: IconProps) {
+  return (
+    <Svg {...props}>
+      <path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8Z" />
+      <path d="M14 3v5h5" />
+    </Svg>
+  );
+}
+
 export function IconTask(props: IconProps) {
   return (
     <Svg {...props}>
@@ -157,6 +166,16 @@ export function IconStop(props: IconProps) {
   );
 }
 
+/** Goal / objective (flag) — Grok Build `/goal` mode. */
+export function IconGoal(props: IconProps) {
+  return (
+    <Svg {...props}>
+      <path d="M4 21V4" />
+      <path d="M4 4h10l-1.5 3.5L14 11H4" />
+    </Svg>
+  );
+}
+
 export function IconBrand(props: IconProps) {
   return (
     <Svg {...props} size={props.size ?? 20}>
@@ -184,6 +203,14 @@ export function IconChevronRight(props: IconProps) {
   );
 }
 
+export function IconChevronDown(props: IconProps) {
+  return (
+    <Svg {...props}>
+      <path d="m6 9 6 6 6-6" />
+    </Svg>
+  );
+}
+
 export function IconTrash(props: IconProps) {
   return (
     <Svg {...props}>
@@ -196,7 +223,33 @@ export function IconTrash(props: IconProps) {
   );
 }
 
+export function IconCopy(props: IconProps) {
+  return (
+    <Svg {...props}>
+      <rect x="9" y="9" width="13" height="13" rx="2" />
+      <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
+    </Svg>
+  );
+}
+
+export function IconCheck(props: IconProps) {
+  return (
+    <Svg {...props}>
+      <path d="M20 6 9 17l-5-5" />
+    </Svg>
+  );
+}
+
 /** Official GitHub mark (filled) for open-source / repo links. */
+export function IconSideChat(props: IconProps) {
+  return (
+    <Svg {...props}>
+      <path d="M14 3h6a1 1 0 0 1 1 1v12a1 1 0 0 1-1 1h-4l-3 3v-3H9a1 1 0 0 1-1-1V9" />
+      <path d="M4 3h8a1 1 0 0 1 1 1v8a1 1 0 0 1-1 1H8l-3 3v-3H4a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1z" />
+    </Svg>
+  );
+}
+
 export function IconGithub(props: IconProps) {
   return (
     <svg

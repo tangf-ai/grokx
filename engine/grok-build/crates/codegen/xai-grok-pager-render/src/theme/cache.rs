@@ -21,7 +21,7 @@ use super::system_appearance;
 /// `load_from_disk()`, then kept in sync by `set()`.
 static CURRENT: AtomicU8 = AtomicU8::new(ThemeKind::GrokNight as u8);
 static LOADED: AtomicBool = AtomicBool::new(false);
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 static TEST_LOCK: Mutex<()> = Mutex::new(());
 
 /// Whether auto-switching mode is active. Set when the config file
@@ -113,11 +113,16 @@ pub fn terminal_native_locked() -> bool {
 /// Engage or clear the terminal-native theme lock.
 pub fn set_terminal_native_lock(locked: bool) {
     TERMINAL_NATIVE_LOCK.store(locked, Ordering::Relaxed);
+    // Cap quantization at ANSI-16 and switch syntax tokens to the dual-
+    // polarity accent map (default-fg grays + base ANSI hues). Without the
+    // polarity-safe remap, night-theme pastels collapse to White and vanish
+    // on light terminal profiles in minimal mode.
     xai_grok_markdown::set_color_level_cap(if locked {
         xai_grok_markdown::ColorLevel::Basic
     } else {
         xai_grok_markdown::ColorLevel::TrueColor
     });
+    xai_grok_markdown::set_polarity_safe_syntax(locked);
 }
 
 // -- Auto-mode ---------------------------------------------------------------
@@ -270,7 +275,7 @@ fn load_auto_theme_config() -> AutoThemeConfig {
 
 // -- Test support ------------------------------------------------------------
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn reset_for_test() {
     // Tests are serialized via TEST_LOCK so the AtomicU8/AtomicBool
     // pair is safe to reset without any cross-thread coordination.
@@ -284,12 +289,12 @@ pub fn reset_for_test() {
 /// Seed `AUTO_THEME_CONFIG` with explicit defaults so `auto_theme_config()`
 /// never falls through to `load_auto_theme_config()` (which reads the
 /// user's real `config.toml`). Call from test setup after `reset_for_test()`.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn seed_auto_theme_defaults_for_test() {
     *AUTO_THEME_CONFIG.lock().unwrap_or_else(|e| e.into_inner()) = Some(AutoThemeConfig::default());
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn test_lock() -> &'static Mutex<()> {
     &TEST_LOCK
 }
@@ -300,7 +305,7 @@ pub fn test_lock() -> &'static Mutex<()> {
 /// `set_theme` tests mutate) and `Theme::current()` reads the global color
 /// level; holding the shared test lock blocks a mid-test theme change. Hold the
 /// returned guard for the whole test.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn pin_theme() -> std::sync::MutexGuard<'static, ()> {
     let guard = test_lock().lock().unwrap_or_else(|e| e.into_inner());
     set(ThemeKind::GrokNight);
@@ -381,6 +386,20 @@ mod tests {
             set_terminal_native_lock(true);
             reset_for_test();
             assert!(!terminal_native_locked());
+        });
+    }
+
+    #[test]
+    fn terminal_native_lock_enables_polarity_safe_syntax() {
+        with_test_env(|| {
+            assert!(!xai_grok_markdown::polarity_safe_syntax());
+            set_terminal_native_lock(true);
+            assert!(
+                xai_grok_markdown::polarity_safe_syntax(),
+                "minimal must engage polarity-safe syntax remapping"
+            );
+            set_terminal_native_lock(false);
+            assert!(!xai_grok_markdown::polarity_safe_syntax());
         });
     }
 

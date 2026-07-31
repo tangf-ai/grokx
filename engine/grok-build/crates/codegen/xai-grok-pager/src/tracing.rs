@@ -412,7 +412,7 @@ pub fn init_tracing() -> TracingHandle {
     };
     use xai_grok_telemetry::debug_log::RMCP_SSE_NOISE_TARGET;
     let (make_writer, rx) = TracingChannelMakeWriter::new();
-    let payload_level = if false { "debug" } else { "off" };
+    let payload_level = "off";
     let directives = format!(
         "xai_grok_shell=info,xai_grok_pager=trace,xai_grok_tools=info,xai_acp_lib=info,{RMCP_SSE_NOISE_TARGET}=error,sampling_log=off,{ACP_UPDATE_TARGET}=debug,{ACP_UPDATE_PAYLOAD_TARGET}={payload_level}"
     );
@@ -489,7 +489,8 @@ mod tests {
             .with(FilterlessNoOp);
         tracing::subscriber::with_default(subscriber, || {
             tracing::debug!(
-                target : "acp_update_payload", payload = % LazyJson(& probe),
+                target: "acp_update_payload",
+                payload = %LazyJson(&probe),
                 "[acp]",
             );
         });
@@ -512,7 +513,7 @@ mod tests {
     #[test]
     fn lazy_json_display_renders_json() {
         assert_eq!(
-            format!("{}", LazyJson(&serde_json::json!({ "a" : 1 }))),
+            format!("{}", LazyJson(&serde_json::json!({"a": 1}))),
             r#"{"a":1}"#
         );
     }

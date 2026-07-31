@@ -34,6 +34,16 @@ fn event_value(event_name: &str) -> &str {
     event_name
 }
 
+/// Product-analytics `$insert_id`: unique per emit, ≤36 bytes, `[A-Za-z0-9-]`.
+///
+/// Do not put the event name in this field. The analytics sink truncates to 36
+/// chars and rejects most other characters; a name-prefixed id either collapses
+/// to a constant (long names → per-user same-second dedup) or is dropped and
+/// regenerated (shorter names with `:`). A bare UUID always validates.
+fn product_analytics_insert_id() -> String {
+    uuid::Uuid::new_v4().simple().to_string()
+}
+
 #[derive(Clone)]
 pub struct TelemetryClient {
     mode: TelemetryMode,
@@ -114,6 +124,7 @@ impl TelemetryClient {
 fn normalize_tier(tier: &str) -> String {
     match tier {
         "SuperGrok Heavy" | "supergrok_heavy" => "supergrok_heavy",
+        "SuperGrok Plus" | "supergrok_plus" => "supergrok_plus",
         "SuperGrok" | "supergrok" => "supergrok",
         "SuperGrok Lite" | "supergrok_lite" => "supergrok_lite",
         "X Premium+" | "x_premium_plus" => "x_premium_plus",
@@ -236,7 +247,7 @@ pub async fn track(event_name: &str, request_id: &str, ctx: &UserContext, mut me
     // Mixpanel path
     if let Some(ref mixpanel) = client.mixpanel {
         let time_secs = chrono::Utc::now().timestamp();
-        let insert_id = format!("{event_name}:{request_id}:{time_secs}");
+        let insert_id = product_analytics_insert_id();
 
         // Convert serde_json::Map to HashMap for mixpanel
         let mut props: std::collections::HashMap<String, serde_json::Value> =
@@ -255,6 +266,10 @@ pub async fn track(event_name: &str, request_id: &str, ctx: &UserContext, mut me
 }
 
 /// Sync the user's Mixpanel profile once per init. Fire-and-forget.
+///
+/// Only runs in [`TelemetryMode::Enabled`]. SessionMetrics mode may emit
+/// lifecycle events via [`track`], but must not write Mixpanel people
+/// profiles (`engage`).
 pub fn sync_profile() {
     let lock = TELEMETRY_CLIENT.get_or_init(|| Mutex::new(None));
     let client = {
@@ -264,6 +279,12 @@ pub fn sync_profile() {
             None => return,
         }
     };
+
+    // The single profile-sync gate: reads the installed client's mode, so every
+    // caller (and any init race) resolves against what was actually installed.
+    if !client.mode.is_enabled() {
+        return;
+    }
 
     let Some(mixpanel) = client.mixpanel.clone() else {
         return;
@@ -396,6 +417,56 @@ mod tests {
         assert_eq!(event_value("grok-workspace-turn"), "turn");
     }
 
+    /// SessionMetrics must not attempt Mixpanel profile engage — sync_profile
+    /// is a no-op unless mode is fully Enabled.
+    #[test]
+    fn sync_profile_is_noop_in_session_metrics_mode() {
+        // No tokio runtime here BY DESIGN: if the gate wrongly falls through,
+        // sync_profile's tokio::spawn panics and fails this test. Converting
+        // this to #[tokio::test] would silently turn it into theater.
+        assert!(
+            tokio::runtime::Handle::try_current().is_err(),
+            "this test must run without a tokio runtime"
+        );
+        // Clear the global client even if an assert below panics.
+        struct ClearClient;
+        impl Drop for ClearClient {
+            fn drop(&mut self) {
+                let lock = TELEMETRY_CLIENT.get_or_init(|| Mutex::new(None));
+                *lock.lock().unwrap_or_else(|err| err.into_inner()) = None;
+            }
+        }
+        let _clear = ClearClient;
+
+        // Mixpanel configured, but no events endpoint: the global must never
+        // carry a live funnel out of this test.
+        let cfg = TelemetryConfig {
+            mixpanel_enabled: true,
+            mixpanel_token: Some("test-token".into()),
+            events_url: None,
+            events_api_key: None,
+            ..TelemetryConfig::default()
+        };
+        init(
+            cfg,
+            TelemetryMode::SessionMetrics,
+            Some("user-1".into()),
+            None,
+            None,
+            None,
+            "0.0.0-test".into(),
+            None,
+            reqwest::Client::new(),
+        );
+        // Explicit call must no-op too (init already invoked it once).
+        sync_profile();
+        assert!(
+            is_session_metrics_enabled(),
+            "client must be live for session metrics"
+        );
+        assert!(!is_enabled(), "product analytics must stay off");
+    }
+
     /// Names without a known emitter prefix pass through unchanged (preserves
     /// the old `unwrap_or(event_name)` fallback).
     #[test]
@@ -435,6 +506,8 @@ mod tests {
         assert_eq!(normalize_tier("X Premium+"), "x_premium_plus");
         assert_eq!(normalize_tier("X Premium"), "x_premium");
         assert_eq!(normalize_tier("SuperGrok Lite"), "supergrok_lite");
+        assert_eq!(normalize_tier("SuperGrok Plus"), "supergrok_plus");
+        assert_eq!(normalize_tier("supergrok_plus"), "supergrok_plus");
         // API key is a dedicated Mixpanel segment — never free.
         assert_eq!(normalize_tier("API Key"), "api_key");
         assert_eq!(normalize_tier("api_key"), "api_key");

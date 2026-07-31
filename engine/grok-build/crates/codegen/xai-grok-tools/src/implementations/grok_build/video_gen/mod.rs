@@ -691,6 +691,16 @@ impl VideoGenConfig {
     pub fn is_enabled(&self) -> bool {
         matches!(self, Self::Enabled { .. })
     }
+
+    /// Stamp [`super::image_gen::SESSION_ID_HEADER`] onto `extra_headers`.
+    /// A caller-provided value is never overwritten. No-op when `Disabled`.
+    pub fn stamp_session_id_header(&mut self, session_id: &str) {
+        if let Self::Enabled { extra_headers, .. } = self {
+            extra_headers
+                .entry(super::image_gen::SESSION_ID_HEADER.to_string())
+                .or_insert_with(|| session_id.to_string());
+        }
+    }
 }
 
 /// Prose returned to the model (as a normal, successful tool result) when a
@@ -1001,7 +1011,7 @@ impl xai_tool_runtime::Tool for ImageToVideoTool {
     ) -> xai_tool_types::ToolDescription {
         xai_tool_types::ToolDescription::new(
             IMAGE_TO_VIDEO_TOOL_NAME,
-            crate::types::tool_metadata::ToolMetadata::description_template(self),
+            crate::types::tool_metadata::ToolMetadata::sanitized_description_template(self),
         )
     }
 
@@ -1097,7 +1107,7 @@ impl xai_tool_runtime::Tool for ReferenceToVideoTool {
     ) -> xai_tool_types::ToolDescription {
         xai_tool_types::ToolDescription::new(
             REFERENCE_TO_VIDEO_TOOL_NAME,
-            crate::types::tool_metadata::ToolMetadata::description_template(self),
+            crate::types::tool_metadata::ToolMetadata::sanitized_description_template(self),
         )
     }
 

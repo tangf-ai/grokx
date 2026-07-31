@@ -72,9 +72,13 @@ async fn handle_btw(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
         .await
         .map_err(|_| acp::Error::internal_error().data("session failed to respond"))?;
     match result {
-        Ok(answer) => super::to_ext_response(Ok(serde_json::json!({
-            "answer": answer,
-        }))),
+        Ok((answer, thinking)) => {
+            let mut body = serde_json::json!({ "answer": answer });
+            if let Some(t) = thinking.filter(|s| !s.trim().is_empty()) {
+                body["thinking"] = serde_json::Value::String(t);
+            }
+            super::to_ext_response(Ok(body))
+        }
         Err(e) => Err(acp::Error::internal_error().data(e)),
     }
 }
@@ -148,12 +152,6 @@ async fn handle_feedback(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult 
             );
             let turn_number = submission.turn_number;
 
-            if let Some(user_meta) =
-                crate::agent::mvp_agent::parse_json_object_env("GROK_USER_METADATA")
-            {
-                submission.merge_metadata(user_meta);
-            }
-
             // Enrich with session context for Slack notifications (best-effort).
             if let Some(ref session_handle) = session_handle {
                 let (tx, rx) = tokio::sync::oneshot::channel();
@@ -209,23 +207,6 @@ async fn handle_feedback(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult 
                 );
             }
 
-            // Point to the per-turn unified log already uploaded by
-            // complete_prompt_trace. Only set the URL when trace uploads
-            // are active — otherwise the cloud storage object won't exist.
-            if agent.trace_upload_config().await.is_some()
-                && let Some(tn) = turn_number
-            {
-                let bucket_url = {
-                    let cfg = agent.cfg.borrow();
-                    cfg.endpoints.resolve_trace_bucket_url().map(|r| r.value)
-                };
-                submission.unified_log_url = crate::upload::gcs::unified_log_url(
-                    bucket_url.as_deref(),
-                    &feedback_input.session_id,
-                    tn,
-                );
-            }
-
             let telemetry_enabled = {
                 let cfg = agent.cfg.borrow();
                 cfg.is_telemetry_enabled()
@@ -240,12 +221,22 @@ async fn handle_feedback(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult 
                     "no feedback client available (missing proxy credentials); feedback saved locally only"
                 );
             }
+            // Read the live feedback.user config (the session-actor path uses its
+            // spawn-time snapshot); both dedupe through the same process-wide
+            // identity cache, so a stable config resolves identically either way.
+            // Clone out so the RefCell borrow doesn't span an await.
+            let user_cfg = agent.cfg.borrow().feedback.user.clone();
+            let author_identity =
+                crate::util::user_identity::cached_identity(user_cfg.as_ref()).await;
             let outcome = crate::session::feedback_manager::submit_feedback_workflow(
                 &mut submission,
                 client.as_ref(),
                 session_handle.as_ref().map(|h| &h.persistence_tx),
-                feedback_input.is_solicited(),
-                telemetry_enabled,
+                crate::session::feedback_manager::SubmitFeedbackOptions {
+                    solicited: feedback_input.is_solicited(),
+                    telemetry_enabled,
+                    author_identity,
+                },
             )
             .await;
 

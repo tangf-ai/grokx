@@ -1,14 +1,30 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type CSSProperties,
+  type MouseEvent as ReactMouseEvent,
+  type ReactNode,
+} from "react";
+import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { open as openUrl } from "@tauri-apps/plugin-shell";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import {
   IconAlert,
+  IconCheck,
+  IconChevronDown,
   IconChevronLeft,
   IconChevronRight,
+  IconCopy,
+  IconFile,
+  IconFolder,
   IconGithub,
+  IconGoal,
   IconInfo,
   IconPaperclip,
   IconPen,
@@ -16,10 +32,33 @@ import {
   IconRefresh,
   IconSend,
   IconSettings,
+  IconSideChat,
   IconStop,
+  IconTask,
   IconTool,
   IconTrash,
 } from "./icons";
+import {
+  onTitlebarDoubleClick,
+  onTitlebarMouseDown,
+} from "./windowDrag";
+import {
+  detectVerbalOnlyCompletion,
+  VERBAL_COMPLETION_NUDGE,
+} from "./lib/verbalCompletion";
+import {
+  ComposerInput,
+  type ComposerInputHandle,
+} from "./components/ComposerInput";
+import {
+  VirtualChatList,
+  type VirtualChatListHandle,
+} from "./components/VirtualChatList";
+import { SessionOutline } from "./components/SessionOutline";
+import {
+  SideChat,
+  type SideChatMessage,
+} from "./components/SideChat";
 
 /** Public open-source repository (opens in the system browser). */
 const GROKX_GITHUB_URL = "https://github.com/tangf-ai/grokx";
@@ -48,36 +87,191 @@ function openExternalUrl(url: string): void {
 }
 
 /**
- * Shared markdown rendering for chat: links open in the system browser,
- * not inside the Tauri webview.
+ * Resolve markdown image src to a webview-loadable URL.
+ * Agents often emit relative paths (e.g. `rdfs-owl-diagrams/01.png`) against
+ * the task cwd — those must become `asset://` URLs via convertFileSrc.
  */
-function ChatMarkdown({ children }: { children: string }) {
+function resolveLocalMediaSrc(
+  src: string | undefined,
+  bases: Array<string | null | undefined>,
+): string | undefined {
+  if (!src) return undefined;
+  const raw = src.trim().replace(/^<|>$/g, "");
+  if (!raw) return undefined;
+  // Remote / data / already asset protocol
+  if (
+    /^(https?:|data:|asset:|blob:)/i.test(raw) ||
+    raw.startsWith("//")
+  ) {
+    return raw;
+  }
+  let path = raw;
+  if (path.startsWith("file://")) {
+    path = decodeURIComponent(path.replace(/^file:\/\//, ""));
+  }
+  // Absolute filesystem path
+  const isAbs =
+    path.startsWith("/") || /^[A-Za-z]:[\\/]/.test(path);
+  if (!isAbs) {
+    // Relative → try task cwd, then project root
+    const rel = path.replace(/^\.\//, "");
+    let joined: string | null = null;
+    for (const base of bases) {
+      if (!base) continue;
+      const b = base.replace(/[/\\]+$/, "");
+      joined = `${b}/${rel}`.replace(/\\/g, "/");
+      break;
+    }
+    if (!joined) return raw;
+    path = joined;
+  }
+  try {
+    return convertFileSrc(path);
+  } catch {
+    return raw;
+  }
+}
+
+/**
+ * Shared markdown rendering for chat: links open in the system browser;
+ * local images resolve against the active task workspace.
+ * When `streaming`, newly added block-level nodes fade in (DOM MutationObserver)
+ * and a soft caret is shown — no per-character effects.
+ */
+function ChatMarkdown({
+  children,
+  mediaBases = [],
+  streaming = false,
+}: {
+  children: string;
+  /** Candidate roots for relative media (task cwd, project root). */
+  mediaBases?: Array<string | null | undefined>;
+  /** Soft block fade-in + caret while assistant is generating. */
+  streaming?: boolean;
+}) {
+  const rootRef = useRef<HTMLDivElement | null>(null);
+  const knownBlocksRef = useRef<WeakSet<Element>>(new WeakSet());
+
+  useEffect(() => {
+    if (!streaming) {
+      knownBlocksRef.current = new WeakSet();
+      return;
+    }
+    const root = rootRef.current;
+    if (!root || typeof MutationObserver === "undefined") return;
+
+    const markEnter = (el: Element) => {
+      if (knownBlocksRef.current.has(el)) return;
+      knownBlocksRef.current.add(el);
+      el.classList.add("md-block-enter");
+      window.setTimeout(() => el.classList.remove("md-block-enter"), 260);
+    };
+
+    // Seed existing blocks without animating (first paint of this stream).
+    root
+      .querySelectorAll(
+        ":scope > p, :scope > h1, :scope > h2, :scope > h3, :scope > h4, :scope > ul, :scope > ol, :scope > pre, :scope > blockquote, :scope > table, :scope > hr, :scope > li",
+      )
+      .forEach((el) => knownBlocksRef.current.add(el));
+
+    const mo = new MutationObserver((records) => {
+      for (const rec of records) {
+        rec.addedNodes.forEach((node) => {
+          if (node.nodeType !== Node.ELEMENT_NODE) return;
+          const el = node as Element;
+          if (
+            /^(P|H1|H2|H3|H4|UL|OL|LI|PRE|BLOCKQUOTE|TABLE|HR)$/.test(
+              el.tagName,
+            )
+          ) {
+            markEnter(el);
+          }
+          // Nested blocks (e.g. li inside newly added ul)
+          el.querySelectorAll?.(
+            "p, h1, h2, h3, h4, ul, ol, li, pre, blockquote, table, hr",
+          ).forEach((child) => markEnter(child));
+        });
+      }
+    });
+    mo.observe(root, { childList: true, subtree: true });
+    return () => mo.disconnect();
+  }, [streaming]);
+
   return (
-    <ReactMarkdown
-      remarkPlugins={[remarkGfm]}
-      components={{
-        a({ href, children: linkChildren, node: _node, ...props }) {
-          return (
-            <a
-              {...props}
-              href={href}
-              // No target=_blank: WKWebView would also open the system browser,
-              // doubling with our shell open().
-              rel="noopener noreferrer"
-              onClick={(e) => {
-                e.preventDefault();
-                e.stopPropagation();
-                if (href) openExternalUrl(href);
-              }}
-            >
-              {linkChildren}
-            </a>
-          );
-        },
-      }}
+    <div
+      ref={rootRef}
+      className={`md-stream-root${streaming ? " is-streaming" : ""}`}
     >
-      {children}
-    </ReactMarkdown>
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        urlTransform={(url) => {
+          // Allow local paths / asset URLs through (default sanitizer may strip).
+          if (!url) return url;
+          if (/^(https?:|data:|asset:|blob:|file:)/i.test(url)) return url;
+          if (url.startsWith("/") || url.startsWith("./") || !url.includes(":")) {
+            return url;
+          }
+          return url;
+        }}
+        components={{
+          a({ href, children: linkChildren, node: _node, ...props }) {
+            return (
+              <a
+                {...props}
+                href={href}
+                // No target=_blank: WKWebView would also open the system browser,
+                // doubling with our shell open().
+                rel="noopener noreferrer"
+                onClick={(e) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  if (href) openExternalUrl(href);
+                }}
+              >
+                {linkChildren}
+              </a>
+            );
+          },
+          img({ src, alt, node: _node, ...props }) {
+            const resolved = resolveLocalMediaSrc(src, mediaBases);
+            if (!resolved) return null;
+            return (
+              <img
+                {...props}
+                src={resolved}
+                alt={alt ?? ""}
+                className="chat-md-img"
+                loading="lazy"
+                onClick={(e) => {
+                  e.preventDefault();
+                  // Prefer opening the original path when possible.
+                  const orig = (src || "").trim();
+                  if (orig && !/^(https?:|data:)/i.test(orig)) {
+                    const abs =
+                      orig.startsWith("/") || /^[A-Za-z]:[\\/]/.test(orig)
+                        ? orig
+                        : mediaBases.find(Boolean)
+                          ? `${String(mediaBases.find(Boolean)).replace(
+                              /[/\\]+$/,
+                              "",
+                            )}/${orig.replace(/^\.\//, "")}`
+                          : null;
+                    if (abs) {
+                      void invoke("open_path", { path: abs }).catch(() => {});
+                      return;
+                    }
+                  }
+                  if (resolved.startsWith("http")) openExternalUrl(resolved);
+                }}
+              />
+            );
+          },
+        }}
+      >
+        {children}
+      </ReactMarkdown>
+      {streaming ? <span className="stream-caret" aria-hidden /> : null}
+    </div>
   );
 }
 
@@ -141,12 +335,18 @@ type Attachment = {
 type ModelOption = { id: string; name: string };
 type EffortOption = { id: string; label: string };
 
+type PermissionMode = "ask" | "auto" | "always-approve";
+
 type PublicSettings = {
   custom_engine_path?: string | null;
   prefer_bundled_engine: boolean;
   model?: string | null;
   effort?: string | null;
   sync_to_grok_config: boolean;
+  /** `ask` | `auto` | `always-approve` (full trust) */
+  permission_mode?: string | null;
+  /** Legacy mirror of full trust */
+  auto_approve?: boolean;
   endpoint: {
     model_id: string;
     name?: string | null;
@@ -161,11 +361,142 @@ type PublicSettings = {
   grok_config_path: string;
 };
 
+function normalizePermissionMode(raw?: string | null, legacyAuto?: boolean): PermissionMode {
+  const v = (raw || "").trim().toLowerCase();
+  if (v === "auto") return "auto";
+  if (
+    v === "always-approve" ||
+    v === "always_approve" ||
+    v === "yolo" ||
+    v === "full-trust" ||
+    v === "full_trust" ||
+    v === "trusted"
+  ) {
+    return "always-approve";
+  }
+  if (!v && legacyAuto) return "always-approve";
+  return "ask";
+}
+
+type ChatAttachment = {
+  path: string;
+  name: string;
+  mime?: string | null;
+  size?: number | null;
+  /** asset:// URL for image preview in chat history */
+  previewSrc?: string | null;
+};
+
 function formatBytes(n?: number | null): string {
   if (n == null) return "";
   if (n < 1024) return `${n} B`;
   if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
   return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+/** Compact label for process rows (basename + key args, not full path). */
+function shortProcessLabel(command: string): string {
+  const raw = (command || "").trim().replace(/\s+/g, " ");
+  if (!raw) return "process";
+  const mykg = raw.match(/\bmykg\s+(\w+)/i);
+  if (mykg) {
+    const port = raw.match(/--port\s+(\d+)/);
+    return port ? `mykg ${mykg[1]} :${port[1]}` : `mykg ${mykg[1]}`;
+  }
+  if (/\b(uvicorn|gunicorn)\b/i.test(raw)) {
+    const m = raw.match(/\b(uvicorn|gunicorn)\b/i);
+    return m ? m[1].toLowerCase() : "server";
+  }
+  if (/\b(vite|next|webpack-dev-server)\b/i.test(raw)) {
+    const m = raw.match(/\b(vite|next|webpack-dev-server)\b/i);
+    return m ? m[1] : "dev-server";
+  }
+  const parts = raw.split(" ");
+  let bin = parts[0] || "process";
+  bin = bin.split("/").pop() || bin;
+  if (bin === "uv" && parts[1] === "run" && parts[2]) {
+    return shortProcessLabel(parts.slice(2).join(" "));
+  }
+  if (bin === "python" || bin === "python3") {
+    const script = parts.find((p) => p.endsWith(".py"));
+    if (script) return script.split("/").pop() || script;
+  }
+  const tail = parts.slice(1, 3).join(" ");
+  const label = tail ? `${bin} ${tail}` : bin;
+  return label.length > 36 ? `${label.slice(0, 33)}…` : label;
+}
+
+type SessionProcLike = {
+  pid: number;
+  ppid: number;
+  command: string;
+  etime: string;
+  state: string;
+  cpu: string;
+  mem: string;
+  depth: number;
+  cwd?: string | null;
+  paused: boolean;
+};
+
+type SessionProcNode = SessionProcLike & { children: SessionProcNode[] };
+
+/**
+ * Build parent→child trees so `uv run …` + its python worker show as one
+ * expandable root instead of two identical flat rows.
+ */
+function buildProcessTree(procs: SessionProcLike[]): SessionProcNode[] {
+  if (procs.length === 0) return [];
+  const byPid = new Map<number, SessionProcNode>();
+  for (const p of procs) {
+    byPid.set(p.pid, { ...p, children: [] });
+  }
+  const roots: SessionProcNode[] = [];
+  for (const node of byPid.values()) {
+    const parent = byPid.get(node.ppid);
+    if (parent && parent.pid !== node.pid) {
+      parent.children.push(node);
+    } else {
+      roots.push(node);
+    }
+  }
+  // Prefer shallower / older-looking roots first.
+  const sortNodes = (nodes: SessionProcNode[]) => {
+    nodes.sort((a, b) => a.pid - b.pid);
+    for (const n of nodes) sortNodes(n.children);
+  };
+  sortNodes(roots);
+  return roots;
+}
+
+/** True for image attachments (mime or extension). */
+function isImageAttachment(a: {
+  name?: string | null;
+  mime?: string | null;
+}): boolean {
+  if (a.mime?.startsWith("image/")) return true;
+  const n = (a.name || "").toLowerCase();
+  return /\.(png|jpe?g|gif|webp|bmp|svg)$/i.test(n);
+}
+
+/**
+ * Prefer the original human filename. Never show a temp uuid-prefixed path
+ * leaf when a real name is available.
+ */
+function attachmentDisplayName(a: {
+  name?: string | null;
+  path?: string | null;
+}): string {
+  const fromName = (a.name || "").trim();
+  if (fromName && !/^[0-9a-f]{8}-/i.test(fromName)) {
+    // Strip any accidental path prefix; keep basename.
+    const leaf = fromName.split(/[/\\]/).pop() || fromName;
+    if (leaf) return leaf;
+  }
+  const fromPath = (a.path || "").split(/[/\\]/).pop() || "";
+  // Temp paste files look like `a1b2c3d4-报告.docx` — strip uuid prefix if present.
+  const stripped = fromPath.replace(/^[0-9a-f]{8}-/i, "");
+  return stripped || fromName || fromPath || "file";
 }
 
 function formatDuration(ms: number): string {
@@ -175,6 +506,97 @@ function formatDuration(ms: number): string {
   const m = Math.floor(sec / 60);
   const s = Math.round(sec % 60);
   return `${m}m ${s.toString().padStart(2, "0")}s`;
+}
+
+/** Compact clock for user bubbles, e.g. 14:32 or 昨天 09:05. */
+function formatMessageTime(iso?: string | null): string | null {
+  if (!iso) return null;
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return null;
+  const now = new Date();
+  const pad = (n: number) => n.toString().padStart(2, "0");
+  const hm = `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  const sameDay =
+    d.getFullYear() === now.getFullYear() &&
+    d.getMonth() === now.getMonth() &&
+    d.getDate() === now.getDate();
+  if (sameDay) return hm;
+  const yesterday = new Date(now);
+  yesterday.setDate(now.getDate() - 1);
+  const isYesterday =
+    d.getFullYear() === yesterday.getFullYear() &&
+    d.getMonth() === yesterday.getMonth() &&
+    d.getDate() === yesterday.getDate();
+  if (isYesterday) return `昨天 ${hm}`;
+  if (d.getFullYear() === now.getFullYear()) {
+    return `${d.getMonth() + 1}/${d.getDate()} ${hm}`;
+  }
+  return `${d.getFullYear()}/${d.getMonth() + 1}/${d.getDate()} ${hm}`;
+}
+
+/**
+ * Rough token estimate for display (not API-reported usage).
+ * CJK ideographs ≈ 1 token; other non-space chars ≈ 4 chars / token.
+ */
+function estimateTokens(text: string): number {
+  let cjk = 0;
+  let other = 0;
+  for (const ch of text) {
+    const code = ch.codePointAt(0) ?? 0;
+    if (
+      (code >= 0x4e00 && code <= 0x9fff) ||
+      (code >= 0x3400 && code <= 0x4dbf) ||
+      (code >= 0x3040 && code <= 0x30ff) ||
+      (code >= 0xac00 && code <= 0xd7af)
+    ) {
+      cjk += 1;
+    } else if (/\s/u.test(ch)) {
+      // ignore whitespace
+    } else {
+      other += 1;
+    }
+  }
+  return Math.max(1, Math.round(cjk + other / 4));
+}
+
+function formatTokensPerSec(tps: number): string {
+  if (!Number.isFinite(tps) || tps <= 0) return "—";
+  if (tps >= 100) return `${Math.round(tps)}`;
+  if (tps >= 10) return tps.toFixed(0);
+  return tps.toFixed(1);
+}
+
+/** Compact token count for the context meter (e.g. 1.2k, 128k). */
+function formatTokenCount(n: number): string {
+  if (!Number.isFinite(n) || n < 0) return "0";
+  if (n < 1000) return `${Math.round(n)}`;
+  if (n < 10_000) return `${(n / 1000).toFixed(1)}k`;
+  if (n < 1_000_000) return `${Math.round(n / 1000)}k`;
+  return `${(n / 1_000_000).toFixed(1)}M`;
+}
+
+/** Estimate session context from visible chat (fallback when engine omits totalTokens). */
+function estimateSessionTokens(chat: ChatLine[], draftText: string): number {
+  let total = 0;
+  for (const line of chat) {
+    if (
+      line.kind === "user" ||
+      line.kind === "assistant" ||
+      line.kind === "thought" ||
+      line.kind === "system" ||
+      line.kind === "error"
+    ) {
+      total += estimateTokens(line.text);
+    } else if (line.kind === "tool") {
+      total += estimateTokens(line.text);
+    } else if (line.kind === "trace") {
+      for (const item of line.items) {
+        total += estimateTokens(item.text);
+      }
+    }
+  }
+  if (draftText.trim()) total += estimateTokens(draftText);
+  return total;
 }
 
 /** Short sidebar title from first user message + optional first assistant reply. */
@@ -215,13 +637,39 @@ type TraceItem = {
   id: string;
   kind: "thought" | "tool" | "system" | "waiting";
   text: string;
+  /** Merged consecutive identical tool lines (for × N display). */
+  count?: number;
 };
 
 type ChatLine =
-  | { id: string; kind: "user"; text: string }
-  | { id: string; kind: "assistant"; text: string }
+  | {
+      id: string;
+      kind: "user";
+      text: string;
+      /** ISO timestamp when the user sent this message. */
+      at?: string;
+      /** Optional image/file attachments shown as thumbnails in the bubble. */
+      attachments?: ChatAttachment[];
+    }
+  | {
+      id: string;
+      kind: "assistant";
+      text: string;
+      /** Estimated output tokens (not API usage). */
+      tokens?: number;
+      /** Wall-clock stream duration for this reply (ms). */
+      streamMs?: number;
+      /** Estimated tokens / second over the stream window. */
+      tokensPerSec?: number;
+    }
   | { id: string; kind: "thought"; text: string }
-  | { id: string; kind: "tool"; text: string }
+  | {
+      id: string;
+      kind: "tool";
+      text: string;
+      /** Consecutive identical tool status lines merged into one chip. */
+      count?: number;
+    }
   | { id: string; kind: "system"; text: string }
   | { id: string; kind: "error"; text: string }
   | { id: string; kind: "waiting"; text: string }
@@ -240,7 +688,102 @@ function nextLineId(kind: string): string {
   return `${kind}-${Date.now()}-${chatLineSeq}`;
 }
 
-/** After a turn ends: fold thought/tool/system into one collapsible trace above the answer. */
+/**
+ * Rough row height for windowing (px). Prefer slight over-estimate so
+ * scrollHeight is never shorter than reality (under-estimate blocks bottom).
+ * VirtualChatList corrects with ResizeObserver once rows mount.
+ */
+function estimateChatLineHeight(line: ChatLine): number {
+  switch (line.kind) {
+    case "tool":
+    case "system":
+      return 40;
+    case "waiting":
+      return 44;
+    case "error":
+      return 64;
+    case "trace": {
+      const base = 48;
+      if (!line.expanded) return base;
+      return base + Math.min(800, line.items.length * 40);
+    }
+    case "thought": {
+      const lines = Math.ceil((line.text?.length ?? 0) / 70);
+      return Math.min(600, 56 + lines * 22);
+    }
+    case "assistant": {
+      // Markdown + spacing is taller than plain char estimates.
+      const lines = Math.ceil((line.text?.length ?? 0) / 55);
+      return Math.max(80, Math.min(6000, 72 + lines * 24));
+    }
+    case "user": {
+      const textLines = Math.ceil((line.text?.length ?? 0) / 48);
+      const atts = line.attachments?.length ?? 0;
+      return Math.min(800, 56 + textLines * 22 + (atts > 0 ? 88 : 0));
+    }
+    default:
+      return 72;
+  }
+}
+
+/** Normalize tool chip text for merge comparison (trim + collapse spaces). */
+function normalizeToolChipText(text: string): string {
+  return text.trim().replace(/\s+/g, " ");
+}
+
+/**
+ * Append a tool status line, merging consecutive identical texts into
+ * `tool → running × N` instead of spamming the chat.
+ */
+function appendOrMergeToolLine(prev: ChatLine[], text: string): ChatLine[] {
+  const label = normalizeToolChipText(text) || "Tool";
+  let base = prev;
+  if (base.length && base[base.length - 1].kind === "waiting") {
+    base = base.slice(0, -1);
+  }
+  const last = base[base.length - 1];
+  if (
+    last &&
+    last.kind === "tool" &&
+    normalizeToolChipText(last.text) === label
+  ) {
+    const copy = base.slice(0, -1);
+    copy.push({
+      ...last,
+      count: (last.count ?? 1) + 1,
+    });
+    return copy;
+  }
+  return [
+    ...base,
+    { id: nextLineId("tool"), kind: "tool", text: label, count: 1 },
+  ];
+}
+
+/** Display label for a tool chip, with ×N when merged. */
+function formatToolChipLabel(line: {
+  text: string;
+  count?: number;
+}): string {
+  const n = line.count ?? 1;
+  if (n <= 1) return line.text;
+  return `${line.text} × ${n}`;
+}
+
+/** Process kinds that fold into the collapsible "Worked" strip. */
+function isProcessLine(
+  line: ChatLine,
+): line is Extract<ChatLine, { kind: "thought" | "tool" | "system" }> {
+  return (
+    line.kind === "thought" || line.kind === "tool" || line.kind === "system"
+  );
+}
+
+/**
+ * After a turn ends: fold thought/tool/system into one collapsible trace
+ * above the answer(s). Safe to call again if late tool events arrived after
+ * a previous collapse (merges into existing trace).
+ */
 function collapseTurnProcess(
   lines: ChatLine[],
   durationMs: number,
@@ -256,21 +799,35 @@ function collapseTurnProcess(
 
   const head = lines.slice(0, lastUser + 1);
   const tail = lines.slice(lastUser + 1);
-  // Don't collapse twice.
-  if (tail.some((l) => l.kind === "trace")) return lines;
 
   const items: TraceItem[] = [];
   const answers: ChatLine[] = [];
   const rest: ChatLine[] = [];
+  let existingTrace: Extract<ChatLine, { kind: "trace" }> | null = null;
 
   for (const line of tail) {
-    if (line.kind === "waiting") continue; // drop typing placeholder
-    if (
-      line.kind === "thought" ||
-      line.kind === "tool" ||
-      line.kind === "system"
-    ) {
-      items.push({ id: line.id, kind: line.kind, text: line.text });
+    if (line.kind === "waiting") continue;
+    if (line.kind === "trace") {
+      // Keep first trace; fold any later process lines into it.
+      if (!existingTrace) {
+        existingTrace = line;
+        items.push(...line.items);
+      } else {
+        items.push(...line.items);
+      }
+      continue;
+    }
+    if (isProcessLine(line)) {
+      if (line.kind === "tool") {
+        items.push({
+          id: line.id,
+          kind: "tool",
+          text: line.text,
+          count: line.count,
+        });
+      } else {
+        items.push({ id: line.id, kind: line.kind, text: line.text });
+      }
     } else if (line.kind === "assistant") {
       answers.push(line);
     } else {
@@ -280,20 +837,60 @@ function collapseTurnProcess(
 
   if (items.length === 0) return lines;
 
+  // Prefer measured duration; keep prior trace duration if new measure is 0.
+  const priorDur = existingTrace?.durationMs ?? 0;
+  const dur =
+    durationMs > 0 ? durationMs : priorDur > 0 ? priorDur : 0;
+
   const trace: ChatLine = {
-    id: nextLineId("trace"),
+    id: existingTrace?.id ?? nextLineId("trace"),
     kind: "trace",
     items,
-    durationMs: Math.max(0, durationMs),
+    durationMs: Math.max(0, dur),
     expanded: false,
   };
 
   return [...head, trace, ...answers, ...rest];
 }
 
+/**
+ * Collapse every turn in a transcript that still has raw thought/tool lines.
+ * Used when loading history that was saved before collapse ran.
+ */
+function collapseAllTurnsInHistory(lines: ChatLine[]): ChatLine[] {
+  const userIdx: number[] = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i].kind === "user") userIdx.push(i);
+  }
+  if (userIdx.length === 0) return lines;
+
+  const out: ChatLine[] = [];
+  // Preserve any prefix before the first user message.
+  if (userIdx[0] > 0) {
+    out.push(...lines.slice(0, userIdx[0]));
+  }
+
+  for (let u = 0; u < userIdx.length; u++) {
+    const start = userIdx[u];
+    const end = u + 1 < userIdx.length ? userIdx[u + 1] : lines.length;
+    const turnSlice = lines.slice(start, end);
+    if (turnSlice.some(isProcessLine)) {
+      // collapseTurnProcess folds from the last user in its input — pass only this turn.
+      const collapsed = collapseTurnProcess(turnSlice, 0);
+      out.push(...collapsed);
+    } else {
+      out.push(...turnSlice);
+    }
+  }
+  return out;
+}
+
 function summarizeTrace(items: TraceItem[]): string {
   const thoughts = items.filter((i) => i.kind === "thought").length;
-  const tools = items.filter((i) => i.kind === "tool").length;
+  // Count merged tool chips by their × N (so 50× running = 50 tools, not 1).
+  const tools = items
+    .filter((i) => i.kind === "tool")
+    .reduce((sum, i) => sum + (i.count ?? 1), 0);
   const systems = items.filter((i) => i.kind === "system").length;
   const parts: string[] = [];
   if (thoughts) parts.push(thoughts === 1 ? "thinking" : `${thoughts} thoughts`);
@@ -302,6 +899,7 @@ function summarizeTrace(items: TraceItem[]): string {
   if (parts.length === 0) parts.push(`${items.length} steps`);
   return parts.join(" · ");
 }
+
 
 type AgentEvent = {
   type: string;
@@ -312,6 +910,8 @@ type AgentEvent = {
   message?: string;
   state?: string;
   steps?: string[];
+  /** Engine `_meta.totalTokens` when present (context_usage events). */
+  used_tokens?: number;
   tool?: {
     title?: string;
     kind?: string;
@@ -340,6 +940,57 @@ function shortPath(p: string | null | undefined): string {
   return `…/${parts.slice(-2).join("/")}`;
 }
 
+const SIDEBAR_W_MIN = 180;
+const SIDEBAR_W_MAX = 440;
+const RIGHT_W_MIN = 220;
+const RIGHT_W_MAX = 560;
+
+function clampWidth(n: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, Math.round(n)));
+}
+
+function readStoredWidth(
+  key: string,
+  fallback: number,
+  min: number,
+  max: number,
+): number {
+  try {
+    const raw = localStorage.getItem(key);
+    if (!raw) return fallback;
+    const n = Number(raw);
+    if (!Number.isFinite(n)) return fallback;
+    return clampWidth(n, min, max);
+  } catch {
+    return fallback;
+  }
+}
+
+function writeStoredWidth(key: string, value: number): void {
+  try {
+    localStorage.setItem(key, String(value));
+  } catch {
+    /* ignore quota / private mode */
+  }
+}
+
+/** Parent directory of a path (POSIX-ish). */
+function parentDir(path: string): string | null {
+  const norm = path.replace(/\\/g, "/").replace(/\/+$/, "");
+  const i = norm.lastIndexOf("/");
+  if (i <= 0) return null;
+  // Keep leading slash on absolute paths.
+  return norm.slice(0, i) || "/";
+}
+
+type DirEntry = {
+  name: string;
+  path: string;
+  is_dir: boolean;
+  size?: number | null;
+  modified?: string | null;
+};
+
 function ChipIcon({ kind }: { kind: ChatLine["kind"] | TraceItem["kind"] }) {
   switch (kind) {
     case "tool":
@@ -361,9 +1012,32 @@ export default function App() {
   const [engine, setEngine] = useState<EngineInfo | null>(null);
   const [session, setSession] = useState<SessionInfo | null>(null);
   const [projects, setProjects] = useState<ProjectListRow[]>([]);
+  /** Project used for “new task under project” / highlight context. */
   const [selectedProjectId, setSelectedProjectId] = useState<string | null>(
     null,
   );
+  /**
+   * Projects whose nested task lists are open. Independent of selection so
+   * switching to another project/session does not collapse an open project.
+   */
+  const [expandedProjectIds, setExpandedProjectIds] = useState<Set<string>>(
+    () => new Set(),
+  );
+  /** Sidebar section fold: Projects / Tasks lists (label click). */
+  const [projectsSectionOpen, setProjectsSectionOpen] = useState(() => {
+    try {
+      return localStorage.getItem("grokx.sidebar.projectsOpen") !== "0";
+    } catch {
+      return true;
+    }
+  });
+  const [tasksSectionOpen, setTasksSectionOpen] = useState(() => {
+    try {
+      return localStorage.getItem("grokx.sidebar.tasksOpen") !== "0";
+    } catch {
+      return true;
+    }
+  });
   const [sessions, setSessions] = useState<SessionListRow[]>([]);
   const [renamingId, setRenamingId] = useState<string | null>(null);
   const [renameDraft, setRenameDraft] = useState("");
@@ -372,17 +1046,191 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
   const [appVersion, setAppVersion] = useState<string>("0.1.0");
   const [lines, setLines] = useState<ChatLine[]>([]);
-  const [draft, setDraft] = useState("");
+  /**
+   * Composer draft lives in ComposerInput (local state) so typing does not
+   * re-render the full chat. These are cheap parent mirrors only:
+   * - draftForMeter: debounced, for context token estimate
+   * - composerHasText: boolean for Send button enablement
+   */
+  const [draftForMeter, setDraftForMeter] = useState("");
+  const [composerHasText, setComposerHasText] = useState(false);
+  /** Composer Goal menu (Grok Build `/goal` slash command). */
+  const [goalMenuOpen, setGoalMenuOpen] = useState(false);
+  const goalMenuRef = useRef<HTMLDivElement | null>(null);
+  /** Edit a past user bubble, then re-send from that point. */
+  const [editingUserId, setEditingUserId] = useState<string | null>(null);
+  const [editDraft, setEditDraft] = useState("");
+  const editTextareaRef = useRef<HTMLTextAreaElement | null>(null);
+  /** Busy for the *focused* task (composer / status pill). */
   const [busy, setBusy] = useState(false);
+  /**
+   * Shown when Working lasts a long time (often a foreground server / hang).
+   * Cleared when the turn ends or the user dismisses / stops.
+   */
+  const [longRunNotice, setLongRunNotice] = useState<{
+    elapsedSec: number;
+    toolHint: string | null;
+  } | null>(null);
+  /** User hid the long-run banner for the current turn. */
+  const longRunDismissedRef = useRef(false);
+  /**
+   * Per-task busy map so sidebar shows Working on background agents.
+   * Multiple tasks can stream in parallel; only the active one's chat is shown.
+   */
+  const [sessionBusyMap, setSessionBusyMap] = useState<Record<string, boolean>>(
+    {},
+  );
+  /**
+   * Sessions that produced activity while not focused — show a dot next to
+   * the task title until the user opens that task.
+   */
+  const [sessionUnreadMap, setSessionUnreadMap] = useState<
+    Record<string, boolean>
+  >({});
+  const sessionUnreadMapRef = useRef<Map<string, boolean>>(new Map());
   const [connecting, setConnecting] = useState(false);
   const [agentStatus, setAgentStatus] = useState<string>("disconnected");
-  const [autoApprove, setAutoApprove] = useState(false);
+  /** Tool permission: ask | auto | always-approve (full trust). */
+  const [permissionMode, setPermissionMode] =
+    useState<PermissionMode>("ask");
+  /** Engine-reported session tokens (`_meta.totalTokens`); null → estimate from chat. */
+  const [engineContextTokens, setEngineContextTokens] = useState<number | null>(
+    null,
+  );
+  /** Per-task engine token totals so switching restores correctly; new tasks start empty. */
+  const sessionContextTokensRef = useRef<Map<string, number>>(new Map());
+  /** In-memory transcript for background tasks still receiving events. */
+  const sessionLinesCacheRef = useRef<Map<string, ChatLine[]>>(new Map());
+  const busyRef = useRef(false);
+  const sessionBusyMapRef = useRef<Map<string, boolean>>(new Map());
   const [pendingPerm, setPendingPerm] = useState<PendingPermission | null>(null);
   /** Main view: workspace chat vs full settings page. */
   const [view, setView] = useState<"workspace" | "settings">("workspace");
-  /** Right Outputs rail — collapsible to free chat space. */
+  /** Right rail — collapsible; holds Chat (btw) + Outputs tabs. */
   const [outputsOpen, setOutputsOpen] = useState(true);
+  /** Side chat messages per session (not main transcript). */
+  const [sideChatBySession, setSideChatBySession] = useState<
+    Record<string, SideChatMessage[]>
+  >({});
+  /**
+   * Chat-area session outline (user prompts list).
+   * Default collapsed (dots only, centered); expanded = short text list.
+   */
+  const [sessionOutlineCollapsed, setSessionOutlineCollapsed] = useState(() => {
+    try {
+      // Default collapsed; only expand when user explicitly set "0".
+      return localStorage.getItem("grokx.sessionOutlineCollapsed") !== "0";
+    } catch {
+      return true;
+    }
+  });
+  /** Left Projects/Tasks rail — collapsible (persisted). */
+  const [sidebarOpen, setSidebarOpen] = useState(() => {
+    try {
+      return localStorage.getItem("grokx.sidebarOpen") !== "0";
+    } catch {
+      return true;
+    }
+  });
+  /** Draggable column widths (px); persisted across restarts. */
+  const [sidebarWidth, setSidebarWidth] = useState(() =>
+    readStoredWidth("grokx.sidebarWidth", 248, SIDEBAR_W_MIN, SIDEBAR_W_MAX),
+  );
+  const [rightWidth, setRightWidth] = useState(() =>
+    readStoredWidth("grokx.rightWidth", 300, RIGHT_W_MIN, RIGHT_W_MAX),
+  );
+  const sidebarWidthRef = useRef(sidebarWidth);
+  const rightWidthRef = useRef(rightWidth);
+  useEffect(() => {
+    sidebarWidthRef.current = sidebarWidth;
+  }, [sidebarWidth]);
+  useEffect(() => {
+    rightWidthRef.current = rightWidth;
+  }, [rightWidth]);
+  const panelDragRef = useRef<{
+    kind: "sidebar" | "right";
+    startX: number;
+    startW: number;
+  } | null>(null);
+  /**
+   * Right panel tab: Chat (/btw side Q&A) vs Outputs overview/files.
+   * Persisted so reopen lands on last section.
+   */
+  const [outputsTab, setOutputsTab] = useState<
+    "chat" | "overview" | "files"
+  >(() => {
+    try {
+      const raw = localStorage.getItem("grokx.rightTab");
+      if (raw === "chat" || raw === "overview" || raw === "files") return raw;
+    } catch {
+      /* ignore */
+    }
+    return "overview";
+  });
+  /** Which root is listed: task cwd vs project folder. */
+  const [filesRootKind, setFilesRootKind] = useState<"task" | "project">("task");
+  const [filesBrowsePath, setFilesBrowsePath] = useState<string | null>(null);
+  const [filesEntries, setFilesEntries] = useState<DirEntry[]>([]);
+  const [filesLoading, setFilesLoading] = useState(false);
+  const [filesError, setFilesError] = useState<string | null>(null);
+  type GitCommitRow = {
+    hash: string;
+    short: string;
+    subject: string;
+    author: string;
+    relative: string;
+  };
+  type GitStatusInfo = {
+    path: string;
+    is_repo: boolean;
+    branch?: string | null;
+    head_short?: string | null;
+    head?: string | null;
+    upstream?: string | null;
+    dirty: boolean;
+    staged: number;
+    unstaged: number;
+    untracked: number;
+    changes: string[];
+    recent: GitCommitRow[];
+    note?: string | null;
+  };
+  const [gitInfo, setGitInfo] = useState<GitStatusInfo | null>(null);
+  const [gitLoading, setGitLoading] = useState(false);
+  const [gitError, setGitError] = useState<string | null>(null);
+  type SessionProc = {
+    pid: number;
+    ppid: number;
+    command: string;
+    etime: string;
+    state: string;
+    cpu: string;
+    mem: string;
+    depth: number;
+    cwd?: string | null;
+    paused: boolean;
+  };
+  const [sessionProcs, setSessionProcs] = useState<SessionProc[]>([]);
+  const [procsLoading, setProcsLoading] = useState(false);
+  const [procsError, setProcsError] = useState<string | null>(null);
+  const [procActionPid, setProcActionPid] = useState<number | null>(null);
+  /** Whole Processes card collapsed by default to keep Outputs quiet. */
+  const [procsSectionOpen, setProcsSectionOpen] = useState(false);
+  /** Per-pid expanded detail rows. */
+  const [expandedProcPids, setExpandedProcPids] = useState<Set<number>>(
+    () => new Set(),
+  );
+  /** Parent→child trees for Outputs Processes (uv + worker = one root). */
+  const processTree = useMemo(
+    () => buildProcessTree(sessionProcs),
+    [sessionProcs],
+  );
   const [attachments, setAttachments] = useState<Attachment[]>([]);
+  /** Full-screen preview for a pending composer image attachment. */
+  const [attachmentPreview, setAttachmentPreview] = useState<{
+    src: string;
+    name: string;
+  } | null>(null);
   const [models, setModels] = useState<ModelOption[]>([]);
   const [modelId, setModelId] = useState<string>("grok-4.5");
   const [efforts, setEfforts] = useState<EffortOption[]>([]);
@@ -390,6 +1238,14 @@ export default function App() {
   /** Sticky user prompt while reading replies (id of last scrolled-past user msg). */
   const [stickyUserId, setStickyUserId] = useState<string | null>(null);
   const [highlightUserId, setHighlightUserId] = useState<string | null>(null);
+  /** Floating control when chat is scrolled up and more content is below. */
+  const [showScrollToBottom, setShowScrollToBottom] = useState(false);
+  /** Assistant message just copied: which id + format (brief "Copied" feedback). */
+  const [copiedMsg, setCopiedMsg] = useState<{
+    id: string;
+    format: "md" | "plain";
+  } | null>(null);
+  const copiedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [settingsMsg, setSettingsMsg] = useState<string | null>(null);
   const [savingSettings, setSavingSettings] = useState(false);
   // Form fields for system LLM config
@@ -406,12 +1262,43 @@ export default function App() {
   const [cfgHasKey, setCfgHasKey] = useState(false);
   const [cfgKeyHint, setCfgKeyHint] = useState<string | null>(null);
   const [cfgGrokPath, setCfgGrokPath] = useState("~/.grok/config.toml");
+  /** Settings → Test connection / Fetch models */
+  const [endpointProbeBusy, setEndpointProbeBusy] = useState(false);
+  const [fetchedRemoteModels, setFetchedRemoteModels] = useState<
+    Array<{ id: string; name: string }>
+  >([]);
+  /** Settings left-nav section (directory → detail). */
+  const [settingsSection, setSettingsSection] = useState<
+    "model" | "toml" | "engine"
+  >("model");
+  /** Raw ~/.grok/config.toml editor (Settings). */
+  const [grokToml, setGrokToml] = useState("");
+  const [grokTomlPath, setGrokTomlPath] = useState("");
+  const [grokTomlExists, setGrokTomlExists] = useState(false);
+  const [grokTomlDirty, setGrokTomlDirty] = useState(false);
+  const [grokTomlMsg, setGrokTomlMsg] = useState<string | null>(null);
+  const [savingGrokToml, setSavingGrokToml] = useState(false);
   const bottomRef = useRef<HTMLDivElement | null>(null);
-  const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const composerRef = useRef<ComposerInputHandle | null>(null);
   const chatScrollRef = useRef<HTMLDivElement | null>(null);
+  const virtualChatRef = useRef<VirtualChatListHandle | null>(null);
   const userMsgEls = useRef<Map<string, HTMLDivElement>>(new Map());
+  /** Cancel multi-pass jump alignment when a newer jump starts. */
+  const jumpAlignGenRef = useRef(0);
   /** Wall-clock start of the in-flight agent turn (for duration on collapse). */
   const turnStartedAtRef = useRef<number | null>(null);
+  /**
+   * Auto-continue when the model ends a turn with only verbal progress.
+   * Resets when the user sends a new prompt; max 1 auto-nudge per user turn.
+   */
+  const verbalNudgeUsedRef = useRef(false);
+  const autoNudgeInFlightRef = useRef(false);
+  /** After Stop, ignore late busy events for this session until a new send. */
+  const userStoppedSessionRef = useRef<string | null>(null);
+  /** First assistant delta for the in-flight reply (for tok/s). */
+  const assistantStreamStartedAtRef = useRef<number | null>(null);
+  /** Last assistant delta timestamp for the in-flight reply. */
+  const assistantStreamLastAtRef = useRef<number | null>(null);
   /** Keep latest lines for flush-to-disk without stale closures. */
   const linesRef = useRef<ChatLine[]>([]);
   const sessionIdRef = useRef<string | null>(null);
@@ -461,9 +1348,213 @@ export default function App() {
   }, [sessions]);
 
   useEffect(() => {
+    busyRef.current = busy;
+  }, [busy]);
+
+  useEffect(() => {
     sessionIdRef.current = session?.session_id ?? null;
     workPathRef.current = session?.work_path ?? null;
   }, [session?.session_id, session?.work_path]);
+
+  /**
+   * After ~90s of continuous Working, surface a sticky hint: the agent may be
+   * blocked on a long-lived shell (e.g. `mykg web`, dev servers) rather than
+   * looping in the UI. Offers one-click Stop.
+   */
+  useEffect(() => {
+    if (!busy) {
+      setLongRunNotice(null);
+      longRunDismissedRef.current = false;
+      return;
+    }
+    const LONG_RUN_MS = 90_000;
+    const tick = () => {
+      if (!busyRef.current || longRunDismissedRef.current) {
+        setLongRunNotice(null);
+        return;
+      }
+      const started = turnStartedAtRef.current;
+      if (started == null) return;
+      const elapsedMs = Date.now() - started;
+      if (elapsedMs < LONG_RUN_MS) {
+        setLongRunNotice(null);
+        return;
+      }
+      // Prefer the latest tool line that looks like a foreground shell.
+      let toolHint: string | null = null;
+      const chat = linesRef.current;
+      for (let i = chat.length - 1; i >= 0; i--) {
+        const l = chat[i];
+        if (l.kind !== "tool" && l.kind !== "system") continue;
+        const t = l.text || "";
+        if (
+          /run_terminal|terminal_command|Execute `|uv run|npm (run|start)|pnpm |yarn |python |mykg web|uvicorn|flask|django|next dev|vite|webpack|serve |--port |0\.0\.0\.0|127\.0\.0\.1/i.test(
+            t,
+          )
+        ) {
+          toolHint = t.length > 140 ? `${t.slice(0, 137)}…` : t;
+          break;
+        }
+        if (l.kind === "tool" && /running/i.test(t) && (l.count ?? 1) >= 8) {
+          toolHint = t;
+          break;
+        }
+      }
+      setLongRunNotice({
+        elapsedSec: Math.floor(elapsedMs / 1000),
+        toolHint,
+      });
+    };
+    tick();
+    const id = window.setInterval(tick, 4000);
+    return () => window.clearInterval(id);
+  }, [busy]);
+
+  /** Update busy for one task; sync focused `busy` when that task is active. */
+  const setSessionBusyState = useCallback((sid: string, nextBusy: boolean) => {
+    if (!sid) return;
+    const wasBusy = sessionBusyMapRef.current.get(sid) === true;
+    sessionBusyMapRef.current.set(sid, nextBusy);
+    setSessionBusyMap((prev) => {
+      if (prev[sid] === nextBusy) return prev;
+      return { ...prev, [sid]: nextBusy };
+    });
+    if (sessionIdRef.current === sid) {
+      busyRef.current = nextBusy;
+      setBusy(nextBusy);
+    }
+    // Working → idle while user is not looking at this task → unread (green).
+    if (wasBusy && !nextBusy) {
+      const viewingThis =
+        sessionIdRef.current === sid &&
+        typeof document !== "undefined" &&
+        document.visibilityState === "visible";
+      if (!viewingThis) {
+        // Defer so markSessionUnread is defined; call via ref pattern below.
+        queueMicrotask(() => {
+          if (sessionUnreadMapRef.current.get(sid)) return;
+          if (
+            sessionIdRef.current === sid &&
+            document.visibilityState === "visible"
+          ) {
+            return;
+          }
+          sessionUnreadMapRef.current.set(sid, true);
+          setSessionUnreadMap((prev) =>
+            prev[sid] ? prev : { ...prev, [sid]: true },
+          );
+        });
+      }
+    }
+  }, []);
+
+  /** Mark a task as having unread activity (finished or updated while not viewed). */
+  const markSessionUnread = useCallback((sid: string | null | undefined) => {
+    if (!sid) return;
+    // Actively viewing this task in a visible window → not unread.
+    if (
+      sessionIdRef.current === sid &&
+      typeof document !== "undefined" &&
+      document.visibilityState === "visible"
+    ) {
+      return;
+    }
+    if (sessionUnreadMapRef.current.get(sid)) return;
+    sessionUnreadMapRef.current.set(sid, true);
+    setSessionUnreadMap((prev) =>
+      prev[sid] ? prev : { ...prev, [sid]: true },
+    );
+  }, []);
+
+  const clearSessionUnread = useCallback((sid: string | null | undefined) => {
+    if (!sid) return;
+    if (!sessionUnreadMapRef.current.get(sid)) return;
+    sessionUnreadMapRef.current.delete(sid);
+    setSessionUnreadMap((prev) => {
+      if (!prev[sid]) return prev;
+      const next = { ...prev };
+      delete next[sid];
+      return next;
+    });
+  }, []);
+
+  /**
+   * Dock badge (macOS Dock / taskbar):
+   * - Working tasks → red count (system badge; priority)
+   * - Else unread finished tasks → green-style count (label with 🟢 when possible)
+   * - Viewed / idle → clear
+   *
+   * Note: macOS dock badge chrome is system-red for numeric badges; we use
+   * setBadgeCount for working, and setBadgeLabel("🟢N") for unread-only so
+   * the two states stay distinguishable.
+   */
+  const syncDockBadge = useCallback(() => {
+    let working = 0;
+    for (const v of sessionBusyMapRef.current.values()) {
+      if (v) working += 1;
+    }
+    if (busyRef.current && sessionIdRef.current) {
+      if (!sessionBusyMapRef.current.get(sessionIdRef.current)) working += 1;
+    }
+    let unread = 0;
+    for (const [sid, v] of sessionUnreadMapRef.current.entries()) {
+      if (!v) continue;
+      // Don't count unread for a task that is still working (working badge wins).
+      if (sessionBusyMapRef.current.get(sid)) continue;
+      if (busyRef.current && sessionIdRef.current === sid) continue;
+      unread += 1;
+    }
+
+    const win = getCurrentWindow();
+    void (async () => {
+      try {
+        if (working > 0) {
+          // Red system badge = tasks currently working.
+          await win.setBadgeLabel(undefined);
+          await win.setBadgeCount(working);
+        } else if (unread > 0) {
+          // Finished but not viewed: green-tinted label (macOS still uses
+          // badge chrome, but 🟢 distinguishes from working count).
+          await win.setBadgeCount(undefined);
+          await win.setBadgeLabel(`🟢${unread}`);
+        } else {
+          await win.setBadgeCount(undefined);
+          await win.setBadgeLabel(undefined);
+        }
+      } catch {
+        /* badge unsupported on some platforms */
+      }
+    })();
+  }, []);
+
+  useEffect(() => {
+    syncDockBadge();
+  }, [sessionBusyMap, sessionUnreadMap, busy, syncDockBadge]);
+
+  // When the window becomes visible again, clear unread for the focused task
+  // and refresh the dock badge.
+  useEffect(() => {
+    const onVis = () => {
+      if (document.visibilityState === "visible" && sessionIdRef.current) {
+        clearSessionUnread(sessionIdRef.current);
+      }
+      syncDockBadge();
+    };
+    document.addEventListener("visibilitychange", onVis);
+    window.addEventListener("focus", onVis);
+    return () => {
+      document.removeEventListener("visibilitychange", onVis);
+      window.removeEventListener("focus", onVis);
+    };
+  }, [clearSessionUnread, syncDockBadge]);
+
+  /** Work path for a task id (active or from list). */
+  const workPathForSession = useCallback((sid: string): string | null => {
+    if (sessionIdRef.current === sid) return workPathRef.current;
+    return (
+      sessionsRef.current.find((s) => s.session_id === sid)?.work_path || null
+    );
+  }, []);
 
   /** Connection / reconnect noise — never persist or restore these alone. */
   const isConnectionNoise = useCallback((line: ChatLine): boolean => {
@@ -550,6 +1641,24 @@ export default function App() {
     await persistChatHistory(sid, linesRef.current, work);
   }, [persistChatHistory]);
 
+  /**
+   * Mutate transcript for a session that is not currently focused.
+   * Keeps background tasks streaming while the user looks at another chat.
+   */
+  const mutateBackgroundLines = useCallback(
+    (sid: string, mutator: (prev: ChatLine[]) => ChatLine[]) => {
+      if (!sid) return;
+      const prev = sessionLinesCacheRef.current.get(sid) ?? [];
+      const next = mutator(prev);
+      sessionLinesCacheRef.current.set(sid, next);
+      const wp = workPathForSession(sid);
+      if (hasRealChatContent(next)) {
+        void persistChatHistory(sid, next, wp);
+      }
+    },
+    [workPathForSession, persistChatHistory, hasRealChatContent],
+  );
+
   const loadChatHistory = useCallback(
     async (sessionId: string, workPath?: string | null) => {
       try {
@@ -558,12 +1667,21 @@ export default function App() {
           workPath: workPath || null,
         });
         if (!raw) return [] as ChatLine[];
-        const parsed = JSON.parse(raw) as ChatLine[];
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(raw);
+        } catch (e) {
+          console.warn("load_chat_history: invalid JSON", sessionId, e);
+          return [] as ChatLine[];
+        }
         if (!Array.isArray(parsed)) return [] as ChatLine[];
-        return parsed.filter(
+        const filtered = (parsed as ChatLine[]).filter(
           (l) => l && l.kind && l.kind !== "waiting" && !isConnectionNoise(l),
         );
-      } catch {
+        // Older histories may still have expanded thought/tool rows — fold them.
+        return collapseAllTurnsInHistory(filtered);
+      } catch (e) {
+        console.warn("load_chat_history failed", sessionId, e);
         return [] as ChatLine[];
       }
     },
@@ -580,41 +1698,33 @@ export default function App() {
     }
   }, []);
 
-  const refreshSessions = useCallback(
-    async (projectId?: string | null) => {
-      const pid = projectId === undefined ? selectedProjectId : projectId;
-      try {
-        let rows: SessionListRow[];
-        if (pid) {
-          // Tasks under a user-selected Project.
-          rows = await invoke<SessionListRow[]>("list_sessions_for_project", {
-            projectId: pid,
-          });
-        } else {
-          // No project selected: show all tasks (including default-sandbox ones).
-          rows = await invoke<SessionListRow[]>("list_sessions");
-        }
-        // Stable UI order: newest-created first. Clicking a task must not reorder.
-        rows = [...rows].sort((a, b) => {
-          const ca = Date.parse(a.created_at || a.updated_at);
-          const cb = Date.parse(b.created_at || b.updated_at);
-          return (Number.isFinite(cb) ? cb : 0) - (Number.isFinite(ca) ? ca : 0);
-        });
-        setSessions(rows);
-        return rows;
-      } catch {
-        return [] as SessionListRow[];
-      }
-    },
-    [selectedProjectId],
-  );
+  /**
+   * Always load the full task list. UI splits them:
+   * - under Projects → tasks whose project_id is a user project
+   * - under Tasks → temporary / default-sandbox only
+   */
+  const refreshSessions = useCallback(async () => {
+    try {
+      let rows = await invoke<SessionListRow[]>("list_sessions");
+      // Stable UI order: newest-created first. Clicking a task must not reorder.
+      rows = [...rows].sort((a, b) => {
+        const ca = Date.parse(a.created_at || a.updated_at);
+        const cb = Date.parse(b.created_at || b.updated_at);
+        return (Number.isFinite(cb) ? cb : 0) - (Number.isFinite(ca) ? ca : 0);
+      });
+      setSessions(rows);
+      return rows;
+    } catch {
+      return [] as SessionListRow[];
+    }
+  }, []);
 
   /** After connect / activate: sync projects + tasks. */
   const refreshHierarchy = useCallback(
     async (opts?: {
       projectId?: string | null;
       projectRoot?: string | null;
-      /** When true, keep Tasks unbound to Projects list (New task default). */
+      /** When true, keep Tasks unbound to Projects list (temporary task). */
       standaloneTask?: boolean;
     }) => {
       const projRows = await refreshProjects();
@@ -634,19 +1744,23 @@ export default function App() {
         setSelectedProjectId(pid);
         const hit = projRows.find((p) => p.project_id === pid);
         if (hit?.root_path) setProjectRoot(hit.root_path);
-        await refreshSessions(pid);
-      } else {
-        // Standalone / default-sandbox tasks: clear project highlight, list all tasks.
+      } else if (opts?.standaloneTask) {
         setSelectedProjectId(null);
-        await refreshSessions(null);
       }
+      await refreshSessions();
       return pid;
     },
     [refreshProjects, refreshSessions, selectedProjectId],
   );
 
   type PushLine =
-    | { kind: "user"; text: string; id?: string }
+    | {
+        kind: "user";
+        text: string;
+        id?: string;
+        at?: string;
+        attachments?: ChatAttachment[];
+      }
     | { kind: "assistant"; text: string; id?: string }
     | { kind: "thought"; text: string; id?: string }
     | { kind: "tool"; text: string; id?: string }
@@ -659,6 +1773,9 @@ export default function App() {
       const full = {
         ...line,
         id: line.id ?? nextLineId(line.kind),
+        ...(line.kind === "user" && !line.at
+          ? { at: new Date().toISOString() }
+          : {}),
       } as ChatLine;
       setLines((prev) => {
         const next = [...prev, full];
@@ -673,6 +1790,7 @@ export default function App() {
 
   const appendAssistant = useCallback(
     (text: string) => {
+      const now = Date.now();
       setLines((prev) => {
         // Drop waiting placeholder once real content starts.
         let base = prev;
@@ -685,12 +1803,17 @@ export default function App() {
           const copy = base.slice(0, -1);
           copy.push({ ...last, text: last.text + text });
           next = copy;
+          if (assistantStreamStartedAtRef.current == null) {
+            assistantStreamStartedAtRef.current = now;
+          }
         } else {
           next = [
             ...base,
             { id: nextLineId("assistant"), kind: "assistant", text },
           ];
+          assistantStreamStartedAtRef.current = now;
         }
+        assistantStreamLastAtRef.current = now;
         linesRef.current = next;
         return next;
       });
@@ -740,13 +1863,158 @@ export default function App() {
     }
   }, []);
 
+  /**
+   * If the model ended with talk-only progress, warn in chat and auto-send a
+   * one-shot follow-up that forces tool use + delivery confirmation.
+   */
+  const maybeHandleVerbalOnlyCompletion = useCallback(
+    (chat: ChatLine[]) => {
+      if (autoNudgeInFlightRef.current) return;
+      const hit = detectVerbalOnlyCompletion(
+        chat as Parameters<typeof detectVerbalOnlyCompletion>[0],
+      );
+      if (!hit) return;
+
+      // Always surface a clear system note; auto-continue only once per user send.
+      const canAutoNudge = hit.shouldNudge && !verbalNudgeUsedRef.current;
+      const warnText = canAutoNudge
+        ? hit.warning
+        : hit.warning.replace(
+            /将自动续跑一次[^\n]*/g,
+            "请手动再发一条明确指令（要求执行工具并确认文件存在）。",
+          );
+      if (canAutoNudge) verbalNudgeUsedRef.current = true;
+
+      const warnLine: ChatLine = {
+        id: nextLineId("system"),
+        kind: "system",
+        text: warnText,
+      };
+      const withWarn = [...chat, warnLine];
+      setLines(withWarn);
+      linesRef.current = withWarn;
+      void flushPersistHistory();
+
+      if (!canAutoNudge) return;
+      if (!sessionIdRef.current) return;
+
+      autoNudgeInFlightRef.current = true;
+      // Brief delay so UI paints the warning before the next turn starts.
+      window.setTimeout(() => {
+        void (async () => {
+          const sid = sessionIdRef.current;
+          if (!sid) {
+            autoNudgeInFlightRef.current = false;
+            return;
+          }
+          // User bubble for the auto-continue (visible, so history is honest).
+          const userId = nextLineId("user");
+          const waitingId = nextLineId("waiting");
+          const nudged: ChatLine[] = [
+            ...linesRef.current,
+            {
+              id: userId,
+              kind: "user",
+              text: "（自动续跑）请用工具完成交付并确认文件存在",
+              at: new Date().toISOString(),
+            },
+            {
+              id: waitingId,
+              kind: "waiting",
+              text: "Grokx is thinking…",
+            },
+          ];
+          setLines(nudged);
+          linesRef.current = nudged;
+          turnStartedAtRef.current = Date.now();
+          setSessionBusyState(sid, true);
+          // Resume bottom follow for the auto-continue turn.
+          autoScrollEnabledRef.current = true;
+          userScrollIntentRef.current = false;
+          try {
+            await invoke("send_prompt_rich", {
+              payload: {
+                text: VERBAL_COMPLETION_NUDGE,
+                attachments: [],
+                model: modelId || null,
+                effort: effortId || null,
+              },
+            });
+          } catch (e) {
+            setSessionBusyState(sid, false);
+            // Drop waiting placeholder on send failure.
+            setLines((prev) => {
+              if (prev.length && prev[prev.length - 1].kind === "waiting") {
+                const next = prev.slice(0, -1);
+                linesRef.current = next;
+                return next;
+              }
+              return prev;
+            });
+            push({ kind: "error", text: String(e) });
+          } finally {
+            autoNudgeInFlightRef.current = false;
+          }
+        })();
+      }, 350);
+    },
+    [flushPersistHistory, setSessionBusyState, push, modelId, effortId],
+  );
+
   const finishTurnCollapse = useCallback(
     (error?: boolean) => {
       const started = turnStartedAtRef.current;
       turnStartedAtRef.current = null;
       const durationMs = started != null ? Date.now() - started : 0;
+
+      // Stamp generation speed on the last assistant reply in this turn.
+      const streamStart = assistantStreamStartedAtRef.current;
+      const streamEnd = assistantStreamLastAtRef.current ?? Date.now();
+      assistantStreamStartedAtRef.current = null;
+      assistantStreamLastAtRef.current = null;
+
+      let finalChat: ChatLine[] | null = null;
+
       setLines((prev) => {
         let next = collapseTurnProcess(prev, durationMs);
+
+        // Attach ~tokens / tok/s to the latest assistant message (after last user).
+        let lastUser = -1;
+        for (let i = next.length - 1; i >= 0; i--) {
+          if (next[i].kind === "user") {
+            lastUser = i;
+            break;
+          }
+        }
+        let lastAsst = -1;
+        for (let i = next.length - 1; i > lastUser; i--) {
+          if (next[i].kind === "assistant") {
+            lastAsst = i;
+            break;
+          }
+        }
+        if (lastAsst >= 0) {
+          const asst = next[lastAsst];
+          if (asst.kind === "assistant" && asst.text.trim()) {
+            const tokens = estimateTokens(asst.text);
+            const streamMs =
+              streamStart != null
+                ? Math.max(1, streamEnd - streamStart)
+                : undefined;
+            const tokensPerSec =
+              streamMs != null && streamMs >= 50
+                ? tokens / (streamMs / 1000)
+                : undefined;
+            next = next.slice();
+            next[lastAsst] = {
+              ...asst,
+              tokens,
+              streamMs,
+              tokensPerSec,
+            };
+          }
+        }
+
         if (error) {
           const hasError = next.some((l) => l.kind === "error");
           if (!hasError) {
@@ -761,16 +2029,51 @@ export default function App() {
           }
         }
         linesRef.current = next;
+        finalChat = next;
         // After first successful assistant reply, summarize and rename the task.
         if (!error) {
           void maybeAutoTitleFromChat(next);
         }
         return next;
       });
+
+      // Late tool/thought events can race turn_finished — collapse once more
+      // from the latest ref after React state has been scheduled.
+      window.setTimeout(() => {
+        const stillRaw = linesRef.current.some(
+          (l, i, arr) => {
+            if (!isProcessLine(l)) return false;
+            // Only care about process lines after the last user.
+            let lastUser = -1;
+            for (let j = arr.length - 1; j >= 0; j--) {
+              if (arr[j].kind === "user") {
+                lastUser = j;
+                break;
+              }
+            }
+            return i > lastUser;
+          },
+        );
+        if (!stillRaw) return;
+        const repaired = collapseTurnProcess(linesRef.current, durationMs);
+        linesRef.current = repaired;
+        setLines(repaired);
+        void flushPersistHistory();
+      }, 80);
+
       // Persist immediately after a turn settles.
       void flushPersistHistory();
+
+      // Premature verbal-only completion → warn + one auto-continue.
+      if (!error && finalChat) {
+        maybeHandleVerbalOnlyCompletion(finalChat);
+      }
     },
-    [flushPersistHistory, maybeAutoTitleFromChat],
+    [
+      flushPersistHistory,
+      maybeAutoTitleFromChat,
+      maybeHandleVerbalOnlyCompletion,
+    ],
   );
 
   const toggleTrace = useCallback(
@@ -827,12 +2130,105 @@ export default function App() {
     });
   }, []);
 
+  /**
+   * Stuck-Working watchdog: UI may stay Working after a missed turn_finished
+   * (soft timeout / reconnect race). If chat is idle and backend reports not
+   * busy, clear Working so the user is not stuck.
+   */
+  const lastChatFingerprintRef = useRef("");
+  const lastChatChangeAtRef = useRef(Date.now());
+  useEffect(() => {
+    if (!busy) return;
+    const sid = session?.session_id;
+    if (!sid) return;
+
+    const fingerprint = () => {
+      const chat = linesRef.current;
+      const last = chat[chat.length - 1];
+      return `${chat.length}:${last?.id ?? ""}:${last?.kind ?? ""}:${
+        last && "text" in last ? String(last.text ?? "").length : 0
+      }`;
+    };
+    lastChatFingerprintRef.current = fingerprint();
+    lastChatChangeAtRef.current = Date.now();
+
+    const id = window.setInterval(() => {
+      if (!busyRef.current) return;
+      if (sessionIdRef.current !== sid) return;
+      if (pendingPerm) return;
+
+      const fp = fingerprint();
+      if (fp !== lastChatFingerprintRef.current) {
+        lastChatFingerprintRef.current = fp;
+        lastChatChangeAtRef.current = Date.now();
+        return;
+      }
+
+      const idleMs = Date.now() - lastChatChangeAtRef.current;
+      // Short streaming pauses are normal; only probe after real idle.
+      if (idleMs < 12_000) return;
+
+      void invoke<boolean>("is_session_busy", { sessionId: sid })
+        .then((stillBusy) => {
+          if (sessionIdRef.current !== sid) return;
+          if (!busyRef.current) return;
+          if (stillBusy) return;
+          console.warn(
+            "busy watchdog: backend idle, clearing stuck Working",
+            sid,
+          );
+          setSessionBusyState(sid, false);
+          setLongRunNotice(null);
+          clearWaiting();
+          finishTurnCollapse(false);
+        })
+        .catch(() => {
+          /* ignore */
+        });
+    }, 5000);
+
+    return () => window.clearInterval(id);
+  }, [
+    busy,
+    session?.session_id,
+    pendingPerm,
+    setSessionBusyState,
+    finishTurnCollapse,
+    clearWaiting,
+  ]);
+
   const lastUserMessage = useMemo(() => {
     for (let i = lines.length - 1; i >= 0; i--) {
       if (lines[i].kind === "user") return lines[i] as Extract<ChatLine, { kind: "user" }>;
     }
     return null;
   }, [lines]);
+
+  /** Every user prompt in this session — for the right-edge outline rail. */
+  const sessionOutlineEntries = useMemo(
+    () =>
+      lines
+        .filter(
+          (l): l is Extract<ChatLine, { kind: "user" }> => l.kind === "user",
+        )
+        .map((l) => ({ id: l.id, text: l.text, at: l.at })),
+    [lines],
+  );
+
+  const toggleSessionOutline = useCallback(() => {
+    setSessionOutlineCollapsed((v) => {
+      const next = !v;
+      try {
+        localStorage.setItem(
+          "grokx.sessionOutlineCollapsed",
+          next ? "1" : "0",
+        );
+      } catch {
+        /* ignore */
+      }
+      return next;
+    });
+  }, []);
 
   const distanceFromBottom = useCallback((el: HTMLElement) => {
     return el.scrollHeight - el.scrollTop - el.clientHeight;
@@ -891,7 +2287,12 @@ export default function App() {
     });
   }, []);
 
-  /** Ease viewport toward bottom (slow + smooth). Does not jump. */
+  /**
+   * Silky follow to bottom while auto-scroll is on.
+   * Exponential ease each frame (no hard 14px cap) so stream growth doesn't
+   * feel like stop-start steps. Keeps looping while still away from bottom
+   * or while the turn is busy (content may keep growing).
+   */
   const ensureSmoothAutoScroll = useCallback(() => {
     if (!autoScrollEnabledRef.current) return;
     if (scrollAnimRef.current != null) return;
@@ -902,32 +2303,39 @@ export default function App() {
       const el = chatScrollRef.current;
       if (!el) return;
 
-      const remaining = distanceFromBottom(el);
-      if (remaining <= 1.5) {
-        // Snap residual for crisp bottom alignment.
+      const maxTop = Math.max(0, el.scrollHeight - el.clientHeight);
+      const remaining = maxTop - el.scrollTop;
+
+      if (remaining <= 0.5) {
         if (remaining > 0) {
           lastProgrammaticScrollRef.current = performance.now();
-          el.scrollTop = el.scrollHeight;
+          el.scrollTop = maxTop;
+        }
+        // While Working, keep a cheap poll so new stream height is chased
+        // without waiting for the next React commit (smoother than restart).
+        if (busyRef.current) {
+          scrollAnimRef.current = requestAnimationFrame(step);
         }
         return;
       }
 
-      // Ease: move a fraction of remaining distance each frame (slow follow).
-      // Cap step so long streams don't race the eye.
-      const ease = 0.08;
-      const minStep = 0.6;
-      const maxStep = 14;
+      // Distance-adaptive ease: catch up when far, soft land when close.
+      // Higher than the old 0.08 so we don't lag in visible "jumps".
+      const ease =
+        remaining > 320 ? 0.28 : remaining > 120 ? 0.2 : remaining > 40 ? 0.15 : 0.12;
       let delta = remaining * ease;
-      if (delta < minStep) delta = Math.min(minStep, remaining);
-      if (delta > maxStep) delta = maxStep;
+      // Gentle floor so we never stall on sub-pixel leftovers.
+      if (delta < 1.2) delta = Math.min(1.2, remaining);
+      // Soft ceiling only for huge reflows (virtual list remount) — still smooth.
+      if (delta > 96) delta = 96;
 
       lastProgrammaticScrollRef.current = performance.now();
-      el.scrollTop += delta;
+      el.scrollTop = Math.min(maxTop, el.scrollTop + delta);
       scrollAnimRef.current = requestAnimationFrame(step);
     };
 
     scrollAnimRef.current = requestAnimationFrame(step);
-  }, [distanceFromBottom]);
+  }, []);
 
   const enableAutoScroll = useCallback(() => {
     autoScrollEnabledRef.current = true;
@@ -942,6 +2350,18 @@ export default function App() {
       scrollAnimRef.current = null;
     }
   }, []);
+
+  const updateScrollToBottomVisible = useCallback(() => {
+    const el = chatScrollRef.current;
+    if (!el) {
+      setShowScrollToBottom(false);
+      return;
+    }
+    // Enough content below the fold that a jump-to-bottom control is useful.
+    const overflow = el.scrollHeight - el.clientHeight > 80;
+    const away = distanceFromBottom(el) > 120;
+    setShowScrollToBottom(overflow && away);
+  }, [distanceFromBottom]);
 
   const applyStickyUserId = useCallback((next: string | null) => {
     if (stickyUserIdRef.current === next) return;
@@ -985,15 +2405,73 @@ export default function App() {
     });
   }, [updateStickyUser]);
 
+  const jumpToBottom = useCallback(() => {
+    const el = chatScrollRef.current;
+    if (!el) return;
+    // Resume live follow; keep programmatic guard long enough for measure passes.
+    lastProgrammaticScrollRef.current = performance.now() + 900;
+    autoScrollEnabledRef.current = true;
+    userScrollIntentRef.current = false;
+    setShowScrollToBottom(false);
+    // Expand virtual window with a few snaps, then ease the rest (less jarring).
+    const snap = () => {
+      const root = chatScrollRef.current;
+      if (!root) return;
+      root.scrollTop = Math.max(0, root.scrollHeight - root.clientHeight);
+    };
+    const far = distanceFromBottom(el) > 400;
+    if (far) {
+      // One quick jump most of the way, then silky finish.
+      el.scrollTop = Math.max(
+        0,
+        el.scrollHeight - el.clientHeight - 120,
+      );
+    }
+    requestAnimationFrame(() => {
+      ensureSmoothAutoScroll();
+      requestAnimationFrame(() => ensureSmoothAutoScroll());
+    });
+    window.setTimeout(() => {
+      if (autoScrollEnabledRef.current) ensureSmoothAutoScroll();
+    }, 40);
+    window.setTimeout(() => {
+      if (autoScrollEnabledRef.current) ensureSmoothAutoScroll();
+      updateScrollToBottomVisible();
+      scheduleStickyUser();
+    }, 160);
+    window.setTimeout(() => {
+      // Final alignment after RO measures.
+      if (autoScrollEnabledRef.current) {
+        snap();
+        ensureSmoothAutoScroll();
+      }
+      updateScrollToBottomVisible();
+    }, 320);
+  }, [
+    scheduleStickyUser,
+    updateScrollToBottomVisible,
+    distanceFromBottom,
+    ensureSmoothAutoScroll,
+  ]);
+
   // When chat content grows, ease toward bottom only if auto-follow is on.
   useEffect(() => {
     if (!autoScrollEnabledRef.current) {
       scheduleStickyUser();
+      updateScrollToBottomVisible();
       return;
     }
     ensureSmoothAutoScroll();
     scheduleStickyUser();
-  }, [lines, busy, pendingPerm, ensureSmoothAutoScroll, scheduleStickyUser]);
+    requestAnimationFrame(() => updateScrollToBottomVisible());
+  }, [
+    lines,
+    busy,
+    pendingPerm,
+    ensureSmoothAutoScroll,
+    scheduleStickyUser,
+    updateScrollToBottomVisible,
+  ]);
 
   // Detect user-driven scroll vs programmatic ease.
   useEffect(() => {
@@ -1039,6 +2517,7 @@ export default function App() {
 
     const onScroll = () => {
       scheduleStickyUser();
+      updateScrollToBottomVisible();
       // Ignore scroll events we just caused programmatically.
       if (performance.now() < lastProgrammaticScrollRef.current) {
         return;
@@ -1077,13 +2556,19 @@ export default function App() {
       endTimer = setTimeout(onScrollEndCheck, 220);
     };
 
+    const onResize = () => {
+      scheduleStickyUser();
+      updateScrollToBottomVisible();
+    };
+
     scroller.addEventListener("wheel", onWheel, { passive: true });
     scroller.addEventListener("touchstart", onTouchStart, { passive: true });
     scroller.addEventListener("pointerdown", onPointerDown, { passive: true });
     scroller.addEventListener("scroll", onScrollWithEnd, { passive: true });
     window.addEventListener("keydown", onKeyDown);
-    window.addEventListener("resize", scheduleStickyUser);
+    window.addEventListener("resize", onResize);
     scheduleStickyUser();
+    updateScrollToBottomVisible();
 
     return () => {
       if (endTimer) clearTimeout(endTimer);
@@ -1100,53 +2585,115 @@ export default function App() {
       scroller.removeEventListener("pointerdown", onPointerDown);
       scroller.removeEventListener("scroll", onScrollWithEnd);
       window.removeEventListener("keydown", onKeyDown);
-      window.removeEventListener("resize", scheduleStickyUser);
+      window.removeEventListener("resize", onResize);
     };
-  }, [scheduleStickyUser, view, disableAutoScroll, enableAutoScroll, isNearBottom]);
+  }, [
+    scheduleStickyUser,
+    updateScrollToBottomVisible,
+    view,
+    disableAutoScroll,
+    enableAutoScroll,
+    isNearBottom,
+  ]);
 
   const jumpToUserMessage = useCallback(
     (id: string) => {
       const scroller = chatScrollRef.current;
-      const el = userMsgEls.current.get(id);
-      if (!el || !scroller) return;
+      if (!scroller) return;
 
-      // Manual navigation — pause auto-follow.
+      // Manual navigation — pause auto-follow so we don't race back to bottom.
       disableAutoScroll();
-      // Hide sticky immediately so the jump target isn't covered.
+      // Sticky is an absolute overlay (not in scroll flow). Hide it and scroll
+      // immediately — waiting for reflow made the first click feel like a no-op.
       stickyUserIdRef.current = null;
       setStickyUserId(null);
       setHighlightUserId(id);
 
-      const scrollToTarget = () => {
-        const target = userMsgEls.current.get(id);
-        const root = chatScrollRef.current;
-        if (!target || !root) return;
+      // Small inset so the user bubble isn't flush against the top edge.
+      const topPad = 16;
+      const gen = ++jumpAlignGenRef.current;
 
-        const rootRect = root.getBoundingClientRect();
-        const targetRect = target.getBoundingClientRect();
-        // Match .chat-scroll top padding so the bubble isn't clipped.
-        const topPad = 28;
-        const nextTop = root.scrollTop + (targetRect.top - rootRect.top) - topPad;
-        // Cover the whole smooth-scroll duration so scroll listeners
-        // don't treat this as a competing user gesture.
-        lastProgrammaticScrollRef.current = performance.now() + 700;
-        root.scrollTo({
-          top: Math.max(0, nextTop),
-          behavior: "smooth",
-        });
+      /**
+       * Prefer measured prefix from VirtualChatList (accounts for real markdown
+       * heights). Fall back to estimateChatLineHeight only if the list handle
+       * is missing or the id is unknown.
+       */
+      const scrollByOffset = () => {
+        const root = chatScrollRef.current;
+        if (!root || jumpAlignGenRef.current !== gen) return;
+        const fromList = virtualChatRef.current?.offsetOf(id);
+        let offset: number;
+        if (fromList != null) {
+          offset = fromList;
+        } else {
+          let approx = 0;
+          for (const line of linesRef.current) {
+            if (line.id === id) break;
+            approx += estimateChatLineHeight(line);
+          }
+          offset = approx;
+        }
+        lastProgrammaticScrollRef.current = performance.now() + 800;
+        root.scrollTop = Math.max(0, offset - topPad);
       };
 
-      // Wait for sticky unmount reflow before measuring positions.
-      requestAnimationFrame(() => {
-        requestAnimationFrame(scrollToTarget);
-      });
+      /** Once the row is mounted, pin by getBoundingClientRect (true layout). */
+      const alignToUser = (): boolean => {
+        if (jumpAlignGenRef.current !== gen) return true;
+        const target = userMsgEls.current.get(id);
+        const root = chatScrollRef.current;
+        if (!target || !root) return false;
+        const rootRect = root.getBoundingClientRect();
+        const targetRect = target.getBoundingClientRect();
+        const nextTop =
+          root.scrollTop + (targetRect.top - rootRect.top) - topPad;
+        // Only nudge when meaningfully off — avoids jitter from subpixel noise.
+        if (Math.abs(root.scrollTop - nextTop) > 1) {
+          lastProgrammaticScrollRef.current = performance.now() + 800;
+          root.scrollTop = Math.max(0, nextTop);
+        }
+        return true;
+      };
+
+      // If the row is already mounted, pin by layout immediately — do not
+      // first apply a coarse offset (estimates can yank away from the truth).
+      const alreadyMounted = Boolean(userMsgEls.current.get(id));
+      if (alreadyMounted) {
+        alignToUser();
+      } else {
+        // Coarse jump so the virtual window mounts the target row.
+        scrollByOffset();
+      }
+
+      // Multi-pass fine alignment while virtual topPad / RO measurements settle.
+      const delays = alreadyMounted
+        ? [0, 16, 48, 120]
+        : [0, 16, 32, 64, 120, 220, 400];
+      for (const ms of delays) {
+        window.setTimeout(() => {
+          if (jumpAlignGenRef.current !== gen) return;
+          if (!alignToUser()) {
+            // Still not mounted — re-apply measured offset (may have updated).
+            scrollByOffset();
+            requestAnimationFrame(() => {
+              if (jumpAlignGenRef.current !== gen) return;
+              if (!alignToUser()) scrollByOffset();
+            });
+          }
+        }, ms);
+      }
 
       window.setTimeout(() => {
+        if (jumpAlignGenRef.current !== gen) return;
         setHighlightUserId((cur) => (cur === id ? null : cur));
       }, 1600);
-      window.setTimeout(() => updateStickyUser(), 550);
+      window.setTimeout(() => {
+        if (jumpAlignGenRef.current !== gen) return;
+        updateStickyUser();
+        updateScrollToBottomVisible();
+      }, 240);
     },
-    [updateStickyUser, disableAutoScroll],
+    [updateStickyUser, updateScrollToBottomVisible, disableAutoScroll],
   );
 
   const stickyUserText = useMemo(() => {
@@ -1154,6 +2701,136 @@ export default function App() {
     const line = lines.find((l) => l.id === stickyUserId && l.kind === "user");
     return line && line.kind === "user" ? line.text : null;
   }, [stickyUserId, lines]);
+
+  /** Context window size from Settings (default 500k for Grok 4.5-class models). */
+  const contextWindow = useMemo(() => {
+    const n = Number(cfgContext);
+    if (Number.isFinite(n) && n > 0) return Math.floor(n);
+    return 500_000;
+  }, [cfgContext]);
+
+  const estimatedContextTokens = useMemo(
+    () => estimateSessionTokens(lines, draftForMeter),
+    [lines, draftForMeter],
+  );
+
+  const clearComposer = useCallback(() => {
+    composerRef.current?.clear();
+    setDraftForMeter("");
+    setComposerHasText(false);
+  }, []);
+
+  const onComposerDraftChange = useCallback((text: string) => {
+    setComposerHasText(Boolean(text.trim()));
+  }, []);
+
+  const onComposerDraftSettled = useCallback((text: string) => {
+    setDraftForMeter(text);
+  }, []);
+
+  // Prefer engine total only when it is for the active non-empty context;
+  // empty new tasks should show ~0, not a stale process total.
+  const contextUsed =
+    engineContextTokens != null &&
+    (estimatedContextTokens > 0 || engineContextTokens < 200)
+      ? engineContextTokens
+      : estimatedContextTokens;
+  const contextFromEngine =
+    engineContextTokens != null &&
+    (estimatedContextTokens > 0 || engineContextTokens < 200);
+  const contextPct = Math.min(
+    100,
+    Math.max(0, (contextUsed / contextWindow) * 100),
+  );
+  const contextMeterClass =
+    contextPct >= 90
+      ? "context-meter high"
+      : contextPct >= 70
+        ? "context-meter mid"
+        : "context-meter";
+
+  /**
+   * Strip common Markdown so clipboard plain-text is readable outside MD editors.
+   * Keeps link URLs and code content; drops fences / emphasis / headings markup.
+   */
+  const markdownToPlainText = useCallback((md: string): string => {
+    let s = md.replace(/\r\n/g, "\n");
+    // Fenced code blocks → inner code only
+    s = s.replace(/```[\w-]*\n?([\s\S]*?)```/g, (_m, code: string) =>
+      String(code).replace(/\n$/, ""),
+    );
+    // Inline code
+    s = s.replace(/`([^`]+)`/g, "$1");
+    // Images ![alt](url) → alt (url)
+    s = s.replace(/!\[([^\]]*)\]\(([^)]+)\)/g, (_m, alt: string, url: string) =>
+      alt ? `${alt} (${url})` : url,
+    );
+    // Links [text](url) → text (url)
+    s = s.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_m, label: string, url: string) =>
+      label === url ? url : `${label} (${url})`,
+    );
+    // Autolinks <https://...>
+    s = s.replace(/<(https?:\/\/[^>]+)>/g, "$1");
+    // Headings
+    s = s.replace(/^#{1,6}\s+/gm, "");
+    // Blockquotes
+    s = s.replace(/^>\s?/gm, "");
+    // List markers
+    s = s.replace(/^\s*[-*+]\s+/gm, "• ");
+    s = s.replace(/^\s*\d+\.\s+/gm, (m) => m.replace(/^\s*/, ""));
+    // Bold / italic / strike (order matters: longer delimiters first)
+    s = s.replace(/\*\*\*([^*]+)\*\*\*/g, "$1");
+    s = s.replace(/___([^_]+)___/g, "$1");
+    s = s.replace(/\*\*([^*]+)\*\*/g, "$1");
+    s = s.replace(/__([^_]+)__/g, "$1");
+    s = s.replace(/\*([^*\n]+)\*/g, "$1");
+    s = s.replace(/_([^_\n]+)_/g, "$1");
+    s = s.replace(/~~([^~]+)~~/g, "$1");
+    // Horizontal rules
+    s = s.replace(/^\s*([-*_]){3,}\s*$/gm, "");
+    // Collapse 3+ blank lines
+    s = s.replace(/\n{3,}/g, "\n\n");
+    return s.trim();
+  }, []);
+
+  const writeClipboardText = useCallback(async (body: string) => {
+    try {
+      await navigator.clipboard.writeText(body);
+    } catch {
+      // Fallback for environments where Clipboard API is blocked.
+      const ta = document.createElement("textarea");
+      ta.value = body;
+      ta.setAttribute("readonly", "");
+      ta.style.position = "fixed";
+      ta.style.left = "-9999px";
+      document.body.appendChild(ta);
+      ta.select();
+      try {
+        document.execCommand("copy");
+      } finally {
+        document.body.removeChild(ta);
+      }
+    }
+  }, []);
+
+  const copyAssistantText = useCallback(
+    async (id: string, text: string, format: "md" | "plain") => {
+      const raw = text.trim();
+      if (!raw) return;
+      const body = format === "plain" ? markdownToPlainText(raw) : raw;
+      if (!body) return;
+      await writeClipboardText(body);
+      if (copiedTimerRef.current) clearTimeout(copiedTimerRef.current);
+      setCopiedMsg({ id, format });
+      copiedTimerRef.current = setTimeout(() => {
+        setCopiedMsg((cur) =>
+          cur && cur.id === id && cur.format === format ? null : cur,
+        );
+        copiedTimerRef.current = null;
+      }, 1600);
+    },
+    [markdownToPlainText, writeClipboardText],
+  );
 
   const refreshModels = useCallback(async () => {
     try {
@@ -1185,9 +2862,59 @@ export default function App() {
     setCfgKeyHint(s.endpoint.api_key_hint || null);
     setCfgGrokPath(s.grok_config_path);
     setCfgApiKey("");
+    setPermissionMode(
+      normalizePermissionMode(s.permission_mode, s.auto_approve),
+    );
     if (s.model) setModelId(s.model);
     if (s.effort || s.endpoint.default_effort) {
       setEffortId(s.effort || s.endpoint.default_effort || "medium");
+    }
+  }, []);
+
+  /** Persist permission mode and sync engine ~/.grok/config.toml. */
+  const setPermissionModeAndSave = useCallback(
+    async (next: PermissionMode) => {
+      setPermissionMode(next);
+      try {
+        const s = await invoke<PublicSettings>("save_settings", {
+          update: {
+            permission_mode: next,
+            // Keep legacy field for older code paths.
+            auto_approve: next === "always-approve",
+          },
+        });
+        applyPublicSettings(s);
+      } catch (e) {
+        console.warn("save permission_mode failed", e);
+      }
+    },
+    [applyPublicSettings],
+  );
+
+  const loadGrokConfigToml = useCallback(async () => {
+    try {
+      const file = await invoke<{
+        path: string;
+        content: string;
+        exists: boolean;
+      }>("read_grok_config");
+      setGrokToml(file.content);
+      setGrokTomlPath(file.path);
+      setGrokTomlExists(file.exists);
+      setGrokTomlDirty(false);
+      setGrokTomlMsg(
+        file.exists
+          ? null
+          : "File not found yet — save to create ~/.grok/config.toml",
+      );
+      // Prefill Base URL from engine config when app settings left it empty.
+      setCfgBaseUrl((prev) => {
+        if (prev.trim()) return prev;
+        const m = file.content.match(/base_url\s*=\s*"([^"]+)"/i);
+        return m?.[1]?.trim() || prev;
+      });
+    } catch (e) {
+      setGrokTomlMsg(String(e));
     }
   }, []);
 
@@ -1195,10 +2922,32 @@ export default function App() {
     try {
       const s = await invoke<PublicSettings>("get_settings");
       applyPublicSettings(s);
+      await loadGrokConfigToml();
     } catch (e) {
       setSettingsMsg(String(e));
     }
-  }, [applyPublicSettings]);
+  }, [applyPublicSettings, loadGrokConfigToml]);
+
+  const onSaveGrokConfigToml = async () => {
+    setSavingGrokToml(true);
+    setGrokTomlMsg(null);
+    try {
+      const file = await invoke<{
+        path: string;
+        content: string;
+        exists: boolean;
+      }>("write_grok_config", { content: grokToml });
+      setGrokToml(file.content);
+      setGrokTomlPath(file.path);
+      setGrokTomlExists(true);
+      setGrokTomlDirty(false);
+      setGrokTomlMsg("Saved. Reconnect the agent to apply engine config.");
+    } catch (e) {
+      setGrokTomlMsg(String(e));
+    } finally {
+      setSavingGrokToml(false);
+    }
+  };
 
   const onSaveSettings = async () => {
     setSavingSettings(true);
@@ -1262,6 +3011,105 @@ export default function App() {
     }
   };
 
+  const probeArgs = useCallback(
+    () => ({
+      baseUrl: cfgBaseUrl.trim(),
+      apiKey: cfgApiKey.trim() || null,
+      envKey: cfgEnvKey.trim() || null,
+      useSavedKey: true,
+    }),
+    [cfgBaseUrl, cfgApiKey, cfgEnvKey],
+  );
+
+  const settingsMsgIsError = (msg: string) =>
+    /fail|error|required|invalid|denied|unauthorized|forbidden|timeout|not found|http [45]/i.test(
+      msg,
+    );
+
+  /** GET {base}/models — validates URL + key. */
+  const onTestEndpoint = async () => {
+    if (!cfgBaseUrl.trim()) {
+      setSettingsMsg("Base URL is required to test.");
+      return;
+    }
+    setEndpointProbeBusy(true);
+    setSettingsMsg(null);
+    try {
+      const r = await invoke<{
+        ok: boolean;
+        status: number;
+        message: string;
+        models_url: string;
+        latency_ms: number;
+        model_count?: number | null;
+        sample_ids: string[];
+      }>("test_endpoint", { args: probeArgs() });
+      const sample =
+        r.sample_ids?.length > 0
+          ? ` · e.g. ${r.sample_ids.slice(0, 4).join(", ")}`
+          : "";
+      setSettingsMsg(
+        r.ok
+          ? `${r.message}${sample}`
+          : `Test failed · ${r.message}`,
+      );
+    } catch (e) {
+      setSettingsMsg(`Test failed · ${String(e)}`);
+    } finally {
+      setEndpointProbeBusy(false);
+    }
+  };
+
+  /** Apply a model id + always sync Display name from the list entry. */
+  const applySelectedModel = useCallback(
+    (
+      id: string,
+      list: Array<{ id: string; name: string }> = fetchedRemoteModels,
+    ) => {
+      const hit = list.find((m) => m.id === id);
+      setCfgModelId(id);
+      // Always update display name when picking from a known list.
+      setCfgName((hit?.name || id).trim() || id);
+    },
+    [fetchedRemoteModels],
+  );
+
+  /** Fetch model ids from the endpoint and fill the Model ID picker. */
+  const onFetchRemoteModels = async () => {
+    if (!cfgBaseUrl.trim()) {
+      setSettingsMsg("Base URL is required to fetch models.");
+      return;
+    }
+    setEndpointProbeBusy(true);
+    setSettingsMsg(null);
+    try {
+      const r = await invoke<{
+        ok: boolean;
+        status: number;
+        message: string;
+        models: Array<{ id: string; name: string }>;
+      }>("fetch_remote_models", { args: probeArgs() });
+      if (!r.ok || !r.models?.length) {
+        setSettingsMsg(`Fetch models failed · ${r.message}`);
+        setFetchedRemoteModels([]);
+        return;
+      }
+      setFetchedRemoteModels(r.models);
+      // Keep current id if still listed; otherwise first. Always refresh name.
+      const nextId = r.models.some((m) => m.id === cfgModelId)
+        ? cfgModelId
+        : r.models[0].id;
+      applySelectedModel(nextId, r.models);
+      setSettingsMsg(
+        `${r.message}. Pick a Model ID below, then Save settings.`,
+      );
+    } catch (e) {
+      setSettingsMsg(`Fetch models failed · ${String(e)}`);
+    } finally {
+      setEndpointProbeBusy(false);
+    }
+  };
+
   useEffect(() => {
     invoke<string>("app_version")
       .then(setAppVersion)
@@ -1297,89 +3145,312 @@ export default function App() {
     (async () => {
       unlisten = await listen<AgentEvent>("agent-event", (event) => {
         const ev = event.payload;
+        const evSid = sessionIdOf(ev);
+        const activeSid = sessionIdRef.current;
+        // Events with a session id that is not focused go to background cache.
+        // agent_status / agent_error may lack session id — treat as focused.
+        const isBackground =
+          Boolean(evSid) && Boolean(activeSid) && evSid !== activeSid;
+
+        const markBusy = (sid: string | null | undefined, next: boolean) => {
+          // After user hits Stop, ignore late tool/stream events that would
+          // flip Working back on until the next send.
+          if (
+            next &&
+            sid &&
+            userStoppedSessionRef.current &&
+            userStoppedSessionRef.current === sid
+          ) {
+            return;
+          }
+          if (sid) setSessionBusyState(sid, next);
+          else if (!isBackground) {
+            busyRef.current = next;
+            setBusy(next);
+          }
+        };
+
+        /** Background activity while user looks at another task → unread dot. */
+        const markBgUnread = () => {
+          if (isBackground && evSid) markSessionUnread(evSid);
+        };
+
+        /** Append a simple line to background transcript. */
+        const bgPush = (
+          sid: string,
+          kind: ChatLine["kind"],
+          text: string,
+        ) => {
+          mutateBackgroundLines(sid, (prev) => {
+            if (kind === "tool") {
+              return appendOrMergeToolLine(prev, text);
+            }
+            let base = prev;
+            if (base.length && base[base.length - 1].kind === "waiting") {
+              base = base.slice(0, -1);
+            }
+            return [
+              ...base,
+              { id: nextLineId(kind), kind, text } as ChatLine,
+            ];
+          });
+        };
+
+        const bgAppendStream = (
+          sid: string,
+          kind: "assistant" | "thought",
+          text: string,
+        ) => {
+          if (!text) return;
+          mutateBackgroundLines(sid, (prev) => {
+            let base = prev;
+            if (base.length && base[base.length - 1].kind === "waiting") {
+              base = base.slice(0, -1);
+            }
+            const last = base[base.length - 1];
+            if (last && last.kind === kind) {
+              const copy = base.slice(0, -1);
+              copy.push({ ...last, text: last.text + text } as ChatLine);
+              return copy;
+            }
+            return [
+              ...base,
+              { id: nextLineId(kind), kind, text } as ChatLine,
+            ];
+          });
+        };
+
         switch (ev.type) {
           case "agent_status":
-            setAgentStatus(ev.status ?? "unknown");
-            // Connection lifecycle stays in the status pill — not the chat transcript.
+            // Global connection pill only for the focused agent lifecycle.
+            if (!isBackground) {
+              setAgentStatus(ev.status ?? "unknown");
+            }
             break;
           case "session_ready":
-            setAgentStatus("ready");
-            // Don't push "Task ready" into chat (pollutes history on reconnect).
-            void refreshHierarchy();
-            void refreshModels();
+            if (!isBackground) {
+              setAgentStatus("ready");
+              void refreshHierarchy();
+              void refreshModels();
+            } else {
+              void refreshSessions();
+            }
             break;
           case "user_message":
             break;
           case "message_delta":
-            if (ev.text) appendAssistant(ev.text);
+            markBusy(evSid || activeSid, true);
+            markBgUnread();
+            if (isBackground && evSid) {
+              if (ev.text) bgAppendStream(evSid, "assistant", ev.text);
+            } else if (ev.text) {
+              appendAssistant(ev.text);
+            }
             break;
           case "thought_delta":
-            if (ev.text) appendThought(ev.text);
+            markBusy(evSid || activeSid, true);
+            markBgUnread();
+            if (isBackground && evSid) {
+              if (ev.text) bgAppendStream(evSid, "thought", ev.text);
+            } else if (ev.text) {
+              appendThought(ev.text);
+            }
             break;
           case "tool_started":
-            clearWaiting();
-            push({
-              kind: "tool",
-              text: ev.tool?.title ?? "Running tool",
-            });
+            markBusy(evSid || activeSid, true);
+            markBgUnread();
+            {
+              const label = ev.tool?.title ?? "Running tool";
+              if (isBackground && evSid) {
+                bgPush(evSid, "tool", label);
+              } else {
+                clearWaiting();
+                setLines((prev) => {
+                  const next = appendOrMergeToolLine(prev, label);
+                  linesRef.current = next;
+                  return next;
+                });
+                schedulePersistHistory();
+              }
+            }
             break;
           case "tool_updated":
-            clearWaiting();
-            push({
-              kind: "tool",
-              text: `${ev.tool?.title ?? "Tool"} → ${ev.tool?.status ?? "updated"}`,
-            });
+            markBusy(evSid || activeSid, true);
+            markBgUnread();
+            {
+              const label = `${ev.tool?.title ?? "Tool"} → ${ev.tool?.status ?? "updated"}`;
+              if (isBackground && evSid) {
+                bgPush(evSid, "tool", label);
+              } else {
+                clearWaiting();
+                setLines((prev) => {
+                  const next = appendOrMergeToolLine(prev, label);
+                  linesRef.current = next;
+                  return next;
+                });
+                schedulePersistHistory();
+              }
+            }
             break;
           case "permission_needed":
-            clearWaiting();
-            if (ev.request?.id) {
-              setPendingPerm({
-                id: ev.request.id,
-                summary: ev.request.summary ?? "Permission required",
-                tool_name: ev.request.tool_name ?? "tool",
-                detail: ev.request.detail,
+            markBusy(evSid || activeSid, true);
+            markBgUnread();
+            if (isBackground && evSid) {
+              bgPush(
+                evSid,
+                "system",
+                `Waiting for approval · ${ev.request?.summary ?? ev.request?.tool_name ?? "tool"}`,
+              );
+              // Permission for background task: still surface so user can act.
+              if (ev.request?.id) {
+                setPendingPerm({
+                  id: ev.request.id,
+                  summary: ev.request.summary ?? "Permission required",
+                  tool_name: ev.request.tool_name ?? "tool",
+                  detail: ev.request.detail,
+                });
+              }
+            } else {
+              clearWaiting();
+              if (ev.request?.id) {
+                setPendingPerm({
+                  id: ev.request.id,
+                  summary: ev.request.summary ?? "Permission required",
+                  tool_name: ev.request.tool_name ?? "tool",
+                  detail: ev.request.detail,
+                });
+              }
+              push({
+                kind: "system",
+                text: `Waiting for approval · ${ev.request?.summary ?? ev.request?.tool_name ?? "tool"}`,
               });
-              setBusy(true);
             }
-            push({
-              kind: "system",
-              text: `Waiting for approval · ${ev.request?.summary ?? ev.request?.tool_name ?? "tool"}`,
-            });
             break;
           case "plan_updated":
             if (ev.steps?.length) {
-              push({ kind: "system", text: `Plan: ${ev.steps.join(" → ")}` });
+              if (isBackground && evSid) {
+                bgPush(evSid, "system", `Plan: ${ev.steps.join(" → ")}`);
+              } else {
+                push({
+                  kind: "system",
+                  text: `Plan: ${ev.steps.join(" → ")}`,
+                });
+              }
             }
             break;
-          case "turn_state":
-            setBusy(
+          case "turn_state": {
+            const nextBusy =
               ev.state === "streaming" ||
-                ev.state === "running_tools" ||
-                ev.state === "waiting_permission",
-            );
+              ev.state === "running_tools" ||
+              ev.state === "waiting_permission";
+            markBusy(evSid || activeSid, nextBusy);
             break;
+          }
           case "turn_finished":
-            setBusy(false);
-            setPendingPerm(null);
-            clearWaiting();
-            if (ev.state === "error") {
-              push({ kind: "error", text: "Turn ended with error" });
-              finishTurnCollapse(true);
-            } else {
-              // Collapse thinking / tools; keep final assistant answer below.
-              finishTurnCollapse(false);
+            markBusy(evSid || activeSid, false);
+            // Always clear focused Working even if session id was missing on the event.
+            if (!isBackground) {
+              busyRef.current = false;
+              setBusy(false);
+              setLongRunNotice(null);
             }
-            // Refresh titles/metadata only — list order is stable (created_at).
-            void refreshSessions(selectedProjectId);
+            // Turn completed off-screen / other task → unread (green dock badge).
+            {
+              const finishedSid = evSid || activeSid;
+              const notViewing =
+                Boolean(finishedSid) &&
+                (finishedSid !== sessionIdRef.current ||
+                  (typeof document !== "undefined" &&
+                    document.visibilityState !== "visible"));
+              if (finishedSid && notViewing) {
+                markSessionUnread(finishedSid);
+              }
+            }
+            if (isBackground && evSid) {
+              mutateBackgroundLines(evSid, (prev) => {
+                let next = prev;
+                if (next.length && next[next.length - 1].kind === "waiting") {
+                  next = next.slice(0, -1);
+                }
+                if (ev.state === "error") {
+                  next = [
+                    ...next,
+                    {
+                      id: nextLineId("error"),
+                      kind: "error",
+                      text: "Turn ended with error",
+                    },
+                  ];
+                } else if (ev.state === "cancelled") {
+                  next = [
+                    ...next,
+                    {
+                      id: nextLineId("system"),
+                      kind: "system",
+                      text: "Turn cancelled",
+                    },
+                  ];
+                }
+                // Collapse thinking/tools for background transcript too.
+                return collapseTurnProcess(next, 0);
+              });
+              void refreshSessions();
+            } else {
+              setPendingPerm(null);
+              clearWaiting();
+              if (ev.state === "error") {
+                push({ kind: "error", text: "Turn ended with error" });
+                finishTurnCollapse(true);
+              } else if (ev.state === "cancelled") {
+                push({ kind: "system", text: "Turn cancelled" });
+                finishTurnCollapse(false);
+              } else {
+                finishTurnCollapse(false);
+              }
+              void refreshSessions();
+            }
             break;
-          case "agent_error":
-            setBusy(false);
-            clearWaiting();
-            push({ kind: "error", text: ev.message ?? "Agent error" });
-            finishTurnCollapse(true);
+          case "context_usage": {
+            if (
+              typeof ev.used_tokens !== "number" ||
+              !Number.isFinite(ev.used_tokens)
+            ) {
+              break;
+            }
+            const usageSid = evSid || activeSid;
+            if (!usageSid) break;
+            // Empty new task: ignore large engine totals (process residue).
+            const chatForCheck =
+              usageSid === activeSid
+                ? linesRef.current
+                : (sessionLinesCacheRef.current.get(usageSid) ?? []);
+            if (!hasRealChatContent(chatForCheck) && ev.used_tokens > 200) {
+              break;
+            }
+            sessionContextTokensRef.current.set(usageSid, ev.used_tokens);
+            if (usageSid === activeSid) {
+              setEngineContextTokens(ev.used_tokens);
+            }
             break;
+          }
+          case "agent_error": {
+            const msg = ev.message ?? "Agent error";
+            const soft =
+              /timed out|still be working|still working/i.test(msg);
+            if (isBackground && evSid) {
+              bgPush(evSid, soft ? "system" : "error", msg);
+              if (!soft) markBusy(evSid, false);
+            } else {
+              push({ kind: soft ? "system" : "error", text: msg });
+              if (!soft) {
+                markBusy(activeSid, false);
+                clearWaiting();
+                finishTurnCollapse(true);
+              }
+            }
+            break;
+          }
           default:
-            void sessionIdOf(ev);
             break;
         }
       });
@@ -1398,36 +3469,171 @@ export default function App() {
     refreshHierarchy,
     refreshModels,
     refreshSessions,
-    selectedProjectId,
     finishTurnCollapse,
+    setSessionBusyState,
+    mutateBackgroundLines,
+    hasRealChatContent,
+    markSessionUnread,
   ]);
-
-  const resizeTextarea = () => {
-    const el = textareaRef.current;
-    if (!el) return;
-    el.style.height = "auto";
-    el.style.height = `${Math.min(el.scrollHeight, 160)}px`;
-  };
 
   const selectedProject = useMemo(
     () => projects.find((p) => p.project_id === selectedProjectId) ?? null,
     [projects, selectedProjectId],
   );
 
-  /** Select a project (stable path). Loads its tasks; does not start an agent. */
+  /** User project ids — tasks under these nest in Projects; others are temporary. */
+  const userProjectIds = useMemo(
+    () => new Set(projects.map((p) => p.project_id)),
+    [projects],
+  );
+
+  const temporarySessions = useMemo(
+    () => sessions.filter((s) => !userProjectIds.has(s.project_id)),
+    [sessions, userProjectIds],
+  );
+
+  const sessionsByProjectId = useMemo(() => {
+    const map = new Map<string, SessionListRow[]>();
+    for (const s of sessions) {
+      if (!userProjectIds.has(s.project_id)) continue;
+      const list = map.get(s.project_id);
+      if (list) list.push(s);
+      else map.set(s.project_id, [s]);
+    }
+    return map;
+  }, [sessions, userProjectIds]);
+
+  /** Expand a project in the sidebar (keeps other projects open). */
+  const expandProject = useCallback((projectId: string) => {
+    setExpandedProjectIds((prev) => {
+      if (prev.has(projectId)) return prev;
+      const next = new Set(prev);
+      next.add(projectId);
+      return next;
+    });
+  }, []);
+
+  /**
+   * Click a project row: toggle its expanded task list (multi-open).
+   * Also marks it as the selected project for “new task under…” context.
+   */
   const onSelectProject = async (p: ProjectListRow) => {
+    setView("workspace");
+    const wasExpanded = expandedProjectIds.has(p.project_id);
+    if (wasExpanded) {
+      // Collapse only this project; leave others expanded.
+      setExpandedProjectIds((prev) => {
+        const next = new Set(prev);
+        next.delete(p.project_id);
+        return next;
+      });
+      // Keep selection if this was selected, or clear if collapsing selected.
+      if (selectedProjectId === p.project_id) {
+        setSelectedProjectId(null);
+      }
+      return;
+    }
+    expandProject(p.project_id);
     setSelectedProjectId(p.project_id);
     setProjectRoot(p.root_path);
-    setView("workspace");
     try {
       await invoke<string>("set_project_root", { projectRoot: p.root_path });
     } catch {
       /* ignore path errors; still show tasks */
     }
-    await refreshSessions(p.project_id);
   };
 
-  /** Reconnect agent on the current task (or create one if none). */
+  /** Remove project from sidebar (+ all its tasks). Source folder is kept. */
+  const onDeleteProject = async (p: ProjectListRow, e?: React.MouseEvent) => {
+    e?.stopPropagation();
+    if (connecting) return;
+    const n = p.session_count;
+    const ok = window.confirm(
+      `Remove project “${p.name}” from Grokx?\n\n` +
+        `This removes the project entry and ${n} task${n === 1 ? "" : "s"} ` +
+        `(chat history under ~/.grokx/tasks/).\n\n` +
+        `Your source folder is NOT deleted:\n${p.root_path}`,
+    );
+    if (!ok) return;
+
+    const wasSelected = selectedProjectId === p.project_id;
+    const activeBelongs =
+      Boolean(session?.session_id) &&
+      sessions.some(
+        (s) =>
+          s.session_id === session?.session_id && s.project_id === p.project_id,
+      );
+
+    if (activeBelongs) {
+      await flushPersistHistory();
+      historyEpochRef.current += 1;
+    }
+
+    try {
+      await invoke("delete_project", { projectId: p.project_id });
+      setProjects((prev) => prev.filter((row) => row.project_id !== p.project_id));
+      // Drop task rows that belonged to this project.
+      setSessions((prev) => {
+        const kept = prev.filter((row) => row.project_id !== p.project_id);
+        for (const gone of prev) {
+          if (gone.project_id === p.project_id) {
+            autoTitledSessionRef.current.delete(gone.session_id);
+            sessionScrollRef.current.delete(gone.session_id);
+            sessionContextTokensRef.current.delete(gone.session_id);
+            sessionLinesCacheRef.current.delete(gone.session_id);
+            sessionBusyMapRef.current.delete(gone.session_id);
+            sessionUnreadMapRef.current.delete(gone.session_id);
+          }
+        }
+        return kept;
+      });
+      setSessionUnreadMap((prev) => {
+        let changed = false;
+        const next = { ...prev };
+        for (const id of Object.keys(next)) {
+          // Drop unread for deleted project tasks (already removed from ref).
+          if (!sessionUnreadMapRef.current.has(id)) {
+            delete next[id];
+            changed = true;
+          }
+        }
+        return changed ? next : prev;
+      });
+
+      if (wasSelected) {
+        setSelectedProjectId(null);
+      }
+      setExpandedProjectIds((prev) => {
+        if (!prev.has(p.project_id)) return prev;
+        const next = new Set(prev);
+        next.delete(p.project_id);
+        return next;
+      });
+      if (activeBelongs) {
+        setSession(null);
+        sessionIdRef.current = null;
+        workPathRef.current = null;
+        setLines([]);
+        linesRef.current = [];
+        setPendingPerm(null);
+        setAttachments([]);
+        clearComposer();
+        setBusy(false);
+        setEngineContextTokens(null);
+        setAgentStatus("disconnected");
+      }
+      await refreshSessions();
+      void refreshProjects();
+    } catch (err) {
+      setError(String(err));
+    }
+  };
+
+  /**
+   * Force reconnect on the current task (or create one if none).
+   * Rarely needed: New task / switching Tasks already connect. Kept for
+   * recovery when the agent drops while you stay on the same task.
+   */
   const onConnect = async () => {
     if (session?.session_id) {
       await onActivateSession(
@@ -1441,17 +3647,18 @@ export default function App() {
           created_at: new Date().toISOString(),
           updated_at: new Date().toISOString(),
         },
+        { forceReconnect: true },
       );
       return;
     }
     await onNewSession();
   };
 
-  /** New task under current project. */
+  /** Sidebar top "New task" → always a temporary (Tasks) session. */
   const onNewTask = async () => {
     setPendingPerm(null);
     setView("workspace");
-    await onNewSession();
+    await onNewStandaloneTask();
   };
 
   /**
@@ -1459,19 +3666,25 @@ export default function App() {
    * the first temporary task under ~/.grokx/tasks/<id>.
    */
   const onOpenProject = async () => {
-    if (connecting || busy) return;
+    // Allow while another task is busy — multi-agent keeps it running.
+    if (connecting) return;
     setView("workspace");
     setError(null);
     try {
       const picked = await invoke<string | null>("pick_project_dir");
       if (!picked) return;
-      saveSessionScroll(sessionIdRef.current);
+      const leavingId = sessionIdRef.current;
+      saveSessionScroll(leavingId);
+      if (leavingId) {
+        sessionLinesCacheRef.current.set(leavingId, linesRef.current);
+      }
       await flushPersistHistory();
       setLines([]);
       linesRef.current = [];
       setPendingPerm(null);
       setAttachments([]);
-      setDraft("");
+      clearComposer();
+      setBusy(false);
       setConnecting(true);
       autoScrollEnabledRef.current = true;
       userScrollIntentRef.current = false;
@@ -1480,7 +3693,7 @@ export default function App() {
       await invoke<string>("set_project_root", { projectRoot: root });
       const info = await invoke<SessionInfo>("connect_workspace", {
         projectRoot: root,
-        autoApprove,
+        autoApprove: permissionMode === "always-approve",
       });
       setSession(info);
       if (info.project_root) setProjectRoot(info.project_root);
@@ -1505,17 +3718,23 @@ export default function App() {
   };
 
   /**
-   * New temporary task in Tasks only.
-   * - If a user Project is selected: attach to that project.
-   * - Otherwise: use internal default sandbox (~/.grokx/workspace) — NOT
-     shown under Projects.
-   * Task cwd: ~/.grokx/tasks/<id>.
+   * Create a new task.
+   * - `underProject`: attach to that user project (nested under Projects).
+   * - otherwise: temporary task under default sandbox (Tasks section only).
+   * Task cwd is always ~/.grokx/tasks/<id>.
    */
-  const onNewSession = async () => {
-    if (connecting || busy) return;
+  const onNewSession = async (opts?: {
+    underProject?: ProjectListRow | null;
+  }) => {
+    // Allow while another task is busy — prior agent keeps working in parallel.
+    if (connecting) return;
     setView("workspace");
     // Remember where we were reading so returning to this task restores it.
-    saveSessionScroll(sessionIdRef.current);
+    const leavingId = sessionIdRef.current;
+    saveSessionScroll(leavingId);
+    if (leavingId) {
+      sessionLinesCacheRef.current.set(leavingId, linesRef.current);
+    }
     // Save current task transcript before leaving.
     await flushPersistHistory();
     historyEpochRef.current += 1;
@@ -1523,9 +3742,13 @@ export default function App() {
     linesRef.current = [];
     setPendingPerm(null);
     setAttachments([]);
-    setDraft("");
+    clearComposer();
+    setEditingUserId(null);
+    setEditDraft("");
     setError(null);
     setBusy(false);
+    // New task = new context window; drop previous engine total immediately.
+    setEngineContextTokens(null);
     turnStartedAtRef.current = null;
     setConnecting(true);
     // Fresh task starts at bottom with auto-follow on.
@@ -1533,8 +3756,11 @@ export default function App() {
     userScrollIntentRef.current = false;
     stickyUserIdRef.current = null;
     setStickyUserId(null);
-    // Only treat an explicitly selected sidebar Project as a real project.
-    const userProject = selectedProject;
+
+    const userProject =
+      opts?.underProject === undefined
+        ? selectedProject
+        : opts.underProject;
     const standalone = !userProject;
     try {
       let root = userProject?.root_path?.trim() || "";
@@ -1548,10 +3774,13 @@ export default function App() {
       }
       const info = await invoke<SessionInfo>("connect_workspace", {
         projectRoot: root,
-        autoApprove,
+        autoApprove: permissionMode === "always-approve",
       });
       setSession(info);
       sessionIdRef.current = info.session_id;
+      // Ensure this id has no inherited engine total.
+      sessionContextTokensRef.current.delete(info.session_id);
+      setEngineContextTokens(null);
       workPathRef.current = info.work_path ?? null;
       if (info.project_root && !standalone) {
         setProjectRoot(info.project_root);
@@ -1573,26 +3802,53 @@ export default function App() {
     }
   };
 
-  /** Activate an existing task (click) — restore history, never creates a new row. */
-  const onActivateSession = async (s: SessionListRow) => {
+  /** New temporary task only (Tasks section +). */
+  const onNewStandaloneTask = async () => {
+    setSelectedProjectId(null);
+    // Do not collapse expanded projects when creating a temporary task.
+    await onNewSession({ underProject: null });
+  };
+
+  /** New task nested under a user project. */
+  const onNewProjectTask = async (p: ProjectListRow, e?: React.MouseEvent) => {
+    e?.stopPropagation();
+    expandProject(p.project_id);
+    setSelectedProjectId(p.project_id);
+    setProjectRoot(p.root_path);
+    await onNewSession({ underProject: p });
+  };
+
+  /** Activate an existing task (click) — restore history, never creates a new row.
+   *  Other tasks keep running in the background (multi-agent). */
+  const onActivateSession = async (
+    s: SessionListRow,
+    opts?: { forceReconnect?: boolean },
+  ) => {
     if (renamingId === s.session_id || connecting) return;
     setView("workspace");
 
-    // Highlight parent Project only if it is a user-visible project.
+    // Open parent project (keep other projects expanded). Temporary tasks
+    // only clear selection — they do not collapse open projects.
     const visibleProject = projects.find((p) => p.project_id === s.project_id);
     if (visibleProject) {
+      expandProject(visibleProject.project_id);
       setSelectedProjectId(visibleProject.project_id);
     } else {
       setSelectedProjectId(null);
     }
 
-    // Already the active task — just focus workspace, no engine restart.
-    // Do not refresh/reorder the list on click.
-    if (session?.session_id === s.session_id) {
+    // Already the active task and agent is healthy — no engine restart.
+    // If disconnected (or force), fall through and reconnect the same task.
+    const agentReady = agentStatus.toLowerCase().includes("ready");
+    if (
+      session?.session_id === s.session_id &&
+      !opts?.forceReconnect &&
+      agentReady
+    ) {
       return;
     }
 
-    // Persist the task we're leaving so we can resume it later.
+    // Persist + cache the task we're leaving so background work continues cleanly.
     const leavingId = sessionIdRef.current;
     const leavingWork = workPathRef.current;
     const leavingLines = linesRef.current;
@@ -1602,8 +3858,12 @@ export default function App() {
       clearTimeout(historySaveTimer.current);
       historySaveTimer.current = null;
     }
-    if (leavingId && hasRealChatContent(leavingLines)) {
-      await persistChatHistory(leavingId, leavingLines, leavingWork);
+    if (leavingId) {
+      // Keep live transcript in memory while agent keeps working off-screen.
+      sessionLinesCacheRef.current.set(leavingId, leavingLines);
+      if (hasRealChatContent(leavingLines)) {
+        await persistChatHistory(leavingId, leavingLines, leavingWork);
+      }
     }
 
     // Invalidate any pending saves from the previous task.
@@ -1614,9 +3874,14 @@ export default function App() {
     setError(null);
     setPendingPerm(null);
     setAttachments([]);
-    setDraft("");
-    setBusy(false);
-    turnStartedAtRef.current = null;
+    clearComposer();
+    setEditingUserId(null);
+    setEditDraft("");
+    // Restore busy for the task we're entering (may still be streaming).
+    const enteringBusy = sessionBusyMapRef.current.get(s.session_id) ?? false;
+    busyRef.current = enteringBusy;
+    setBusy(enteringBusy);
+    turnStartedAtRef.current = enteringBusy ? Date.now() : null;
     stickyUserIdRef.current = null;
     setStickyUserId(null);
 
@@ -1628,28 +3893,50 @@ export default function App() {
       status: "Starting",
     });
     sessionIdRef.current = s.session_id;
+    // Opening this task clears its unread indicator.
+    clearSessionUnread(s.session_id);
+    // Restore this task's last engine total (if any); otherwise estimate from chat.
+    setEngineContextTokens(
+      sessionContextTokensRef.current.get(s.session_id) ?? null,
+    );
     workPathRef.current = s.work_path || null;
     if (s.project_root) setProjectRoot(s.project_root);
 
-    // Restore transcript ASAP (by work_path) so chat is visible during reconnect.
-    const history = await loadChatHistory(s.session_id, s.work_path);
-    if (historyEpochRef.current !== epoch) return;
-    // Apply scroll policy *before* setLines so the lines-effect auto-follow
-    // does not race and yank the viewport to the bottom.
-    const savedScroll = sessionScrollRef.current.get(s.session_id);
-    if (!savedScroll || savedScroll.pinBottom) {
-      autoScrollEnabledRef.current = true;
-      userScrollIntentRef.current = false;
+    // Prefer in-memory cache (includes live stream while we were away).
+    // Clear previous task's lines immediately so background→active events
+    // for the new task don't append onto the old transcript during await.
+    const cached = sessionLinesCacheRef.current.get(s.session_id);
+    if (cached && cached.length > 0) {
+      setLines(cached);
+      linesRef.current = cached;
     } else {
-      autoScrollEnabledRef.current = false;
-      userScrollIntentRef.current = true;
+      setLines([]);
+      linesRef.current = [];
     }
-    setLines(history);
-    linesRef.current = history;
-    // Resume at the leave position (or bottom if first visit / was pinned).
-    restoreSessionScroll(s.session_id);
 
+    // Entire activate path must clear `connecting` — early returns used to
+    // leave Connecting stuck forever and block further task switches.
     try {
+      let history =
+        cached && cached.length > 0
+          ? cached
+          : await loadChatHistory(s.session_id, s.work_path);
+      if (historyEpochRef.current !== epoch) return;
+      // Apply scroll policy *before* setLines so the lines-effect auto-follow
+      // does not race and yank the viewport to the bottom.
+      const savedScroll = sessionScrollRef.current.get(s.session_id);
+      if (!savedScroll || savedScroll.pinBottom) {
+        autoScrollEnabledRef.current = true;
+        userScrollIntentRef.current = false;
+      } else {
+        autoScrollEnabledRef.current = false;
+        userScrollIntentRef.current = true;
+      }
+      setLines(history);
+      linesRef.current = history;
+      // Resume at the leave position (or bottom if first visit / was pinned).
+      restoreSessionScroll(s.session_id);
+
       if (s.project_root) {
         try {
           await invoke<string>("set_project_root", {
@@ -1659,10 +3946,11 @@ export default function App() {
           /* path may still work via reconnect metadata */
         }
       }
-      // reconnect_session reuses this session_id — does not append a new list item.
+      // reconnect_session focuses an already-live agent or spawns one —
+      // does not kill other parallel agents.
       const info = await invoke<SessionInfo>("reconnect_session", {
         sessionId: s.session_id,
-        autoApprove,
+        autoApprove: permissionMode === "always-approve",
       });
       if (historyEpochRef.current !== epoch) return;
       if (info.session_id !== s.session_id) {
@@ -1684,38 +3972,65 @@ export default function App() {
       if (info.project_root) setProjectRoot(info.project_root);
       setAgentStatus(info.status);
 
-      // Re-load history after reconnect in case first load raced; never clear real chat.
-      const history2 = await loadChatHistory(
-        s.session_id,
-        info.work_path ?? s.work_path,
-      );
-      if (historyEpochRef.current !== epoch) return;
-      let historyChanged = false;
-      if (history2.length > 0) {
-        // Only replace if content actually differs — avoid resetting scroll.
+      // Prefer freshest in-memory cache (background events may have updated it).
+      const cached2 = sessionLinesCacheRef.current.get(s.session_id);
+      if (cached2 && cached2.length > 0) {
         const prev = linesRef.current;
-        historyChanged =
-          history2.length !== prev.length ||
-          history2.some((l, i) => l.id !== prev[i]?.id || l.kind !== prev[i]?.kind);
+        const historyChanged =
+          cached2.length !== prev.length ||
+          cached2.some(
+            (l, i) => l.id !== prev[i]?.id || l.kind !== prev[i]?.kind,
+          );
         if (historyChanged) {
-          setLines(history2);
-          linesRef.current = history2;
+          setLines(cached2);
+          linesRef.current = cached2;
+          restoreSessionScroll(s.session_id);
         }
-      } else if (hasRealChatContent(linesRef.current)) {
-        // Keep what we already showed.
+      } else {
+        // Re-load history after reconnect in case first load raced.
+        const history2 = await loadChatHistory(
+          s.session_id,
+          info.work_path ?? s.work_path,
+        );
+        if (historyEpochRef.current !== epoch) return;
+        if (history2.length > 0) {
+          const prev = linesRef.current;
+          const historyChanged =
+            history2.length !== prev.length ||
+            history2.some(
+              (l, i) => l.id !== prev[i]?.id || l.kind !== prev[i]?.kind,
+            );
+          if (historyChanged) {
+            setLines(history2);
+            linesRef.current = history2;
+            restoreSessionScroll(s.session_id);
+          }
+        }
       }
 
-      if (historyChanged) {
-        restoreSessionScroll(s.session_id);
+      // Sync busy from backend in case we missed events while away.
+      try {
+        const stillBusy = await invoke<boolean>("is_session_busy", {
+          sessionId: s.session_id,
+        });
+        if (historyEpochRef.current === epoch) {
+          setSessionBusyState(s.session_id, stillBusy);
+        }
+      } catch {
+        /* keep map value */
       }
 
-      // Keep list order stable: only refresh session metadata/titles, no full hierarchy reshuffle.
-      await refreshSessions(visibleProject ? s.project_id : null);
+      // Keep list order stable: only refresh session metadata/titles.
+      await refreshSessions();
       await refreshModels();
     } catch (e) {
       setError(String(e));
       // Keep restored history visible even if reconnect fails.
+      setAgentStatus("failed");
     } finally {
+      // Always release the connecting lock for this activation attempt.
+      // A superseded epoch means a newer activate owns the UI; still clear
+      // if we are the latest so we never stick on Connecting forever.
       if (historyEpochRef.current === epoch) {
         setConnecting(false);
       }
@@ -1757,7 +4072,7 @@ export default function App() {
 
   const onDeleteSession = async (s: SessionListRow, e?: React.MouseEvent) => {
     e?.stopPropagation();
-    if (connecting || busy) return;
+    if (connecting) return;
     const label = s.title || s.session_id.slice(0, 8);
     const ok = window.confirm(
       `Delete task “${label}”?\n\nThis removes the task and its chat history from disk.`,
@@ -1776,6 +4091,16 @@ export default function App() {
       setSessions((prev) => prev.filter((row) => row.session_id !== s.session_id));
       autoTitledSessionRef.current.delete(s.session_id);
       sessionScrollRef.current.delete(s.session_id);
+      sessionContextTokensRef.current.delete(s.session_id);
+      sessionLinesCacheRef.current.delete(s.session_id);
+      sessionBusyMapRef.current.delete(s.session_id);
+      setSessionBusyMap((prev) => {
+        if (!(s.session_id in prev)) return prev;
+        const next = { ...prev };
+        delete next[s.session_id];
+        return next;
+      });
+      clearSessionUnread(s.session_id);
 
       if (wasActive) {
         setSession(null);
@@ -1785,7 +4110,7 @@ export default function App() {
         linesRef.current = [];
         setPendingPerm(null);
         setAttachments([]);
-        setDraft("");
+        clearComposer();
         setBusy(false);
         setAgentStatus("disconnected");
       }
@@ -1813,10 +4138,14 @@ export default function App() {
         for (const f of files) {
           if (seen.has(f.path)) continue;
           seen.add(f.path);
+          const displayName = attachmentDisplayName({
+            name: f.name,
+            path: f.path,
+          });
           next.push({
             path: f.path,
-            name: f.name || f.path.split(/[/\\]/).pop() || f.path,
-            mime: f.mime,
+            name: displayName,
+            mime: f.mime ?? null,
             size: f.size,
             previewUrl: f.previewUrl ?? null,
           });
@@ -2072,6 +4401,29 @@ export default function App() {
     });
   };
 
+  const openAttachmentPreview = useCallback((a: Attachment) => {
+    if (!isImageAttachment(a)) return;
+    let src = a.previewUrl || "";
+    if (!src && a.path) {
+      try {
+        src = convertFileSrc(a.path);
+      } catch {
+        src = "";
+      }
+    }
+    if (!src) return;
+    setAttachmentPreview({ src, name: attachmentDisplayName(a) });
+  }, []);
+
+  useEffect(() => {
+    if (!attachmentPreview) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setAttachmentPreview(null);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [attachmentPreview]);
+
   const onModelChange = async (id: string) => {
     setModelId(id);
     try {
@@ -2081,35 +4433,269 @@ export default function App() {
     }
   };
 
+  const cancelEditUser = useCallback(() => {
+    setEditingUserId(null);
+    setEditDraft("");
+  }, []);
+
+  const beginEditUser = useCallback(
+    (line: Extract<ChatLine, { kind: "user" }>) => {
+      if (busy || connecting) return;
+      setEditingUserId(line.id);
+      setEditDraft(line.text ?? "");
+      // Focus after paint so the textarea exists.
+      requestAnimationFrame(() => {
+        const el = editTextareaRef.current;
+        if (!el) return;
+        el.focus();
+        el.style.height = "auto";
+        el.style.height = `${Math.min(el.scrollHeight, 200)}px`;
+        // Place caret at end.
+        const len = el.value.length;
+        el.setSelectionRange(len, len);
+      });
+    },
+    [busy, connecting],
+  );
+
+  /**
+   * Re-send from an edited user bubble: keep history up to that message,
+   * replace its text, drop everything after, and start a new turn.
+   */
+  const onResendEditedUser = async () => {
+    if (!editingUserId || busy || connecting) return;
+    const text = editDraft.trim();
+    const idx = linesRef.current.findIndex(
+      (l) => l.kind === "user" && l.id === editingUserId,
+    );
+    if (idx < 0) {
+      cancelEditUser();
+      return;
+    }
+    const original = linesRef.current[idx];
+    if (original.kind !== "user") {
+      cancelEditUser();
+      return;
+    }
+    const keepAtts = original.attachments ?? [];
+    if (!text && keepAtts.length === 0) return;
+
+    // Truncate transcript: keep messages before this user bubble, then the
+    // edited user message (attachments preserved; text updated).
+    const kept = linesRef.current.slice(0, idx);
+    const updatedUser: ChatLine = {
+      ...original,
+      text: text || original.text,
+      at: new Date().toISOString(),
+    };
+    const next: ChatLine[] = [
+      ...kept,
+      updatedUser,
+      {
+        id: nextLineId("waiting"),
+        kind: "waiting",
+        text: "Grokx is thinking…",
+      },
+    ];
+    setLines(next);
+    linesRef.current = next;
+    if (sessionIdRef.current) {
+      sessionLinesCacheRef.current.set(sessionIdRef.current, next);
+    }
+    setEditingUserId(null);
+    setEditDraft("");
+    // Persist truncated + edited history immediately (don't wait for debounce).
+    if (sessionIdRef.current) {
+      void persistChatHistory(
+        sessionIdRef.current,
+        next,
+        workPathRef.current,
+      );
+    }
+
+    turnStartedAtRef.current = Date.now();
+    verbalNudgeUsedRef.current = false;
+    const sid = sessionIdRef.current;
+    if (sid) setSessionBusyState(sid, true);
+    else setBusy(true);
+    enableAutoScroll();
+
+    // Prompt text: edited text, or empty if image-only (engine gets attachments).
+    const promptText = text;
+    const attPayload = keepAtts.map((a) => ({
+      path: a.path,
+      name: a.name,
+      mime: a.mime ?? null,
+      size: a.size ?? null,
+    }));
+
+    try {
+      await invoke("send_prompt_rich", {
+        payload: {
+          text: promptText,
+          attachments: attPayload,
+          model: modelId || null,
+          effort: effortId || null,
+        },
+      });
+    } catch (e) {
+      if (sid) setSessionBusyState(sid, false);
+      else setBusy(false);
+      clearWaiting();
+      push({ kind: "error", text: String(e) });
+      finishTurnCollapse(true);
+    }
+  };
+
+  /**
+   * Grok Build `/goal` helpers.
+   * - Set goal: put `/goal ` (or `/goal <draft>`) in the composer for the user to send
+   * - status / pause / resume / clear: send the slash command immediately
+   */
+  const sendGoalCommand = useCallback(
+    async (cmd: "status" | "pause" | "resume" | "clear") => {
+      setGoalMenuOpen(false);
+      if (!session || busy) return;
+      const text = `/goal ${cmd}`;
+      turnStartedAtRef.current = Date.now();
+      longRunDismissedRef.current = false;
+      setLongRunNotice(null);
+      verbalNudgeUsedRef.current = true; // slash meta — no verbal nudge
+      const sid = sessionIdRef.current;
+      if (sid) userStoppedSessionRef.current = null;
+      if (sid) setSessionBusyState(sid, true);
+      else setBusy(true);
+      enableAutoScroll();
+      push({
+        kind: "user",
+        text,
+        at: new Date().toISOString(),
+      });
+      push({ kind: "waiting", text: "Grokx is thinking…" });
+      try {
+        await invoke("send_prompt_rich", {
+          payload: {
+            text,
+            attachments: [],
+            model: modelId || null,
+            effort: effortId || null,
+          },
+        });
+      } catch (e) {
+        if (sid) setSessionBusyState(sid, false);
+        else setBusy(false);
+        clearWaiting();
+        push({ kind: "error", text: String(e) });
+        finishTurnCollapse(true);
+      }
+    },
+    [
+      session,
+      busy,
+      modelId,
+      effortId,
+      setSessionBusyState,
+      enableAutoScroll,
+      push,
+      clearWaiting,
+      finishTurnCollapse,
+    ],
+  );
+
+  const onGoalSetClick = useCallback(() => {
+    setGoalMenuOpen(false);
+    const cur = (composerRef.current?.getValue() ?? "").trim();
+    if (!cur) {
+      composerRef.current?.setValue("/goal ");
+    } else if (/^\/goal(\s|$)/i.test(cur)) {
+      // Already a goal command — leave as-is.
+      composerRef.current?.focus();
+      return;
+    } else {
+      composerRef.current?.setValue(`/goal ${cur}`);
+    }
+    setComposerHasText(true);
+    composerRef.current?.focus();
+  }, []);
+
+  useEffect(() => {
+    if (!goalMenuOpen) return;
+    const onDoc = (e: MouseEvent) => {
+      const el = goalMenuRef.current;
+      if (el && !el.contains(e.target as Node)) {
+        setGoalMenuOpen(false);
+      }
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setGoalMenuOpen(false);
+    };
+    document.addEventListener("mousedown", onDoc);
+    window.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onDoc);
+      window.removeEventListener("keydown", onKey);
+    };
+  }, [goalMenuOpen]);
+
   const onSend = async () => {
-    const text = draft.trim();
+    // If editing a past message, that flow owns send.
+    if (editingUserId) {
+      await onResendEditedUser();
+      return;
+    }
+    const text = (composerRef.current?.getValue() ?? "").trim();
     if ((!text && attachments.length === 0) || busy) return;
     const pendingAttachments = attachments;
-    setDraft("");
+    clearComposer();
     setAttachments([]);
-    if (textareaRef.current) {
-      textareaRef.current.style.height = "auto";
-    }
     turnStartedAtRef.current = Date.now();
+    longRunDismissedRef.current = false;
+    setLongRunNotice(null);
+    // Fresh user turn: allow one auto-nudge again if the model only talks.
+    verbalNudgeUsedRef.current = false;
+    const sid = sessionIdRef.current;
+    // New prompt clears Stop guard so this turn can show Working.
+    if (sid) userStoppedSessionRef.current = null;
+    if (sid) setSessionBusyState(sid, true);
+    else setBusy(true);
     // New user turn: resume gentle auto-follow from the bottom.
     enableAutoScroll();
-    const display =
-      pendingAttachments.length > 0
-        ? `${text || "(attachments)"}${text ? "\n\n" : ""}📎 ${pendingAttachments
-            .map((a) => a.name)
-            .join(", ")}`
-        : text;
-    push({ kind: "user", text: display });
+    const chatAtts: ChatAttachment[] = pendingAttachments.map((a) => {
+      const name = attachmentDisplayName(a);
+      let previewSrc: string | null = a.previewUrl ?? null;
+      if (!previewSrc && a.path && isImageAttachment({ name, mime: a.mime })) {
+        try {
+          previewSrc = convertFileSrc(a.path);
+        } catch {
+          previewSrc = null;
+        }
+      }
+      return {
+        path: a.path,
+        name,
+        mime: a.mime ?? null,
+        size: a.size ?? null,
+        previewSrc,
+      };
+    });
+    // User bubble always keeps original attachment names (Word/docx etc.).
+    // Text is the typed prompt; files render as chips under the bubble.
+    const display = text;
+    push({
+      kind: "user",
+      text: display,
+      at: new Date().toISOString(),
+      attachments: chatAtts.length ? chatAtts : undefined,
+    });
     // Immediate left-side feedback so the UI doesn't look frozen.
     push({ kind: "waiting", text: "Grokx is thinking…" });
-    setBusy(true);
     try {
       await invoke("send_prompt_rich", {
         payload: {
           text,
           attachments: pendingAttachments.map((a) => ({
             path: a.path,
-            name: a.name,
+            name: attachmentDisplayName(a),
             mime: a.mime ?? null,
             size: a.size ?? null,
           })),
@@ -2118,25 +4704,373 @@ export default function App() {
         },
       });
     } catch (e) {
-      setBusy(false);
+      if (sid) setSessionBusyState(sid, false);
+      else setBusy(false);
       clearWaiting();
       push({ kind: "error", text: String(e) });
       finishTurnCollapse(true);
     }
   };
 
+  /**
+   * Stop button: end the active task's in-flight work immediately.
+   * - UI leaves Working right away
+   * - Backend sends session/cancel and unblocks the prompt RPC
+   * - Auto-nudge is suppressed so we do not restart after stop
+   */
   const onCancel = async () => {
+    const sid = sessionIdRef.current;
+    // Suppress verbal auto-continue after a user stop.
+    verbalNudgeUsedRef.current = true;
+    autoNudgeInFlightRef.current = false;
+    if (sid) userStoppedSessionRef.current = sid;
+    setLongRunNotice(null);
+    longRunDismissedRef.current = true;
+
+    // Optimistic UI: stop spinner / dock badge before RPC returns.
+    if (sid) setSessionBusyState(sid, false);
+    else setBusy(false);
+    setPendingPerm(null);
+    clearWaiting();
+
     try {
       await invoke("cancel_turn");
     } catch (e) {
-      push({ kind: "error", text: String(e) });
+      // Still settle the turn in the transcript.
+      push({
+        kind: "system",
+        text: `Stop requested · ${String(e)}`,
+      });
     } finally {
-      setBusy(false);
-      setPendingPerm(null);
-      // Still collapse any in-flight process stream.
+      // Collapse thinking/tools and show cancelled end state.
       finishTurnCollapse(false);
+      // Ensure a cancelled system line is visible if bridge event was missed.
+      setLines((prev) => {
+        const lastUser = (() => {
+          for (let i = prev.length - 1; i >= 0; i--) {
+            if (prev[i].kind === "user") return i;
+          }
+          return -1;
+        })();
+        const tail = lastUser >= 0 ? prev.slice(lastUser + 1) : prev;
+        const hasCancelNote = tail.some(
+          (l) =>
+            (l.kind === "system" || l.kind === "error") &&
+            /cancel|stop|stopped|中止|停止/i.test(l.text),
+        );
+        if (hasCancelNote) return prev;
+        const next: ChatLine[] = [
+          ...prev,
+          {
+            id: nextLineId("system"),
+            kind: "system",
+            text: "Turn stopped",
+          },
+        ];
+        linesRef.current = next;
+        return next;
+      });
+      if (sid) setSessionBusyState(sid, false);
+      else setBusy(false);
+      void flushPersistHistory();
     }
   };
+
+  /** Windowed chat rows: same ChatLine plus height estimate for virtualization. */
+  const virtualChatItems = useMemo(
+    () =>
+      lines.map((line) => ({
+        ...line,
+        estimateHeight: estimateChatLineHeight(line),
+      })),
+    [lines],
+  );
+
+  /** Drag the vertical split between sidebar ↔ chat or chat ↔ Outputs. */
+  const onPanelResizeStart = useCallback(
+    (kind: "sidebar" | "right", e: ReactMouseEvent) => {
+      e.preventDefault();
+      e.stopPropagation();
+      panelDragRef.current = {
+        kind,
+        startX: e.clientX,
+        startW: kind === "sidebar" ? sidebarWidth : rightWidth,
+      };
+      document.body.classList.add("resizing-panels");
+    },
+    [sidebarWidth, rightWidth],
+  );
+
+  useEffect(() => {
+    const onMove = (e: MouseEvent) => {
+      const drag = panelDragRef.current;
+      if (!drag) return;
+      if (drag.kind === "sidebar") {
+        const next = clampWidth(
+          drag.startW + (e.clientX - drag.startX),
+          SIDEBAR_W_MIN,
+          SIDEBAR_W_MAX,
+        );
+        setSidebarWidth(next);
+      } else {
+        // Right edge: drag handle is on the left of the rail; move left → wider.
+        const next = clampWidth(
+          drag.startW - (e.clientX - drag.startX),
+          RIGHT_W_MIN,
+          RIGHT_W_MAX,
+        );
+        setRightWidth(next);
+      }
+    };
+    const onUp = () => {
+      if (!panelDragRef.current) return;
+      const kind = panelDragRef.current.kind;
+      panelDragRef.current = null;
+      document.body.classList.remove("resizing-panels");
+      if (kind === "sidebar") {
+        writeStoredWidth("grokx.sidebarWidth", sidebarWidthRef.current);
+      } else {
+        writeStoredWidth("grokx.rightWidth", rightWidthRef.current);
+      }
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+    return () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+      document.body.classList.remove("resizing-panels");
+    };
+  }, []);
+
+  /** Absolute root for the Files tab (task cwd or project folder). */
+  const filesRootPath = useMemo(() => {
+    if (!session) return null;
+    if (filesRootKind === "project") {
+      return session.project_root || session.work_path || null;
+    }
+    return session.work_path || session.project_root || null;
+  }, [session, filesRootKind]);
+
+  /** Bases for resolving relative markdown images / media. */
+  const chatMediaBases = useMemo(
+    () => [session?.work_path, session?.project_root, projectRoot],
+    [session?.work_path, session?.project_root, projectRoot],
+  );
+
+  const refreshGitStatus = useCallback(async () => {
+    const root =
+      session?.project_root || session?.work_path || projectRoot || null;
+    if (!root) {
+      setGitInfo(null);
+      setGitError(null);
+      return;
+    }
+    setGitLoading(true);
+    setGitError(null);
+    try {
+      const info = await invoke<GitStatusInfo>("git_status", { path: root });
+      setGitInfo(info);
+    } catch (e) {
+      setGitInfo(null);
+      setGitError(String(e));
+    } finally {
+      setGitLoading(false);
+    }
+  }, [session?.project_root, session?.work_path, projectRoot]);
+
+  // Load git summary when overview is visible / session changes.
+  useEffect(() => {
+    if (view !== "workspace" || !outputsOpen) return;
+    if (outputsTab !== "overview") return;
+    void refreshGitStatus();
+  }, [
+    view,
+    outputsOpen,
+    outputsTab,
+    session?.session_id,
+    session?.project_root,
+    session?.work_path,
+    refreshGitStatus,
+  ]);
+
+  // Soft-refresh git after a turn finishes (agent may have committed).
+  useEffect(() => {
+    if (busy) return;
+    if (view !== "workspace" || outputsTab !== "overview") return;
+    if (!session) return;
+    const t = window.setTimeout(() => {
+      void refreshGitStatus();
+    }, 600);
+    return () => window.clearTimeout(t);
+  }, [busy, view, outputsTab, session?.session_id, refreshGitStatus]);
+
+  const refreshSessionProcesses = useCallback(async () => {
+    const sid = session?.session_id;
+    if (!sid) {
+      setSessionProcs([]);
+      setProcsError(null);
+      return;
+    }
+    setProcsLoading(true);
+    setProcsError(null);
+    try {
+      const rows = await invoke<SessionProc[]>("list_session_processes", {
+        sessionId: sid,
+      });
+      setSessionProcs(rows);
+    } catch (e) {
+      setSessionProcs([]);
+      setProcsError(String(e));
+    } finally {
+      setProcsLoading(false);
+    }
+  }, [session?.session_id]);
+
+  /** Stop a process tree (root + children). Only control exposed in Outputs. */
+  const stopSessionProcess = useCallback(
+    async (pid: number) => {
+      const sid = session?.session_id;
+      if (!sid) return;
+      setProcActionPid(pid);
+      setProcsError(null);
+      try {
+        await invoke("stop_session_process", { sessionId: sid, pid });
+        await new Promise((r) => setTimeout(r, 200));
+        await refreshSessionProcesses();
+      } catch (e) {
+        setProcsError(String(e));
+      } finally {
+        setProcActionPid(null);
+      }
+    },
+    [session?.session_id, refreshSessionProcesses],
+  );
+
+  // Poll agent-spawned processes while Outputs overview is open.
+  useEffect(() => {
+    if (view !== "workspace" || !outputsOpen) return;
+    if (outputsTab !== "overview") return;
+    if (!session?.session_id) {
+      setSessionProcs([]);
+      return;
+    }
+    void refreshSessionProcesses();
+    const id = window.setInterval(() => {
+      void refreshSessionProcesses();
+    }, 4000);
+    return () => window.clearInterval(id);
+  }, [
+    view,
+    outputsOpen,
+    outputsTab,
+    session?.session_id,
+    refreshSessionProcesses,
+  ]);
+
+  // After turn activity, refresh sooner (new tool shells often appear then).
+  useEffect(() => {
+    if (!session?.session_id) return;
+    if (outputsTab !== "overview") return;
+    const t = window.setTimeout(() => {
+      void refreshSessionProcesses();
+    }, 800);
+    return () => window.clearTimeout(t);
+  }, [busy, session?.session_id, outputsTab, refreshSessionProcesses]);
+
+  const loadFilesDir = useCallback(
+    async (path: string) => {
+      setFilesLoading(true);
+      setFilesError(null);
+      try {
+        const rows = await invoke<DirEntry[]>("list_directory", {
+          path,
+          maxEntries: 200,
+        });
+        setFilesBrowsePath(path);
+        setFilesEntries(rows);
+      } catch (e) {
+        setFilesError(String(e));
+        setFilesEntries([]);
+      } finally {
+        setFilesLoading(false);
+      }
+    },
+    [],
+  );
+
+  const refreshFilesTab = useCallback(() => {
+    const root = filesRootPath;
+    if (!root) {
+      setFilesEntries([]);
+      setFilesBrowsePath(null);
+      setFilesError(null);
+      return;
+    }
+    // Stay under the current root when refreshing mid-browse.
+    const target =
+      filesBrowsePath &&
+      (filesBrowsePath === root ||
+        filesBrowsePath.startsWith(root + "/") ||
+        filesBrowsePath.startsWith(root + "\\"))
+        ? filesBrowsePath
+        : root;
+    void loadFilesDir(target);
+  }, [filesRootPath, filesBrowsePath, loadFilesDir]);
+
+  // Load / refresh Files when tab opens or session / root kind changes.
+  useEffect(() => {
+    if (outputsTab !== "files") return;
+    if (!filesRootPath) {
+      setFilesEntries([]);
+      setFilesBrowsePath(null);
+      setFilesError(session ? null : "Open a task to browse files");
+      return;
+    }
+    // Reset browse path when root kind / session root changes.
+    void loadFilesDir(filesRootPath);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- only re-root on session/root change
+  }, [outputsTab, filesRootPath, session?.session_id]);
+
+  // After a turn finishes, refresh file list if Files tab is open.
+  useEffect(() => {
+    if (outputsTab !== "files" || busy || !filesBrowsePath) return;
+    // Soft refresh when leaving busy (agent may have written files).
+    const t = window.setTimeout(() => {
+      void loadFilesDir(filesBrowsePath);
+    }, 400);
+    return () => window.clearTimeout(t);
+  }, [busy, outputsTab, filesBrowsePath, loadFilesDir]);
+
+  const onOpenFilesPath = useCallback(async (path: string) => {
+    try {
+      await invoke("open_path", { path });
+    } catch (e) {
+      setFilesError(String(e));
+    }
+  }, []);
+
+  const onFilesEntryClick = useCallback(
+    (ent: DirEntry) => {
+      if (ent.is_dir) {
+        void loadFilesDir(ent.path);
+      } else {
+        void onOpenFilesPath(ent.path);
+      }
+    },
+    [loadFilesDir, onOpenFilesPath],
+  );
+
+  const filesCanGoUp = useMemo(() => {
+    if (!filesBrowsePath || !filesRootPath) return false;
+    const parent = parentDir(filesBrowsePath);
+    if (!parent) return false;
+    // Stay inside the selected root.
+    return (
+      parent === filesRootPath ||
+      parent.startsWith(filesRootPath + "/") ||
+      parent.startsWith(filesRootPath + "\\")
+    );
+  }, [filesBrowsePath, filesRootPath]);
 
   const onPermission = async (decision: "allow_once" | "deny") => {
     if (!pendingPerm) return;
@@ -2151,6 +5085,10 @@ export default function App() {
             : `Allowed · ${pendingPerm.summary}`,
       });
       setPendingPerm(null);
+      // After allow, tools continue — keep Working until turn_finished.
+      if (decision !== "deny") {
+        setBusy(true);
+      }
     } catch (e) {
       push({ kind: "error", text: String(e) });
     }
@@ -2170,24 +5108,131 @@ export default function App() {
     shortPath(session?.project_root || projectRoot) ||
     "New task";
 
+  const layoutStyle = {
+    ["--sidebar-w" as string]: sidebarOpen
+      ? `${sidebarWidth}px`
+      : "52px",
+    ["--right-w" as string]: `${rightWidth}px`,
+  } as CSSProperties;
+
+  const toggleSidebar = useCallback(() => {
+    setSidebarOpen((v) => {
+      const next = !v;
+      try {
+        localStorage.setItem("grokx.sidebarOpen", next ? "1" : "0");
+      } catch {
+        /* ignore */
+      }
+      return next;
+    });
+  }, []);
+
+  const setRightTab = useCallback((tab: "chat" | "overview" | "files") => {
+    setOutputsTab(tab);
+    try {
+      localStorage.setItem("grokx.rightTab", tab);
+    } catch {
+      /* ignore */
+    }
+  }, []);
+
+  /** Open right rail on Chat tab (or toggle closed if already on Chat). */
+  const openRightChat = useCallback(() => {
+    if (outputsOpen && outputsTab === "chat") {
+      setOutputsOpen(false);
+      return;
+    }
+    setRightTab("chat");
+    setOutputsOpen(true);
+  }, [outputsOpen, outputsTab, setRightTab]);
+
+  /** Open right rail on Outputs (overview), or collapse if already showing outputs. */
+  const openRightOutputs = useCallback(() => {
+    if (outputsOpen && (outputsTab === "overview" || outputsTab === "files")) {
+      setOutputsOpen(false);
+      return;
+    }
+    if (outputsTab === "chat") setRightTab("overview");
+    setOutputsOpen(true);
+  }, [outputsOpen, outputsTab, setRightTab]);
+
+  const sideChatSessionId = session?.session_id ?? null;
+  const sideChatMessages = sideChatSessionId
+    ? (sideChatBySession[sideChatSessionId] ?? [])
+    : [];
+
+  const updateSideChatMessages = useCallback(
+    (updater: (prev: SideChatMessage[]) => SideChatMessage[]) => {
+      const sid = sessionIdRef.current;
+      if (!sid) return;
+      setSideChatBySession((map) => {
+        const prev = map[sid] ?? [];
+        return { ...map, [sid]: updater(prev) };
+      });
+    },
+    [],
+  );
+
   return (
     <div
       className={`layout${outputsOpen ? "" : " layout-outputs-collapsed"}${
-        view === "settings" ? " layout-settings" : ""
-      }`}
+        sidebarOpen ? "" : " layout-sidebar-collapsed"
+      }${view === "settings" ? " layout-settings" : ""}`}
+      style={layoutStyle}
     >
-      <aside className="sidebar">
-        <div className="brand-row" data-tauri-drag-region>
-          <button
-            type="button"
-            className="brand brand-btn"
-            title="Back to workspace"
-            onClick={() => setView("workspace")}
-          >
-            Grokx
-          </button>
+      {view !== "settings" && (
+      <aside className={`sidebar${sidebarOpen ? "" : " sidebar-collapsed"}`}>
+        {/* Full sidebar chrome under traffic lights — drag to move the window. */}
+        <div
+          className="sidebar-titlebar"
+          onMouseDown={onTitlebarMouseDown}
+          onDoubleClick={onTitlebarDoubleClick}
+        >
+          <div className="brand-row">
+            {sidebarOpen ? (
+              <>
+                <button
+                  type="button"
+                  className="brand brand-btn"
+                  title="Back to workspace"
+                  onClick={() => setView("workspace")}
+                >
+                  Grokx
+                </button>
+                <button
+                  type="button"
+                  className="icon-btn sidebar-collapse-btn"
+                  title="Collapse sidebar"
+                  aria-label="Collapse sidebar"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    toggleSidebar();
+                  }}
+                  onMouseDown={(e) => e.stopPropagation()}
+                >
+                  <IconChevronLeft size={16} />
+                </button>
+              </>
+            ) : (
+              <button
+                type="button"
+                className="icon-btn sidebar-expand-btn"
+                title="Expand sidebar"
+                aria-label="Expand sidebar"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  toggleSidebar();
+                }}
+                onMouseDown={(e) => e.stopPropagation()}
+              >
+                <IconChevronRight size={16} />
+              </button>
+            )}
+          </div>
         </div>
 
+        {sidebarOpen && (
+        <>
         <nav className="nav">
           <button
             className="nav-item"
@@ -2199,150 +5244,435 @@ export default function App() {
             </span>
             {connecting ? "Connecting…" : "New task"}
           </button>
-          <button
-            className="nav-item"
-            onClick={() => void onConnect()}
-            disabled={connecting}
-          >
-            <span className="nav-glyph">
-              <IconRefresh size={16} />
-            </span>
-            {connected ? "Reconnect" : "Connect agent"}
-          </button>
         </nav>
 
-        {/* Project = fixed user-chosen folder */}
+        {/*
+          Projects = fixed folders; tasks nest under the selected project.
+          Tasks = temporary sessions (default sandbox) only.
+        */}
         <div className="section-label-row">
-          <span className="section-label">Projects</span>
+          <button
+            type="button"
+            className={`section-label-btn${
+              projectsSectionOpen ? "" : " collapsed"
+            }`}
+            aria-expanded={projectsSectionOpen}
+            title={
+              projectsSectionOpen
+                ? "Collapse Projects"
+                : "Expand Projects"
+            }
+            onClick={() => {
+              setProjectsSectionOpen((v) => {
+                const next = !v;
+                try {
+                  localStorage.setItem(
+                    "grokx.sidebar.projectsOpen",
+                    next ? "1" : "0",
+                  );
+                } catch {
+                  /* ignore */
+                }
+                return next;
+              });
+            }}
+          >
+            <span className="section-chevron" aria-hidden>
+              {projectsSectionOpen ? (
+                <IconChevronDown size={14} />
+              ) : (
+                <IconChevronRight size={14} />
+              )}
+            </span>
+            <span className="section-label">Projects</span>
+          </button>
           <button
             type="button"
             className="session-add-btn"
             title="Open project folder (fixed path)"
-            disabled={connecting || busy}
+            disabled={connecting}
             onClick={() => void onOpenProject()}
           >
             <IconPlus size={16} />
           </button>
         </div>
+        {projectsSectionOpen && (
         <div className="project-list">
           {projects.length === 0 && (
             <div className="session-empty">
               No projects · + opens a folder
             </div>
           )}
-          {projects.map((p) => (
-            <div
-              key={p.project_id}
-              className={`project-row${
-                p.project_id === selectedProjectId ? " active" : ""
-              }`}
-              onClick={() => void onSelectProject(p)}
-              title={`Project (fixed path)\n${p.root_path}`}
-            >
-              <div className="project-row-main">
-                <div className="project-title">{p.name}</div>
-                <span className="project-count">{p.session_count}</span>
-              </div>
-              <div className="project-meta">{shortPath(p.root_path)}</div>
-            </div>
-          ))}
-        </div>
-
-        {/* Tasks = temporary ~/.grokx/tasks/<id> only; does not create Projects */}
-        <div className="section-label-row">
-          <span className="section-label">
-            Tasks
-            {selectedProject ? ` · ${selectedProject.name}` : ""}
-          </span>
-          <button
-            type="button"
-            className="session-add-btn"
-            title={
-              selectedProject
-                ? "New task under this project (~/.grokx/tasks/…)"
-                : "New temporary task (Tasks only, no Project entry)"
+          {projects.map((p) => {
+            const isExpanded = expandedProjectIds.has(p.project_id);
+            const isSelected = p.project_id === selectedProjectId;
+            const nested = sessionsByProjectId.get(p.project_id) ?? [];
+            // When project is collapsed, still surface child task activity.
+            let nestedWorking = 0;
+            let nestedUnread = 0;
+            for (const s of nested) {
+              const childActive = s.session_id === session?.session_id;
+              if (
+                sessionBusyMap[s.session_id] ||
+                (childActive && busy)
+              ) {
+                nestedWorking += 1;
+              }
+              if (sessionUnreadMap[s.session_id] && !childActive) {
+                nestedUnread += 1;
+              }
             }
-            disabled={connecting || busy}
-            onClick={() => void onNewSession()}
-          >
-            <IconPlus size={16} />
-          </button>
-        </div>
-        <div className="session-list">
-          {sessions.length === 0 && (
-            <div className="session-empty">No tasks · click + to start</div>
-          )}
-          {sessions.map((s) => (
-            <div
-              key={s.session_id}
-              className={`session-row${
-                s.session_id === session?.session_id ? " active" : ""
-              }`}
-              onClick={() => void onActivateSession(s)}
-              onDoubleClick={(e) => startRename(s, e)}
-              title={`Task workspace (temporary)\n${s.work_path || "~/.grokx/tasks/…"}\nProject: ${s.project_root}\nClick to switch · double-click or ✎ to rename · 🗑 to delete`}
-            >
-              {renamingId === s.session_id ? (
-                <input
-                  ref={renameInputRef}
-                  className="session-rename-input"
-                  value={renameDraft}
-                  onChange={(e) => setRenameDraft(e.target.value)}
-                  onClick={(e) => e.stopPropagation()}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter") {
-                      e.preventDefault();
-                      void commitRename();
-                    } else if (e.key === "Escape") {
-                      e.preventDefault();
-                      cancelRename();
-                    }
-                  }}
-                  onBlur={() => void commitRename()}
-                />
-              ) : (
-                <>
-                  <div className="session-row-main">
-                    <div className="session-title">
-                      {s.title || s.session_id.slice(0, 8)}
+            const projectWorking = nestedWorking > 0;
+            const projectUnread = nestedUnread > 0;
+            // Show unread on the project row only while collapsed.
+            const showProjectUnread = projectUnread && !isExpanded;
+            return (
+              <div key={p.project_id} className="project-block">
+                <div
+                  className={`project-row${isSelected ? " active" : ""}${
+                    isExpanded ? " expanded" : ""
+                  }${projectWorking ? " working" : ""}${
+                    showProjectUnread ? " unread" : ""
+                  }`}
+                  onClick={() => void onSelectProject(p)}
+                  title={
+                    projectWorking
+                      ? `Working · ${nestedWorking} task${
+                          nestedWorking === 1 ? "" : "s"
+                        }\n${p.root_path}`
+                      : showProjectUnread
+                        ? `Unread · ${nestedUnread} task${
+                            nestedUnread === 1 ? "" : "s"
+                          }\n${p.root_path}`
+                        : isExpanded
+                          ? `Expanded · click to collapse\n${p.root_path}`
+                          : `Project (fixed path)\n${p.root_path}\nClick to expand nested tasks`
+                  }
+                >
+                  <div className="project-row-main">
+                    {projectWorking ? (
+                      <span
+                        className="session-working-spin project-working-spin"
+                        title={
+                          nestedWorking === 1
+                            ? "1 task working"
+                            : `${nestedWorking} tasks working`
+                        }
+                        aria-label={
+                          nestedWorking === 1
+                            ? "1 task working"
+                            : `${nestedWorking} tasks working`
+                        }
+                      />
+                    ) : (
+                      <span className="project-icon" aria-hidden>
+                        <IconFolder size={15} />
+                      </span>
+                    )}
+                    <div className="project-title">
+                      {p.name}
+                      {showProjectUnread && (
+                        <span
+                          className="session-unread-dot"
+                          title={
+                            nestedUnread === 1
+                              ? "1 unread task"
+                              : `${nestedUnread} unread tasks`
+                          }
+                          aria-label="Unread activity in project"
+                        />
+                      )}
                     </div>
+                    <span
+                      className={`project-count${
+                        projectWorking ? " project-count-working" : ""
+                      }`}
+                      title={
+                        projectWorking
+                          ? `${nestedWorking} working · ${nested.length} total`
+                          : undefined
+                      }
+                    >
+                      {projectWorking
+                        ? `${nestedWorking}/${nested.length}`
+                        : nested.length}
+                    </span>
                     <button
                       type="button"
-                      className="session-action-btn"
-                      title="Rename task"
-                      onClick={(e) => startRename(s, e)}
+                      className="session-action-btn project-add-task-btn"
+                      title="New task under this project"
+                      disabled={connecting}
+                      onClick={(e) => void onNewProjectTask(p, e)}
                     >
-                      <IconPen size={12} />
+                      <IconPlus size={12} />
                     </button>
                     <button
                       type="button"
-                      className="session-action-btn session-delete-btn"
-                      title="Delete task"
-                      onClick={(e) => void onDeleteSession(s, e)}
+                      className="session-action-btn session-delete-btn project-delete-btn"
+                      title="Remove project from Grokx (keeps source folder)"
+                      onClick={(e) => void onDeleteProject(p, e)}
                     >
                       <IconTrash size={12} />
                     </button>
                   </div>
-                  <div className="session-meta">
-                    {s.work_path
-                      ? shortPath(s.work_path)
-                      : new Date(s.created_at || s.updated_at).toLocaleString()}
+                </div>
+                {isExpanded && (
+                  <div className="project-tasks">
+                    {nested.length === 0 && (
+                      <div className="session-empty session-empty-nested">
+                        No tasks · + under project
+                      </div>
+                    )}
+                    {nested.map((s) => {
+                      const isActive = s.session_id === session?.session_id;
+                      const isWorking = Boolean(
+                        sessionBusyMap[s.session_id] ||
+                          (isActive && busy),
+                      );
+                      const isUnread = Boolean(
+                        sessionUnreadMap[s.session_id] && !isActive,
+                      );
+                      return (
+                        <div
+                          key={s.session_id}
+                          className={`session-row nested task-row${
+                            isActive ? " active" : ""
+                          }${isWorking ? " working" : ""}${
+                            isUnread ? " unread" : ""
+                          }`}
+                          onClick={() => void onActivateSession(s)}
+                          onDoubleClick={(e) => startRename(s, e)}
+                          title={
+                            isWorking
+                              ? `Working…\n${s.work_path || "~/.grokx/tasks/…"}`
+                              : isUnread
+                                ? `Unread activity\nTask under ${p.name}\n${s.work_path || "~/.grokx/tasks/…"}`
+                                : `Task under ${p.name}\n${s.work_path || "~/.grokx/tasks/…"}`
+                          }
+                        >
+                          {renamingId === s.session_id ? (
+                            <input
+                              ref={renameInputRef}
+                              className="session-rename-input"
+                              value={renameDraft}
+                              onChange={(e) => setRenameDraft(e.target.value)}
+                              onClick={(e) => e.stopPropagation()}
+                              onKeyDown={(e) => {
+                                if (e.key === "Enter") {
+                                  e.preventDefault();
+                                  void commitRename();
+                                } else if (e.key === "Escape") {
+                                  e.preventDefault();
+                                  cancelRename();
+                                }
+                              }}
+                              onBlur={() => void commitRename()}
+                            />
+                          ) : (
+                            <>
+                              <div className="session-row-main">
+                                {isWorking ? (
+                                  <span
+                                    className="session-working-spin"
+                                    title="Working"
+                                    aria-label="Working"
+                                  />
+                                ) : (
+                                  <span className="task-icon" aria-hidden>
+                                    <IconTask size={13} />
+                                  </span>
+                                )}
+                                <div className="session-title">
+                                  {s.title || s.session_id.slice(0, 8)}
+                                  {isUnread && (
+                                    <span
+                                      className="session-unread-dot"
+                                      title="Unread"
+                                      aria-label="Unread activity"
+                                    />
+                                  )}
+                                </div>
+                                <button
+                                  type="button"
+                                  className="session-action-btn"
+                                  title="Rename task"
+                                  onClick={(e) => startRename(s, e)}
+                                >
+                                  <IconPen size={12} />
+                                </button>
+                                <button
+                                  type="button"
+                                  className="session-action-btn session-delete-btn"
+                                  title="Delete task"
+                                  onClick={(e) => void onDeleteSession(s, e)}
+                                >
+                                  <IconTrash size={12} />
+                                </button>
+                              </div>
+                            </>
+                          )}
+                        </div>
+                      );
+                    })}
                   </div>
-                </>
-              )}
-            </div>
-          ))}
+                )}
+              </div>
+            );
+          })}
         </div>
+        )}
+
+        {/* Temporary tasks only (not bound to a user Project) */}
+        <div className="section-label-row">
+          <button
+            type="button"
+            className={`section-label-btn${
+              tasksSectionOpen ? "" : " collapsed"
+            }`}
+            aria-expanded={tasksSectionOpen}
+            title={
+              tasksSectionOpen ? "Collapse Tasks" : "Expand Tasks"
+            }
+            onClick={() => {
+              setTasksSectionOpen((v) => {
+                const next = !v;
+                try {
+                  localStorage.setItem(
+                    "grokx.sidebar.tasksOpen",
+                    next ? "1" : "0",
+                  );
+                } catch {
+                  /* ignore */
+                }
+                return next;
+              });
+            }}
+          >
+            <span className="section-chevron" aria-hidden>
+              {tasksSectionOpen ? (
+                <IconChevronDown size={14} />
+              ) : (
+                <IconChevronRight size={14} />
+              )}
+            </span>
+            <span className="section-label">Tasks</span>
+          </button>
+          <button
+            type="button"
+            className="session-add-btn"
+            title="New temporary task (not under a Project)"
+            disabled={connecting}
+            onClick={() => void onNewStandaloneTask()}
+          >
+            <IconPlus size={16} />
+          </button>
+        </div>
+        {tasksSectionOpen && (
+        <div className="session-list">
+          {temporarySessions.length === 0 && (
+            <div className="session-empty">
+              No temporary tasks · + to start
+            </div>
+          )}
+          {temporarySessions.map((s) => {
+            const isActive = s.session_id === session?.session_id;
+            const isWorking = Boolean(
+              sessionBusyMap[s.session_id] || (isActive && busy),
+            );
+            const isUnread = Boolean(
+              sessionUnreadMap[s.session_id] && !isActive,
+            );
+            return (
+              <div
+                key={s.session_id}
+                className={`session-row task-row${isActive ? " active" : ""}${
+                  isWorking ? " working" : ""
+                }${isUnread ? " unread" : ""}`}
+                onClick={() => void onActivateSession(s)}
+                onDoubleClick={(e) => startRename(s, e)}
+                title={
+                  isWorking
+                    ? `Working…\nTemporary task\n${s.work_path || "~/.grokx/tasks/…"}`
+                    : isUnread
+                      ? `Unread activity\nTemporary task\n${s.work_path || "~/.grokx/tasks/…"}`
+                      : `Temporary task\n${s.work_path || "~/.grokx/tasks/…"}\nClick to switch · double-click or ✎ to rename`
+                }
+              >
+                {renamingId === s.session_id ? (
+                  <input
+                    ref={renameInputRef}
+                    className="session-rename-input"
+                    value={renameDraft}
+                    onChange={(e) => setRenameDraft(e.target.value)}
+                    onClick={(e) => e.stopPropagation()}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") {
+                        e.preventDefault();
+                        void commitRename();
+                      } else if (e.key === "Escape") {
+                        e.preventDefault();
+                        cancelRename();
+                      }
+                    }}
+                    onBlur={() => void commitRename()}
+                  />
+                ) : (
+                  <>
+                    <div className="session-row-main">
+                      {isWorking ? (
+                        <span
+                          className="session-working-spin"
+                          title="Working"
+                          aria-label="Working"
+                        />
+                      ) : (
+                        <span className="task-icon" aria-hidden>
+                          <IconTask size={13} />
+                        </span>
+                      )}
+                      <div className="session-title">
+                        {s.title || s.session_id.slice(0, 8)}
+                        {isUnread && (
+                          <span
+                            className="session-unread-dot"
+                            title="Unread"
+                            aria-label="Unread activity"
+                          />
+                        )}
+                      </div>
+                      <button
+                        type="button"
+                        className="session-action-btn"
+                        title="Rename task"
+                        onClick={(e) => startRename(s, e)}
+                      >
+                        <IconPen size={12} />
+                      </button>
+                      <button
+                        type="button"
+                        className="session-action-btn session-delete-btn"
+                        title="Delete task"
+                        onClick={(e) => void onDeleteSession(s, e)}
+                      >
+                        <IconTrash size={12} />
+                      </button>
+                    </div>
+                  </>
+                )}
+              </div>
+            );
+          })}
+        </div>
+        )}
 
         <div className="sidebar-bottom">
           <button
             type="button"
-            className={`nav-item sidebar-settings-btn${
-              view === "settings" ? " active" : ""
-            }`}
+            className="nav-item sidebar-settings-btn"
             title="Settings · model, API key, engine"
             onClick={() => {
               setView("settings");
+              setSettingsSection("model");
               void loadSettings();
             }}
           >
@@ -2368,263 +5698,555 @@ export default function App() {
             </button>
           </div>
         </div>
+        </>
+        )}
       </aside>
+      )}
+
+      {view !== "settings" &&
+        (sidebarOpen ? (
+          <div
+            className="panel-resizer panel-resizer-sidebar"
+            role="separator"
+            aria-orientation="vertical"
+            aria-label="Resize sidebar"
+            title="Drag to resize sidebar"
+            onMouseDown={(e) => onPanelResizeStart("sidebar", e)}
+          />
+        ) : (
+          <div className="panel-resizer panel-resizer-sidebar panel-resizer-sidebar-collapsed" />
+        ))}
 
       {view === "settings" ? (
-        <main className="main settings-main">
-          <header className="topbar" data-tauri-drag-region>
-            <div style={{ minWidth: 0 }}>
-              <h1 className="topbar-title">Settings</h1>
-              <p className="topbar-sub">
-                System · model and engine (set once)
-              </p>
+        <div className="settings-shell">
+          <aside
+            className="settings-rail"
+            onMouseDown={onTitlebarMouseDown}
+            onDoubleClick={onTitlebarDoubleClick}
+          >
+            <div className="settings-rail-top">
+              <button
+                type="button"
+                className="settings-back-btn"
+                onClick={() => setView("workspace")}
+                onMouseDown={(e) => e.stopPropagation()}
+              >
+                <IconChevronLeft size={16} />
+                Back to app
+              </button>
             </div>
-            <button
-              className="btn"
-              onClick={() => setView("workspace")}
-            >
-              Back to workspace
-            </button>
-          </header>
+            <nav className="settings-rail-nav" aria-label="Settings">
+              <div className="settings-rail-group">Configuration</div>
+              <button
+                type="button"
+                className={`settings-rail-item${
+                  settingsSection === "model" ? " active" : ""
+                }`}
+                onClick={() => setSettingsSection("model")}
+                onMouseDown={(e) => e.stopPropagation()}
+              >
+                <IconSettings size={15} />
+                Model
+              </button>
+              <button
+                type="button"
+                className={`settings-rail-item${
+                  settingsSection === "toml" ? " active" : ""
+                }`}
+                onClick={() => setSettingsSection("toml")}
+                onMouseDown={(e) => e.stopPropagation()}
+              >
+                <IconFile size={15} />
+                Engine config
+              </button>
+              <button
+                type="button"
+                className={`settings-rail-item${
+                  settingsSection === "engine" ? " active" : ""
+                }`}
+                onClick={() => setSettingsSection("engine")}
+                onMouseDown={(e) => e.stopPropagation()}
+              >
+                <IconTool size={15} />
+                Project & engine
+              </button>
+            </nav>
+          </aside>
 
-          <div className="settings-page">
-            <div className="settings-grid">
-              <section className="card settings-card">
-                <h3>Model</h3>
-                <p className="muted" style={{ marginBottom: 12 }}>
-                  Configure API endpoint, key, and default model. Daily chat does not need this page; after save
-                  {cfgSyncGrok ? "it syncs to the engine config, " : ""}
-                  reconnect to apply.
-                </p>
-                {settingsMsg && (
-                  <div
-                    className={
-                      settingsMsg.toLowerCase().includes("fail") ||
-                      settingsMsg.toLowerCase().includes("error")
-                        ? "error-banner"
-                        : "settings-ok"
-                    }
-                  >
-                    {settingsMsg}
-                  </div>
-                )}
-                <div className="settings-form-grid">
-                  <div className="field">
-                    <label>Model ID</label>
-                    <input
-                      value={cfgModelId}
-                      onChange={(e) => setCfgModelId(e.target.value)}
-                      placeholder="grok-4.5"
-                    />
-                  </div>
-                  <div className="field">
-                    <label>Display name</label>
-                    <input
-                      value={cfgName}
-                      onChange={(e) => setCfgName(e.target.value)}
-                      placeholder="Grok 4.5"
-                    />
-                  </div>
-                  <div className="field field-span-2">
-                    <label>Base URL</label>
-                    <input
-                      value={cfgBaseUrl}
-                      onChange={(e) => setCfgBaseUrl(e.target.value)}
-                      placeholder="https://api.x.ai/v1 or http://host:port/v1"
-                    />
-                  </div>
-                  <div className="field field-span-2">
-                    <label>
-                      API Key
-                      {cfgHasKey && cfgKeyHint
-                        ? ` (saved ${cfgKeyHint})`
-                        : ""}
-                    </label>
-                    <input
-                      type="password"
-                      value={cfgApiKey}
-                      onChange={(e) => setCfgApiKey(e.target.value)}
-                      placeholder={
-                        cfgHasKey
-                          ? "Leave blank to keep current key"
-                          : "sk-..."
+          <main className="settings-content">
+            <div className="settings-content-scroll">
+              {settingsSection === "model" && (
+                <>
+                  <h1 className="settings-page-title">Model</h1>
+                  <p className="settings-page-lead muted">
+                    API endpoint, key, and default model. After save
+                    {cfgSyncGrok ? " syncs to the engine config;" : ""} reconnect
+                    a task to apply.
+                  </p>
+                  {settingsMsg && (
+                    <div
+                      className={
+                        settingsMsgIsError(settingsMsg)
+                          ? "error-banner"
+                          : "settings-ok"
                       }
-                      autoComplete="off"
-                    />
-                  </div>
-                  <div className="field">
-                    <label>Env key (optional)</label>
-                    <input
-                      value={cfgEnvKey}
-                      onChange={(e) => setCfgEnvKey(e.target.value)}
-                      placeholder="XAI_API_KEY"
-                    />
-                  </div>
-                  <div className="field">
-                    <label>API Backend</label>
-                    <select
-                      className="settings-select"
-                      value={cfgBackend}
-                      onChange={(e) => setCfgBackend(e.target.value)}
                     >
-                      <option value="chat_completions">chat_completions</option>
-                      <option value="responses">responses</option>
-                      <option value="anthropic_messages">
-                        anthropic_messages
-                      </option>
-                    </select>
+                      {settingsMsg}
+                    </div>
+                  )}
+
+                  <h2 className="settings-group-title">Connection</h2>
+                  <div className="settings-group-card">
+                    <div className="settings-row settings-row-stack">
+                      <div className="settings-row-text">
+                        <div className="settings-row-label">Base URL</div>
+                        <div className="settings-row-desc">
+                          OpenAI-compatible root, e.g. https://api.x.ai/v1
+                        </div>
+                      </div>
+                      <input
+                        className="settings-row-input"
+                        value={cfgBaseUrl}
+                        onChange={(e) => setCfgBaseUrl(e.target.value)}
+                        placeholder="https://api.x.ai/v1 or http://host:port/v1"
+                      />
+                    </div>
+                    <div className="settings-row settings-row-stack">
+                      <div className="settings-row-text">
+                        <div className="settings-row-label">
+                          API Key
+                          {cfgHasKey && cfgKeyHint
+                            ? ` · saved ${cfgKeyHint}`
+                            : ""}
+                        </div>
+                        <div className="settings-row-desc">
+                          Leave blank to keep the saved key
+                        </div>
+                      </div>
+                      <input
+                        className="settings-row-input"
+                        type="password"
+                        value={cfgApiKey}
+                        onChange={(e) => setCfgApiKey(e.target.value)}
+                        placeholder={
+                          cfgHasKey
+                            ? "Leave blank to keep current key"
+                            : "sk-..."
+                        }
+                        autoComplete="off"
+                      />
+                    </div>
+                    <div className="settings-row">
+                      <div className="settings-row-text">
+                        <div className="settings-row-label">Probe endpoint</div>
+                        <div className="settings-row-desc">
+                          Test connection or load model ids from the server
+                        </div>
+                      </div>
+                      <div className="btn-row settings-probe-row">
+                        <button
+                          type="button"
+                          className="btn"
+                          disabled={endpointProbeBusy || savingSettings}
+                          onClick={() => void onTestEndpoint()}
+                        >
+                          {endpointProbeBusy ? "Testing…" : "Test connection"}
+                        </button>
+                        <button
+                          type="button"
+                          className="btn"
+                          disabled={endpointProbeBusy || savingSettings}
+                          onClick={() => void onFetchRemoteModels()}
+                        >
+                          {endpointProbeBusy ? "Fetching…" : "Fetch models"}
+                        </button>
+                      </div>
+                    </div>
                   </div>
-                  <div className="field">
-                    <label>Context window</label>
-                    <input
-                      value={cfgContext}
-                      onChange={(e) => setCfgContext(e.target.value)}
-                      placeholder="500000"
-                    />
-                  </div>
-                  <div className="field">
-                    <label>Default effort</label>
-                    <select
-                      className="settings-select"
-                      value={
-                        efforts.some((e) => e.id === cfgEffort)
-                          ? cfgEffort
-                          : "medium"
-                      }
-                      onChange={(e) => setCfgEffort(e.target.value)}
-                      title="Reasoning effort for Grok (Low · Medium · High · Extra high)"
-                    >
-                      {(efforts.length
-                        ? efforts
-                        : [
-                            { id: "low", label: "Low" },
-                            { id: "medium", label: "Medium" },
-                            { id: "high", label: "High" },
-                            { id: "xhigh", label: "Extra high" },
-                          ]
-                      ).map((e) => (
-                        <option key={e.id} value={e.id}>
-                          {e.label}
+
+                  <h2 className="settings-group-title">Model</h2>
+                  <div className="settings-group-card">
+                    <div className="settings-row">
+                      <div className="settings-row-text">
+                        <div className="settings-row-label">Model ID</div>
+                        <div className="settings-row-desc">
+                          {fetchedRemoteModels.length > 0
+                            ? `${fetchedRemoteModels.length} models loaded — pick one`
+                            : "Type an id, or Fetch models to choose"}
+                        </div>
+                      </div>
+                      {fetchedRemoteModels.length > 0 ? (
+                        <select
+                          className="settings-select settings-row-control"
+                          value={
+                            fetchedRemoteModels.some((m) => m.id === cfgModelId)
+                              ? cfgModelId
+                              : fetchedRemoteModels[0]?.id || cfgModelId
+                          }
+                          onChange={(e) => {
+                            applySelectedModel(e.target.value);
+                          }}
+                        >
+                          {fetchedRemoteModels.map((m) => (
+                            <option key={m.id} value={m.id}>
+                              {m.name && m.name !== m.id
+                                ? `${m.name} (${m.id})`
+                                : m.id}
+                            </option>
+                          ))}
+                        </select>
+                      ) : (
+                        <input
+                          className="settings-row-input settings-row-control"
+                          value={cfgModelId}
+                          onChange={(e) => {
+                            const id = e.target.value;
+                            setCfgModelId(id);
+                            // Manual typing: keep display name in sync when empty
+                            // or still equal to the previous id.
+                            setCfgName((prev) => {
+                              const p = prev.trim();
+                              if (!p || p === cfgModelId) return id;
+                              return prev;
+                            });
+                          }}
+                          placeholder="grok-4.5"
+                          list="settings-model-suggestions"
+                        />
+                      )}
+                      {fetchedRemoteModels.length === 0 && (
+                        <datalist id="settings-model-suggestions">
+                          {(models.length
+                            ? models
+                            : [{ id: "grok-4.5", name: "Grok 4.5" }]
+                          ).map((m) => (
+                            <option key={m.id} value={m.id}>
+                              {m.name}
+                            </option>
+                          ))}
+                        </datalist>
+                      )}
+                    </div>
+                    <div className="settings-row">
+                      <div className="settings-row-text">
+                        <div className="settings-row-label">Display name</div>
+                        <div className="settings-row-desc">
+                          Shown in the composer model menu
+                        </div>
+                      </div>
+                      <input
+                        className="settings-row-input settings-row-control"
+                        value={cfgName}
+                        onChange={(e) => setCfgName(e.target.value)}
+                        placeholder="Grok 4.5"
+                      />
+                    </div>
+                    <div className="settings-row">
+                      <div className="settings-row-text">
+                        <div className="settings-row-label">API Backend</div>
+                        <div className="settings-row-desc">
+                          Protocol the endpoint speaks
+                        </div>
+                      </div>
+                      <select
+                        className="settings-select settings-row-control"
+                        value={cfgBackend}
+                        onChange={(e) => setCfgBackend(e.target.value)}
+                      >
+                        <option value="chat_completions">chat_completions</option>
+                        <option value="responses">responses</option>
+                        <option value="anthropic_messages">
+                          anthropic_messages
                         </option>
-                      ))}
-                    </select>
+                      </select>
+                    </div>
+                    <div className="settings-row">
+                      <div className="settings-row-text">
+                        <div className="settings-row-label">Default effort</div>
+                        <div className="settings-row-desc">
+                          Reasoning effort for new turns
+                        </div>
+                      </div>
+                      <select
+                        className="settings-select settings-row-control"
+                        value={
+                          efforts.some((e) => e.id === cfgEffort)
+                            ? cfgEffort
+                            : "medium"
+                        }
+                        onChange={(e) => setCfgEffort(e.target.value)}
+                      >
+                        {(efforts.length
+                          ? efforts
+                          : [
+                              { id: "low", label: "Low" },
+                              { id: "medium", label: "Medium" },
+                              { id: "high", label: "High" },
+                              { id: "xhigh", label: "Extra high" },
+                            ]
+                        ).map((e) => (
+                          <option key={e.id} value={e.id}>
+                            {e.label}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                    <div className="settings-row">
+                      <div className="settings-row-text">
+                        <div className="settings-row-label">Context window</div>
+                        <div className="settings-row-desc">
+                          Token budget shown in the composer meter
+                        </div>
+                      </div>
+                      <input
+                        className="settings-row-input settings-row-control"
+                        value={cfgContext}
+                        onChange={(e) => setCfgContext(e.target.value)}
+                        placeholder="500000"
+                      />
+                    </div>
+                    <div className="settings-row">
+                      <div className="settings-row-text">
+                        <div className="settings-row-label">Env key</div>
+                        <div className="settings-row-desc">
+                          Optional env var name if not storing the key in app
+                          settings
+                        </div>
+                      </div>
+                      <input
+                        className="settings-row-input settings-row-control"
+                        value={cfgEnvKey}
+                        onChange={(e) => setCfgEnvKey(e.target.value)}
+                        placeholder="XAI_API_KEY"
+                      />
+                    </div>
                   </div>
-                </div>
-                <label className="check">
-                  <input
-                    type="checkbox"
-                    checked={cfgSyncGrok}
-                    onChange={(e) => setCfgSyncGrok(e.target.checked)}
-                  />
-                  Also write ~/.grok/config.toml
-                </label>
-                <p className="hint mono" style={{ marginTop: 0 }}>
-                  {cfgGrokPath}
-                </p>
-                <div className="btn-row">
-                  <button
-                    className="btn btn-primary"
-                    onClick={() => void onSaveSettings()}
-                    disabled={savingSettings}
-                  >
-                    {savingSettings ? "Saving…" : "Save settings"}
-                  </button>
-                  {cfgHasKey && (
+
+                  <h2 className="settings-group-title">Sync</h2>
+                  <div className="settings-group-card">
+                    <div className="settings-row">
+                      <div className="settings-row-text">
+                        <div className="settings-row-label">
+                          Write ~/.grok/config.toml
+                        </div>
+                        <div className="settings-row-desc mono">{cfgGrokPath}</div>
+                      </div>
+                      <label className="settings-toggle">
+                        <input
+                          type="checkbox"
+                          checked={cfgSyncGrok}
+                          onChange={(e) => setCfgSyncGrok(e.target.checked)}
+                        />
+                        <span className="settings-toggle-ui" />
+                      </label>
+                    </div>
+                  </div>
+
+                  <div className="btn-row settings-save-row">
                     <button
-                      className="btn btn-ghost"
-                      onClick={() => void onClearApiKey()}
+                      className="btn btn-primary"
+                      onClick={() => void onSaveSettings()}
                       disabled={savingSettings}
                     >
-                      Clear key
+                      {savingSettings ? "Saving…" : "Save settings"}
                     </button>
-                  )}
-                  <button
-                    className="btn"
-                    onClick={() => void loadSettings()}
-                    disabled={savingSettings}
-                  >
-                    Reload
-                  </button>
-                </div>
-              </section>
-
-              <section className="card settings-card">
-                <h3>Project & engine</h3>
-                {error && <div className="error-banner">{error}</div>}
-                <p className="muted" style={{ marginBottom: 12 }}>
-                  Open a project folder from the sidebar (+). Each task gets a
-                  temporary workspace under <code>~/.grokx/tasks/</code> with a{" "}
-                  <code>project</code> link to your sources.
-                </p>
-                {selectedProject && (
-                  <dl className="kv">
-                    <dt>Project</dt>
-                    <dd className="mono">{selectedProject.root_path}</dd>
-                    {session?.work_path && (
-                      <>
-                        <dt>Task cwd</dt>
-                        <dd className="mono">{session.work_path}</dd>
-                      </>
+                    {cfgHasKey && (
+                      <button
+                        className="btn btn-ghost"
+                        onClick={() => void onClearApiKey()}
+                        disabled={savingSettings}
+                      >
+                        Clear key
+                      </button>
                     )}
-                  </dl>
-                )}
-                <div className="btn-row">
-                  <button
-                    className="btn btn-primary"
-                    onClick={() => void onOpenProject()}
-                    disabled={connecting}
-                  >
-                    {connecting ? "Opening…" : "Open project…"}
-                  </button>
-                  <button
-                    className="btn"
-                    onClick={() => void onConnect()}
-                    disabled={connecting}
-                  >
-                    {connecting
-                      ? "Connecting…"
-                      : connected
-                        ? "Reconnect"
-                        : "Connect agent"}
-                  </button>
-                </div>
-                <label className="check">
-                  <input
-                    type="checkbox"
-                    checked={autoApprove}
-                    onChange={(e) => setAutoApprove(e.target.checked)}
-                  />
-                  Auto-approve tools on next connect
-                </label>
-                <div className="field">
-                  <label>Custom engine path (optional)</label>
-                  <input
-                    value={cfgEnginePath}
-                    onChange={(e) => setCfgEnginePath(e.target.value)}
-                    placeholder="/path/to/grok"
-                  />
-                </div>
-                {engine ? (
-                  <dl className="kv">
-                    <dt>Source</dt>
-                    <dd>{engine.source}</dd>
-                    <dt>Binary</dt>
-                    <dd className="mono">{engine.path}</dd>
-                    <dt>Agent</dt>
-                    <dd>{agentStatus}</dd>
-                  </dl>
-                ) : (
-                  !error && <p className="muted">Resolving engine…</p>
-                )}
-              </section>
+                    <button
+                      className="btn"
+                      onClick={() => void loadSettings()}
+                      disabled={savingSettings}
+                    >
+                      Reload
+                    </button>
+                  </div>
+                </>
+              )}
+
+              {settingsSection === "toml" && (
+                <>
+                  <h1 className="settings-page-title">Engine config</h1>
+                  <p className="settings-page-lead muted">
+                    Raw Grok Build config the engine reads on connect. Edit and
+                    save, then reconnect a task to apply.
+                  </p>
+                  <div className="settings-group-card settings-toml-card">
+                    <div className="settings-toml-path mono muted">
+                      {grokTomlPath || cfgGrokPath}
+                      {!grokTomlExists ? " · (missing)" : ""}
+                      {grokTomlDirty ? " · unsaved" : ""}
+                    </div>
+                    {grokTomlMsg && (
+                      <div
+                        className={
+                          /fail|error|must not/i.test(grokTomlMsg)
+                            ? "error-banner"
+                            : "settings-ok"
+                        }
+                        style={{ marginBottom: 8 }}
+                      >
+                        {grokTomlMsg}
+                      </div>
+                    )}
+                    <textarea
+                      className="settings-toml-editor"
+                      value={grokToml}
+                      spellCheck={false}
+                      onChange={(e) => {
+                        setGrokToml(e.target.value);
+                        setGrokTomlDirty(true);
+                      }}
+                      placeholder={"# ~/.grok/config.toml\n"}
+                      rows={20}
+                    />
+                    <div className="btn-row" style={{ marginTop: 12 }}>
+                      <button
+                        className="btn btn-primary"
+                        onClick={() => void onSaveGrokConfigToml()}
+                        disabled={savingGrokToml || !grokTomlDirty}
+                      >
+                        {savingGrokToml ? "Saving…" : "Save config.toml"}
+                      </button>
+                      <button
+                        className="btn"
+                        onClick={() => void loadGrokConfigToml()}
+                        disabled={savingGrokToml}
+                      >
+                        Reload file
+                      </button>
+                    </div>
+                  </div>
+                </>
+              )}
+
+              {settingsSection === "engine" && (
+                <>
+                  <h1 className="settings-page-title">Project & engine</h1>
+                  <p className="settings-page-lead muted">
+                    Permissions, engine binary, and quick project actions.
+                  </p>
+                  {error && <div className="error-banner">{error}</div>}
+
+                  <h2 className="settings-group-title">Permissions</h2>
+                  <div className="settings-group-card">
+                    <div className="settings-row">
+                      <div className="settings-row-text">
+                        <div className="settings-row-label">Tool permission</div>
+                        <div className="settings-row-desc">
+                          Applied on the next connect / new task
+                        </div>
+                      </div>
+                      <select
+                        className="settings-select settings-row-control"
+                        value={permissionMode}
+                        onChange={(e) =>
+                          void setPermissionModeAndSave(
+                            normalizePermissionMode(e.target.value),
+                          )
+                        }
+                      >
+                        <option value="ask">Needs approval</option>
+                        <option value="auto">Auto</option>
+                        <option value="always-approve">Full trust</option>
+                      </select>
+                    </div>
+                  </div>
+
+                  <h2 className="settings-group-title">Engine</h2>
+                  <div className="settings-group-card">
+                    <div className="settings-row settings-row-stack">
+                      <div className="settings-row-text">
+                        <div className="settings-row-label">
+                          Custom engine path
+                        </div>
+                        <div className="settings-row-desc">
+                          Optional override for the bundled grok binary
+                        </div>
+                      </div>
+                      <input
+                        className="settings-row-input"
+                        value={cfgEnginePath}
+                        onChange={(e) => setCfgEnginePath(e.target.value)}
+                        placeholder="/path/to/grok"
+                      />
+                    </div>
+                    {engine && (
+                      <div className="settings-row settings-row-stack">
+                        <div className="settings-row-text">
+                          <div className="settings-row-label">Runtime</div>
+                          <div className="settings-row-desc mono">
+                            {engine.source} · {engine.path}
+                            <br />
+                            Agent: {agentStatus}
+                          </div>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+
+                  <h2 className="settings-group-title">Workspace</h2>
+                  <div className="settings-group-card">
+                    {selectedProject && (
+                      <div className="settings-row settings-row-stack">
+                        <div className="settings-row-text">
+                          <div className="settings-row-label">
+                            Selected project
+                          </div>
+                          <div className="settings-row-desc mono">
+                            {selectedProject.root_path}
+                            {session?.work_path
+                              ? `\nTask cwd: ${session.work_path}`
+                              : ""}
+                          </div>
+                        </div>
+                      </div>
+                    )}
+                    <div className="settings-row">
+                      <div className="settings-row-text">
+                        <div className="settings-row-label">Actions</div>
+                        <div className="settings-row-desc">
+                          Open a project folder or start a temporary task
+                        </div>
+                      </div>
+                      <div className="btn-row">
+                        <button
+                          className="btn btn-primary"
+                          onClick={() => void onOpenProject()}
+                          disabled={connecting}
+                        >
+                          {connecting ? "Opening…" : "Open project…"}
+                        </button>
+                        <button
+                          className="btn"
+                          onClick={() => void onNewTask()}
+                          disabled={connecting}
+                        >
+                          {connecting ? "Connecting…" : "New task"}
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                </>
+              )}
             </div>
-          </div>
-        </main>
+          </main>
+        </div>
       ) : (
         <>
           <main className="main">
-            <header className="topbar" data-tauri-drag-region>
-              <div style={{ minWidth: 0 }}>
+            <header
+              className="topbar"
+              onMouseDown={onTitlebarMouseDown}
+              onDoubleClick={onTitlebarDoubleClick}
+            >
+              <div className="topbar-main">
                 <h1 className="topbar-title">{title}</h1>
                 <p className="topbar-sub">
                   {selectedProject
@@ -2642,17 +6264,62 @@ export default function App() {
                 </p>
               </div>
               <div className="topbar-actions">
-                <div className="status-pill">
-                  <span className={`status-dot ${statusClass}`} />
-                  {busy ? "Working" : connected ? "Ready" : agentStatus}
-                </div>
+                {/* Status is non-interactive — whole top strip moves the window. */}
                 <button
                   type="button"
-                  className="icon-btn topbar-outputs-toggle"
-                  title={outputsOpen ? "Hide outputs panel" : "Show outputs panel"}
-                  onClick={() => setOutputsOpen((v) => !v)}
+                  className={`status-pill${connected || busy ? "" : " status-pill-action"}`}
+                  title={
+                    connected || busy
+                      ? busy
+                        ? "Agent is working"
+                        : "Agent ready"
+                      : "Click to reconnect agent"
+                  }
+                  onClick={() => {
+                    if (!connected && !busy && !connecting) {
+                      void onConnect();
+                    }
+                  }}
+                  disabled={connecting || busy || connected}
                 >
-                  {outputsOpen ? (
+                  <span className={`status-dot ${statusClass}`} />
+                  {connecting
+                    ? "Connecting…"
+                    : busy
+                      ? "Working"
+                      : connected
+                        ? "Ready"
+                        : agentStatus}
+                </button>
+                <button
+                  type="button"
+                  className={`icon-btn topbar-side-chat-toggle${
+                    outputsOpen && outputsTab === "chat" ? " is-active" : ""
+                  }`}
+                  title={
+                    outputsOpen && outputsTab === "chat"
+                      ? "Hide side chat"
+                      : "Side chat (does not add to main context)"
+                  }
+                  aria-pressed={outputsOpen && outputsTab === "chat"}
+                  onClick={openRightChat}
+                >
+                  <IconSideChat size={16} />
+                </button>
+                <button
+                  type="button"
+                  className={`icon-btn topbar-outputs-toggle${
+                    outputsOpen && outputsTab !== "chat" ? " is-active" : ""
+                  }`}
+                  title={
+                    outputsOpen && outputsTab !== "chat"
+                      ? "Hide outputs panel"
+                      : "Show outputs panel"
+                  }
+                  aria-pressed={outputsOpen && outputsTab !== "chat"}
+                  onClick={openRightOutputs}
+                >
+                  {outputsOpen && outputsTab !== "chat" ? (
                     <IconChevronRight size={16} />
                   ) : (
                     <IconChevronLeft size={16} />
@@ -2661,23 +6328,38 @@ export default function App() {
               </div>
             </header>
 
-            <div className="chat-pane">
+            <div
+              className={`chat-pane${
+                sessionOutlineEntries.length > 0
+                  ? sessionOutlineCollapsed
+                    ? " has-outline-collapsed"
+                    : " has-outline"
+                  : ""
+              }`}
+            >
               {/* Overlay (not in scroll flow) so show/hide never changes scrollHeight. */}
               {stickyUserId && stickyUserText != null && (
                 <button
                   type="button"
                   className="user-sticky-bar"
-                  title="Jump to this user message"
+                  title="Jump to your message above"
                   onClick={() => jumpToUserMessage(stickyUserId)}
                 >
                   <span className="user-sticky-label">Your message</span>
                   <span className="user-sticky-text">{stickyUserText}</span>
-                  <span className="user-sticky-jump">Jump ↓</span>
+                  <span className="user-sticky-jump">Jump ↑</span>
                 </button>
               )}
+              <SessionOutline
+                entries={sessionOutlineEntries}
+                activeId={highlightUserId || stickyUserId}
+                collapsed={sessionOutlineCollapsed}
+                onToggleCollapsed={toggleSessionOutline}
+                onJump={jumpToUserMessage}
+              />
               <div className="chat-scroll" ref={chatScrollRef}>
-              <div className="chat-inner">
-                {lines.length === 0 && (
+              {lines.length === 0 ? (
+                <div className="chat-inner">
                   <div className="empty-state">
                     <h2>Start a task</h2>
                     <p>
@@ -2688,13 +6370,27 @@ export default function App() {
                       folder. Model key: <strong>Settings</strong>.
                     </p>
                   </div>
-                )}
-
-                {lines.map((line, i) => {
+                </div>
+              ) : (
+              <VirtualChatList
+                ref={virtualChatRef}
+                className="chat-inner"
+                items={virtualChatItems}
+                scrollerRef={chatScrollRef}
+                overscanPx={900}
+                footer={<div ref={bottomRef} />}
+                renderItem={(line, i) => {
                   if (line.kind === "trace") {
                     return (
-                      <div key={line.id} className="msg msg-trace">
-                        <div className="trace-panel">
+                      <div
+                        key={line.id}
+                        className="msg msg-trace"
+                      >
+                        <div
+                          className={`trace-panel${
+                            line.expanded ? " is-expanded" : ""
+                          }`}
+                        >
                           <button
                             type="button"
                             className="trace-summary"
@@ -2707,9 +6403,21 @@ export default function App() {
                             <span className="trace-label">
                               Worked · {summarizeTrace(line.items)}
                             </span>
-                            <span className="trace-duration">
-                              {formatDuration(line.durationMs)}
-                            </span>
+                            {line.durationMs > 0 ? (
+                              <span
+                                className="trace-duration"
+                                title="Total time from answer start to finish"
+                              >
+                                {formatDuration(line.durationMs)}
+                              </span>
+                            ) : (
+                              <span
+                                className="trace-duration is-unknown"
+                                title="Duration unavailable"
+                              >
+                                —
+                              </span>
+                            )}
                           </button>
                           {line.expanded && (
                             <div className="trace-body">
@@ -2721,7 +6429,9 @@ export default function App() {
                                       className="msg msg-thought trace-item"
                                     >
                                       <div className="msg-body md-body thought-md">
-                                        <ChatMarkdown>{item.text}</ChatMarkdown>
+                                        <ChatMarkdown mediaBases={chatMediaBases}>
+                                          {item.text}
+                                        </ChatMarkdown>
                                       </div>
                                     </div>
                                   );
@@ -2729,12 +6439,27 @@ export default function App() {
                                 return (
                                   <div
                                     key={item.id}
-                                    className="msg-chip trace-item"
+                                    className={`msg-chip trace-item${
+                                      item.kind === "tool" &&
+                                      (item.count ?? 1) > 1
+                                        ? " msg-chip-merged"
+                                        : ""
+                                    }`}
+                                    title={
+                                      item.kind === "tool" &&
+                                      (item.count ?? 1) > 1
+                                        ? `${item.text} · repeated ${item.count} times`
+                                        : undefined
+                                    }
                                   >
                                     <span className="chip-icon">
                                       <ChipIcon kind={item.kind} />
                                     </span>
-                                    <span>{item.text}</span>
+                                    <span>
+                                      {item.kind === "tool"
+                                        ? formatToolChipLabel(item)
+                                        : item.text}
+                                    </span>
                                   </div>
                                 );
                               })}
@@ -2745,18 +6470,37 @@ export default function App() {
                     );
                   }
                   if (line.kind === "tool" || line.kind === "system") {
+                    const label =
+                      line.kind === "tool"
+                        ? formatToolChipLabel(line)
+                        : line.text;
                     return (
-                      <div key={line.id} className="msg-chip">
+                      <div
+                        key={line.id}
+                        className={`msg-chip${
+                          line.kind === "tool" && (line.count ?? 1) > 1
+                            ? " msg-chip-merged"
+                            : ""
+                        }`}
+                        title={
+                          line.kind === "tool" && (line.count ?? 1) > 1
+                            ? `${line.text} · repeated ${line.count} times`
+                            : undefined
+                        }
+                      >
                         <span className="chip-icon">
                           <ChipIcon kind={line.kind} />
                         </span>
-                        <span>{line.text}</span>
+                        <span>{label}</span>
                       </div>
                     );
                   }
                   if (line.kind === "waiting") {
                     return (
-                      <div key={line.id} className="msg msg-waiting">
+                      <div
+                        key={line.id}
+                        className="msg msg-waiting"
+                      >
                         <div className="msg-body waiting-body">
                           <span className="waiting-dots" aria-hidden>
                             <span />
@@ -2769,12 +6513,119 @@ export default function App() {
                     );
                   }
                   if (line.kind === "assistant") {
+                    const streaming =
+                      busy && i === lines.length - 1;
+                    const canCopy = Boolean(line.text.trim()) && !streaming;
+                    const copiedMd =
+                      copiedMsg?.id === line.id && copiedMsg.format === "md";
+                    const copiedPlain =
+                      copiedMsg?.id === line.id &&
+                      copiedMsg.format === "plain";
                     return (
                       <div key={line.id} className="msg msg-assistant">
-                        <div className="msg-body md-body">
-                          <ChatMarkdown>{line.text}</ChatMarkdown>
-                          {busy && i === lines.length - 1 && (
-                            <span className="stream-caret" aria-hidden />
+                        <div
+                          className={`msg-assistant-wrap${
+                            streaming ? " is-streaming" : ""
+                          }`}
+                        >
+                          <div className="msg-body md-body">
+                            <ChatMarkdown
+                              mediaBases={chatMediaBases}
+                              streaming={streaming}
+                            >
+                              {line.text}
+                            </ChatMarkdown>
+                          </div>
+                          {canCopy && (
+                            <div className="msg-actions">
+                              <button
+                                type="button"
+                                className={`msg-copy-btn${
+                                  copiedMd ? " msg-copy-btn-done" : ""
+                                }`}
+                                title={
+                                  copiedMd
+                                    ? "Copied as Markdown"
+                                    : "Copy as Markdown"
+                                }
+                                aria-label={
+                                  copiedMd
+                                    ? "Copied as Markdown"
+                                    : "Copy reply as Markdown"
+                                }
+                                onClick={() =>
+                                  void copyAssistantText(
+                                    line.id,
+                                    line.text,
+                                    "md",
+                                  )
+                                }
+                              >
+                                {copiedMd ? (
+                                  <IconCheck size={14} />
+                                ) : (
+                                  <IconCopy size={14} />
+                                )}
+                                <span>
+                                  {copiedMd ? "Copied" : "Markdown"}
+                                </span>
+                              </button>
+                              <button
+                                type="button"
+                                className={`msg-copy-btn${
+                                  copiedPlain ? " msg-copy-btn-done" : ""
+                                }`}
+                                title={
+                                  copiedPlain
+                                    ? "Copied as plain text"
+                                    : "Copy as plain text"
+                                }
+                                aria-label={
+                                  copiedPlain
+                                    ? "Copied as plain text"
+                                    : "Copy reply as plain text"
+                                }
+                                onClick={() =>
+                                  void copyAssistantText(
+                                    line.id,
+                                    line.text,
+                                    "plain",
+                                  )
+                                }
+                              >
+                                {copiedPlain ? (
+                                  <IconCheck size={14} />
+                                ) : (
+                                  <IconCopy size={14} />
+                                )}
+                                <span>
+                                  {copiedPlain ? "Copied" : "Text"}
+                                </span>
+                              </button>
+                              {(line.tokens != null ||
+                                line.tokensPerSec != null) && (
+                                <span
+                                  className="msg-metrics"
+                                  title={
+                                    line.streamMs != null
+                                      ? `Estimated ~${line.tokens ?? "?"} tokens over ${(line.streamMs / 1000).toFixed(1)}s of streaming (not API usage)`
+                                      : "Estimated tokens from reply length (not API usage)"
+                                  }
+                                >
+                                  {line.tokens != null && (
+                                    <span className="msg-metric">
+                                      ~{line.tokens} tok
+                                    </span>
+                                  )}
+                                  {line.tokensPerSec != null && (
+                                    <span className="msg-metric">
+                                      {formatTokensPerSec(line.tokensPerSec)}{" "}
+                                      tok/s
+                                    </span>
+                                  )}
+                                </span>
+                              )}
+                            </div>
                           )}
                         </div>
                       </div>
@@ -2782,104 +6633,396 @@ export default function App() {
                   }
                   if (line.kind === "thought") {
                     return (
-                      <div key={line.id} className="msg msg-thought">
+                      <div
+                        key={line.id}
+                        className="msg msg-thought"
+                      >
                         <div className="msg-body md-body thought-md">
-                          <ChatMarkdown>{line.text}</ChatMarkdown>
+                          <ChatMarkdown mediaBases={chatMediaBases}>
+                            {line.text}
+                          </ChatMarkdown>
                         </div>
                       </div>
                     );
                   }
+                  if (line.kind === "error") {
+                    return (
+                      <div
+                        key={line.id}
+                        className="msg msg-error"
+                      >
+                        <div className="msg-body">{line.text}</div>
+                      </div>
+                    );
+                  }
                   if (line.kind === "user") {
+                    const timeLabel = formatMessageTime(line.at);
+                    const atts = line.attachments ?? [];
+                    const imgs = atts.filter(
+                      (a) =>
+                        isImageAttachment(a) && (a.previewSrc || a.path),
+                    );
+                    const files = atts.filter((a) => !isImageAttachment(a));
+                    const isEditing = editingUserId === line.id;
+                    const canEdit = !busy && !connecting && !isEditing;
                     return (
                       <div
                         key={line.id}
                         className={`msg msg-user${
                           highlightUserId === line.id ? " msg-user-highlight" : ""
-                        }`}
+                        }${isEditing ? " msg-user-editing" : ""}`}
                         data-user-msg={line.id}
                         ref={(el) => {
                           if (el) userMsgEls.current.set(line.id, el);
                           else userMsgEls.current.delete(line.id);
                         }}
                       >
-                        <div className="msg-body">{line.text}</div>
+                        <div className="msg-user-stack">
+                          {isEditing ? (
+                            <div className="msg-body msg-user-edit-body">
+                              {imgs.length > 0 && (
+                                <div className="msg-user-thumbs">
+                                  {imgs.map((a) => {
+                                    const src =
+                                      a.previewSrc ||
+                                      (a.path ? convertFileSrc(a.path) : "");
+                                    return src ? (
+                                      <span
+                                        key={a.path || a.name}
+                                        className="msg-user-thumb"
+                                      >
+                                        <img src={src} alt={a.name} />
+                                      </span>
+                                    ) : null;
+                                  })}
+                                </div>
+                              )}
+                              {files.length > 0 && (
+                                <div className="msg-user-files">
+                                  {files.map((a) => {
+                                    const label = attachmentDisplayName(a);
+                                    return (
+                                      <span
+                                        key={a.path || label}
+                                        className="msg-user-file-chip"
+                                        title={a.path || label}
+                                      >
+                                        📎 {label}
+                                      </span>
+                                    );
+                                  })}
+                                </div>
+                              )}
+                              <textarea
+                                ref={editTextareaRef}
+                                className="msg-user-edit-input"
+                                value={editDraft}
+                                rows={2}
+                                placeholder="Edit your message…"
+                                onChange={(e) => {
+                                  setEditDraft(e.target.value);
+                                  const el = e.target;
+                                  el.style.height = "auto";
+                                  el.style.height = `${Math.min(
+                                    el.scrollHeight,
+                                    200,
+                                  )}px`;
+                                }}
+                                onKeyDown={(e) => {
+                                  if (e.key === "Escape") {
+                                    e.preventDefault();
+                                    cancelEditUser();
+                                  } else if (
+                                    e.key === "Enter" &&
+                                    (e.metaKey || e.ctrlKey)
+                                  ) {
+                                    e.preventDefault();
+                                    void onResendEditedUser();
+                                  }
+                                }}
+                              />
+                              <div className="msg-user-edit-actions">
+                                <button
+                                  type="button"
+                                  className="msg-user-edit-cancel"
+                                  onClick={cancelEditUser}
+                                >
+                                  Cancel
+                                </button>
+                                <button
+                                  type="button"
+                                  className="msg-user-edit-send"
+                                  disabled={
+                                    !editDraft.trim() &&
+                                    (line.attachments?.length ?? 0) === 0
+                                  }
+                                  title="Send edited message and restart from here (⌘↵)"
+                                  onClick={() => void onResendEditedUser()}
+                                >
+                                  <IconSend size={13} />
+                                  Send
+                                </button>
+                              </div>
+                            </div>
+                          ) : (
+                            <>
+                              <div className="msg-body">
+                                {imgs.length > 0 && (
+                                  <div className="msg-user-thumbs">
+                                    {imgs.map((a) => {
+                                      const src =
+                                        a.previewSrc ||
+                                        (a.path ? convertFileSrc(a.path) : "");
+                                      return (
+                                        <a
+                                          key={a.path || a.name}
+                                          className="msg-user-thumb"
+                                          href={src || undefined}
+                                          title={a.name}
+                                          onClick={(e) => {
+                                            e.preventDefault();
+                                            if (a.path) {
+                                              void openUrl(
+                                                a.path.startsWith("file:")
+                                                  ? a.path
+                                                  : `file://${a.path}`,
+                                              ).catch(() => {});
+                                            }
+                                          }}
+                                        >
+                                          {src ? (
+                                            <img src={src} alt={a.name} />
+                                          ) : (
+                                            <span className="msg-user-file-chip">
+                                              {a.name}
+                                            </span>
+                                          )}
+                                        </a>
+                                      );
+                                    })}
+                                  </div>
+                                )}
+                                {files.length > 0 && (
+                                  <div className="msg-user-files">
+                                    {files.map((a) => {
+                                      const label = attachmentDisplayName(a);
+                                      return (
+                                        <button
+                                          key={a.path || label}
+                                          type="button"
+                                          className="msg-user-file-chip"
+                                          title={a.path || label}
+                                          onClick={() => {
+                                            if (!a.path) return;
+                                            void invoke("open_path", {
+                                              path: a.path,
+                                            }).catch(() => {
+                                              void openUrl(
+                                                a.path.startsWith("file:")
+                                                  ? a.path
+                                                  : `file://${a.path}`,
+                                              ).catch(() => {});
+                                            });
+                                          }}
+                                        >
+                                          📎 {label}
+                                        </button>
+                                      );
+                                    })}
+                                  </div>
+                                )}
+                                {line.text ? (
+                                  <div className="msg-user-text">
+                                    {line.text}
+                                  </div>
+                                ) : null}
+                                {!line.text &&
+                                  files.length === 0 &&
+                                  imgs.length === 0 && (
+                                    <div className="msg-user-text muted">
+                                      (empty)
+                                    </div>
+                                  )}
+                              </div>
+                              <div className="msg-user-meta">
+                                {canEdit && (
+                                  <button
+                                    type="button"
+                                    className="msg-user-edit-btn"
+                                    title="Edit and re-send from this message"
+                                    aria-label="Edit message"
+                                    onClick={() => beginEditUser(line)}
+                                  >
+                                    <IconPen size={12} />
+                                    Edit
+                                  </button>
+                                )}
+                                {timeLabel && (
+                                  <time
+                                    className="msg-user-time"
+                                    dateTime={line.at}
+                                    title={
+                                      line.at
+                                        ? new Date(line.at).toLocaleString()
+                                        : undefined
+                                    }
+                                  >
+                                    {timeLabel}
+                                  </time>
+                                )}
+                              </div>
+                            </>
+                          )}
+                        </div>
                       </div>
                     );
                   }
-                  return (
-                    <div key={line.id} className={`msg msg-${line.kind}`}>
-                      <div className="msg-body">{line.text}</div>
-                    </div>
-                  );
-                })}
-                <div ref={bottomRef} />
+                  // Exhaustive for ChatLine kinds handled above.
+                  return null;
+                }}
+              />
+              )}
               </div>
-              </div>
+              {showScrollToBottom && (
+                <button
+                  type="button"
+                  className="scroll-to-bottom-btn"
+                  title="Scroll to bottom"
+                  aria-label="Scroll to bottom"
+                  onClick={jumpToBottom}
+                >
+                  <IconChevronDown size={18} />
+                </button>
+              )}
             </div>
 
             <div className="composer-dock">
-              {attachments.length > 0 && (
-                <div className="attach-row">
-                  {attachments.map((a) => (
-                    <div
-                      key={a.path}
-                      className={`attach-chip${
-                        a.mime?.startsWith("image/") ? " attach-chip-image" : ""
-                      }`}
-                      title={a.path}
+              {longRunNotice && busy && (
+                <div className="long-run-banner" role="status">
+                  <div className="long-run-banner-text">
+                    <strong>Still working · {longRunNotice.elapsedSec}s</strong>
+                    <span>
+                      {longRunNotice.toolHint
+                        ? " Likely waiting on a long-running command (e.g. a web server) that never exits — not a UI hang."
+                        : " The agent may be blocked on a long-running tool. This is usually not a dead loop in Grokx."}
+                    </span>
+                    {longRunNotice.toolHint && (
+                      <code className="long-run-tool-hint" title={longRunNotice.toolHint}>
+                        {longRunNotice.toolHint}
+                      </code>
+                    )}
+                  </div>
+                  <div className="long-run-banner-actions">
+                    <button
+                      type="button"
+                      className="btn btn-primary long-run-stop"
+                      onClick={() => void onCancel()}
+                      title="Stop this turn"
                     >
-                      {a.mime?.startsWith("image/") && a.previewUrl ? (
-                        <img
-                          className="attach-thumb"
-                          src={a.previewUrl}
-                          alt={a.name}
-                        />
-                      ) : (
-                        <span className="attach-icon">
-                          {a.mime?.startsWith("image/") ? "🖼" : "📄"}
-                        </span>
-                      )}
-                      <span className="attach-name">{a.name}</span>
-                      {a.size != null && (
-                        <span className="attach-size">
-                          {formatBytes(a.size)}
-                        </span>
-                      )}
-                      <button
-                        type="button"
-                        className="attach-remove"
-                        onClick={() => removeAttachment(a.path)}
-                        aria-label="Remove attachment"
-                      >
-                        ×
-                      </button>
-                    </div>
-                  ))}
+                      <IconStop size={13} />
+                      Stop
+                    </button>
+                    <button
+                      type="button"
+                      className="btn btn-ghost"
+                      onClick={() => {
+                        longRunDismissedRef.current = true;
+                        setLongRunNotice(null);
+                      }}
+                    >
+                      Dismiss
+                    </button>
+                  </div>
                 </div>
               )}
-              <textarea
-                ref={textareaRef}
-                value={draft}
-                rows={1}
-                onChange={(e) => {
-                  setDraft(e.target.value);
-                  resizeTextarea();
-                }}
-                onPaste={(e) => {
-                  void onComposerPaste(e);
-                }}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter" && !e.shiftKey) {
-                    e.preventDefault();
-                    void onSend();
-                  }
-                }}
+              {attachments.length > 0 && (
+                <div className="attach-row">
+                  {attachments.map((a) => {
+                    const label = attachmentDisplayName(a);
+                    const isImg = isImageAttachment(a);
+                    const thumbSrc =
+                      isImg && (a.previewUrl || a.path)
+                        ? a.previewUrl ||
+                          (a.path ? convertFileSrc(a.path) : "")
+                        : "";
+                    return (
+                      <div
+                        key={a.path}
+                        className={`attach-chip${
+                          isImg ? " attach-chip-image" : ""
+                        }${isImg && thumbSrc ? " attach-chip-clickable" : ""}`}
+                        title={
+                          isImg && thumbSrc
+                            ? `Click to preview · ${label}`
+                            : label
+                        }
+                        role={isImg && thumbSrc ? "button" : undefined}
+                        tabIndex={isImg && thumbSrc ? 0 : undefined}
+                        onClick={
+                          isImg && thumbSrc
+                            ? () => openAttachmentPreview(a)
+                            : undefined
+                        }
+                        onKeyDown={
+                          isImg && thumbSrc
+                            ? (e) => {
+                                if (e.key === "Enter" || e.key === " ") {
+                                  e.preventDefault();
+                                  openAttachmentPreview(a);
+                                }
+                              }
+                            : undefined
+                        }
+                      >
+                        {isImg && thumbSrc ? (
+                          <img
+                            className="attach-thumb"
+                            src={thumbSrc}
+                            alt={label}
+                          />
+                        ) : (
+                          <span className="attach-icon" aria-hidden>
+                            📄
+                          </span>
+                        )}
+                        <span className="attach-name">{label}</span>
+                        {a.size != null && (
+                          <span className="attach-size">
+                            {formatBytes(a.size)}
+                          </span>
+                        )}
+                        <button
+                          type="button"
+                          className="attach-remove"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            removeAttachment(a.path);
+                          }}
+                          aria-label="Remove attachment"
+                        >
+                          ×
+                        </button>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+              <ComposerInput
+                ref={composerRef}
                 disabled={!session || (busy && !pendingPerm)}
                 placeholder={
                   session
                     ? "Describe what this task should do… (paste text or images)"
                     : "Click Tasks + to create a task and start chatting…"
                 }
+                onPaste={(e) => {
+                  void onComposerPaste(e);
+                }}
+                onSubmit={() => {
+                  void onSend();
+                }}
+                onDraftChange={onComposerDraftChange}
+                onDraftSettled={onComposerDraftSettled}
               />
               <div className="composer-bar">
                 <div className="composer-left">
@@ -2892,14 +7035,118 @@ export default function App() {
                   >
                     <IconPaperclip size={16} />
                   </button>
-                  <button
-                    type="button"
-                    className={`access-toggle${autoApprove ? "" : " off"}`}
-                    onClick={() => setAutoApprove((v) => !v)}
-                    title="Auto-approve tools on next connect"
+                  <div className="composer-goal-wrap" ref={goalMenuRef}>
+                    <button
+                      type="button"
+                      className={`composer-plus composer-goal-btn${
+                        goalMenuOpen ? " active" : ""
+                      }`}
+                      title="Goal mode (Grok Build /goal)"
+                      aria-label="Goal mode"
+                      aria-haspopup="menu"
+                      aria-expanded={goalMenuOpen}
+                      disabled={!session || busy}
+                      onClick={() => setGoalMenuOpen((v) => !v)}
+                    >
+                      <IconGoal size={16} />
+                    </button>
+                    {goalMenuOpen && (
+                      <div className="composer-goal-menu" role="menu">
+                        <button
+                          type="button"
+                          role="menuitem"
+                          className="composer-goal-item"
+                          onClick={onGoalSetClick}
+                        >
+                          <strong>Set goal…</strong>
+                          <span>Prefix input with /goal</span>
+                        </button>
+                        <button
+                          type="button"
+                          role="menuitem"
+                          className="composer-goal-item"
+                          disabled={busy}
+                          onClick={() => void sendGoalCommand("status")}
+                        >
+                          <strong>Status</strong>
+                          <span>/goal status</span>
+                        </button>
+                        <button
+                          type="button"
+                          role="menuitem"
+                          className="composer-goal-item"
+                          disabled={busy}
+                          onClick={() => void sendGoalCommand("pause")}
+                        >
+                          <strong>Pause</strong>
+                          <span>/goal pause</span>
+                        </button>
+                        <button
+                          type="button"
+                          role="menuitem"
+                          className="composer-goal-item"
+                          disabled={busy}
+                          onClick={() => void sendGoalCommand("resume")}
+                        >
+                          <strong>Resume</strong>
+                          <span>/goal resume</span>
+                        </button>
+                        <button
+                          type="button"
+                          role="menuitem"
+                          className="composer-goal-item danger"
+                          disabled={busy}
+                          onClick={() => void sendGoalCommand("clear")}
+                        >
+                          <strong>Clear</strong>
+                          <span>/goal clear</span>
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                  <select
+                    className={`composer-select access-select access-mode-${permissionMode}`}
+                    value={permissionMode}
+                    onChange={(e) =>
+                      void setPermissionModeAndSave(
+                        normalizePermissionMode(e.target.value),
+                      )
+                    }
+                    title={
+                      permissionMode === "always-approve"
+                        ? "Full trust: all tools auto-approved (saved). New task/reconnect applies."
+                        : permissionMode === "auto"
+                          ? "Auto: engine may auto-allow low-risk tools (saved). New task/reconnect applies."
+                          : "Needs approval: confirm each tool (saved). New task/reconnect applies."
+                    }
+                    aria-label="Tool permission mode"
                   >
-                    {autoApprove ? "Auto-approve" : "Needs approval"}
-                  </button>
+                    <option value="ask">Needs approval</option>
+                    <option value="auto">Auto</option>
+                    <option value="always-approve">Full trust</option>
+                  </select>
+                  {session && (
+                    <div
+                      className={contextMeterClass}
+                      title={
+                        contextFromEngine
+                          ? `Context: ${contextUsed.toLocaleString()} / ${contextWindow.toLocaleString()} tokens (engine-reported for this task)`
+                          : `Context (estimated from this task’s chat): ~${contextUsed.toLocaleString()} / ${contextWindow.toLocaleString()} tokens · set window in Settings`
+                      }
+                    >
+                      <div className="context-meter-track" aria-hidden>
+                        <div
+                          className="context-meter-fill"
+                          style={{ width: `${contextPct}%` }}
+                        />
+                      </div>
+                      <span className="context-meter-label">
+                        {formatTokenCount(contextUsed)}/
+                        {formatTokenCount(contextWindow)}
+                        {contextFromEngine ? "" : " ~"}
+                      </span>
+                    </div>
+                  )}
                 </div>
                 <div className="composer-right">
                   <select
@@ -2946,7 +7193,8 @@ export default function App() {
                       type="button"
                       className="send-btn stop"
                       onClick={() => void onCancel()}
-                      title="Stop"
+                      title="Stop generation"
+                      aria-label="Stop generation"
                     >
                       <IconStop size={14} />
                     </button>
@@ -2957,7 +7205,7 @@ export default function App() {
                       onClick={() => void onSend()}
                       disabled={
                         !session ||
-                        (!draft.trim() && attachments.length === 0)
+                        (!composerHasText && attachments.length === 0)
                       }
                       title="Send"
                     >
@@ -2970,94 +7218,694 @@ export default function App() {
           </main>
 
           {outputsOpen && (
-            <aside className="right">
-              <div className="right-header" data-tauri-drag-region>
-                <h2>Outputs</h2>
+            <>
+              <div
+                className="panel-resizer panel-resizer-right"
+                role="separator"
+                aria-orientation="vertical"
+                aria-label="Resize outputs panel"
+                title="Drag to resize outputs"
+                onMouseDown={(e) => onPanelResizeStart("right", e)}
+              />
+              <aside
+                className={`right${
+                  outputsTab === "chat" ? " right-chat-mode" : ""
+                }`}
+              >
+              <div
+                className="right-header"
+                onMouseDown={onTitlebarMouseDown}
+                onDoubleClick={onTitlebarDoubleClick}
+              >
+                <h2>{outputsTab === "chat" ? "Side chat" : "Outputs"}</h2>
               </div>
 
-              {error && !session && (
+              <div
+                className="outputs-tabs"
+                role="tablist"
+                aria-label="Right panel"
+              >
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={outputsTab === "chat"}
+                  className={`outputs-tab${
+                    outputsTab === "chat" ? " active" : ""
+                  }`}
+                  onClick={() => setRightTab("chat")}
+                  title="Side chat — does not add to main context"
+                >
+                  Chat
+                </button>
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={outputsTab === "overview"}
+                  className={`outputs-tab${
+                    outputsTab === "overview" ? " active" : ""
+                  }`}
+                  onClick={() => setRightTab("overview")}
+                >
+                  Overview
+                </button>
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={outputsTab === "files"}
+                  className={`outputs-tab${
+                    outputsTab === "files" ? " active" : ""
+                  }`}
+                  onClick={() => setRightTab("files")}
+                  title="Browse this task's workspace and project files"
+                >
+                  Files
+                </button>
+              </div>
+
+              {outputsTab === "chat" && (
+                <SideChat
+                  sessionId={sideChatSessionId}
+                  connected={connected}
+                  messages={sideChatMessages}
+                  onMessagesChange={updateSideChatMessages}
+                  active={outputsTab === "chat"}
+                />
+              )}
+
+              {error && !session && outputsTab === "overview" && (
                 <div className="error-banner" style={{ marginBottom: 12 }}>
                   {error}
                 </div>
               )}
 
-              {pendingPerm && (
-                <div className="card">
-                  <div className="perm-title">{pendingPerm.tool_name}</div>
-                  <p>{pendingPerm.summary}</p>
-                  {pendingPerm.detail && (
-                    <pre className="perm-detail">{pendingPerm.detail}</pre>
+              {outputsTab === "overview" && (
+                <>
+                  {pendingPerm && (
+                    <div className="card">
+                      <div className="perm-title">{pendingPerm.tool_name}</div>
+                      <p>{pendingPerm.summary}</p>
+                      {pendingPerm.detail && (
+                        <pre className="perm-detail">{pendingPerm.detail}</pre>
+                      )}
+                      <div className="btn-row" style={{ marginTop: 12 }}>
+                        <button
+                          className="btn btn-accent"
+                          onClick={() => void onPermission("allow_once")}
+                        >
+                          Allow
+                        </button>
+                        <button
+                          className="btn btn-ghost"
+                          onClick={() => void onPermission("deny")}
+                        >
+                          Deny
+                        </button>
+                      </div>
+                      <p className="hint">
+                        Agent waiting · {pendingPerm.id.slice(0, 8)}
+                      </p>
+                    </div>
                   )}
-                  <div className="btn-row" style={{ marginTop: 12 }}>
-                    <button
-                      className="btn btn-accent"
-                      onClick={() => void onPermission("allow_once")}
+
+                  {session && !pendingPerm && (
+                    <div className="card">
+                      <h3>Approvals</h3>
+                      <p className="muted">
+                        When auto-approve is off, tool permission requests appear
+                        here.
+                      </p>
+                    </div>
+                  )}
+
+                  {session && (
+                    <div className="card">
+                      <h3>Current task</h3>
+                      <dl className="kv">
+                        {session.project_root && (
+                          <>
+                            <dt>Project</dt>
+                            <dd className="mono" title={session.project_root}>
+                              {shortPath(session.project_root)}
+                            </dd>
+                          </>
+                        )}
+                        {session.work_path && (
+                          <>
+                            <dt>Task cwd</dt>
+                            <dd className="mono" title={session.work_path}>
+                              {shortPath(session.work_path)}
+                            </dd>
+                          </>
+                        )}
+                      </dl>
+                      <p className="muted" style={{ marginTop: 8 }}>
+                        Temporary workspace under ~/.grokx/tasks/. Project
+                        sources via ./project.
+                      </p>
+                    </div>
+                  )}
+
+                  {session && (
+                    <div
+                      className={`card proc-card${
+                        procsSectionOpen ? " proc-card-open" : " proc-card-collapsed"
+                      }`}
                     >
-                      Allow
-                    </button>
+                      <div className="files-card-head proc-card-head">
+                        <button
+                          type="button"
+                          className="proc-section-toggle"
+                          aria-expanded={procsSectionOpen}
+                          title={
+                            procsSectionOpen
+                              ? "Collapse processes"
+                              : "Expand processes"
+                          }
+                          onClick={() => setProcsSectionOpen((v) => !v)}
+                        >
+                          <span className="proc-section-chevron" aria-hidden>
+                            {procsSectionOpen ? (
+                              <IconChevronDown size={16} />
+                            ) : (
+                              <IconChevronRight size={16} />
+                            )}
+                          </span>
+                          <h3>
+                            Processes
+                            {processTree.length > 0
+                              ? ` · ${processTree.length}`
+                              : ""}
+                          </h3>
+                        </button>
+                        <button
+                          type="button"
+                          className="files-icon-btn"
+                          title="Refresh processes started by this task"
+                          disabled={procsLoading}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            void refreshSessionProcesses();
+                          }}
+                        >
+                          <IconRefresh size={14} />
+                        </button>
+                      </div>
+                      {!procsSectionOpen && processTree.length > 0 && (
+                        <div className="proc-collapsed-summary muted">
+                          {processTree.slice(0, 3).map((p) => {
+                            const label = shortProcessLabel(p.command);
+                            const childN = p.children.length;
+                            return (
+                              <span
+                                key={p.pid}
+                                className="proc-chip"
+                                title={
+                                  childN > 0
+                                    ? `${p.command}\n(+${childN} child process${
+                                        childN === 1 ? "" : "es"
+                                      })`
+                                    : p.command
+                                }
+                              >
+                                {label}
+                                {childN > 0 ? ` · +${childN}` : ""}
+                                {p.paused ? " · paused" : ""}
+                              </span>
+                            );
+                          })}
+                          {processTree.length > 3 && (
+                            <span className="proc-chip">
+                              +{processTree.length - 3}
+                            </span>
+                          )}
+                        </div>
+                      )}
+                      {procsSectionOpen && (
+                        <>
+                          <p className="muted proc-hint">
+                            One row per service · expand for details · Stop ends
+                            the whole tree.
+                          </p>
+                          {procsError && (
+                            <p className="files-error">{procsError}</p>
+                          )}
+                          {procsLoading && sessionProcs.length === 0 && (
+                            <p className="muted">Scanning…</p>
+                          )}
+                          {!procsLoading &&
+                            sessionProcs.length === 0 &&
+                            !procsError && (
+                              <p className="muted">
+                                No related processes. Long-lived tools like{" "}
+                                <code>mykg web</code> show up here.
+                              </p>
+                            )}
+                          {processTree.length > 0 && (
+                            <ul className="proc-list">
+                              {processTree.map((root) => {
+                                const renderNode = (
+                                  p: SessionProcNode,
+                                  nest: number,
+                                ): ReactNode => {
+                                  const busyRow = procActionPid === p.pid;
+                                  const rowOpen = expandedProcPids.has(p.pid);
+                                  const label = shortProcessLabel(p.command);
+                                  const childN = p.children.length;
+                                  const tip = [
+                                    p.command,
+                                    p.cwd ? `cwd: ${p.cwd}` : null,
+                                    `pid ${p.pid} · ${p.etime} · ${
+                                      p.paused ? "paused" : p.state
+                                    }`,
+                                    childN > 0
+                                      ? `${childN} child process${
+                                          childN === 1 ? "" : "es"
+                                        } (expand)`
+                                      : null,
+                                  ]
+                                    .filter(Boolean)
+                                    .join("\n");
+                                  return (
+                                    <li
+                                      key={p.pid}
+                                      className={`proc-row${
+                                        p.paused ? " proc-paused" : ""
+                                      }${rowOpen ? " proc-row-open" : ""}${
+                                        nest > 0 ? " proc-row-child" : ""
+                                      }`}
+                                      style={
+                                        nest > 0
+                                          ? {
+                                              marginLeft: Math.min(nest, 3) * 12,
+                                            }
+                                          : undefined
+                                      }
+                                    >
+                                      <button
+                                        type="button"
+                                        className="proc-row-summary"
+                                        title={tip}
+                                        aria-expanded={rowOpen}
+                                        onClick={() => {
+                                          setExpandedProcPids((prev) => {
+                                            const next = new Set(prev);
+                                            if (next.has(p.pid))
+                                              next.delete(p.pid);
+                                            else next.add(p.pid);
+                                            return next;
+                                          });
+                                        }}
+                                      >
+                                        <span
+                                          className="proc-row-chevron"
+                                          aria-hidden
+                                        >
+                                          {rowOpen ? (
+                                            <IconChevronDown size={14} />
+                                          ) : (
+                                            <IconChevronRight size={14} />
+                                          )}
+                                        </span>
+                                        <span className="proc-label">
+                                          {label}
+                                          {nest === 0 && childN > 0 && (
+                                            <span className="proc-child-count muted">
+                                              {" "}
+                                              · {childN + 1} procs
+                                            </span>
+                                          )}
+                                          {nest > 0 && (
+                                            <span className="proc-child-tag muted">
+                                              {" "}
+                                              child
+                                            </span>
+                                          )}
+                                        </span>
+                                        <span
+                                          className={`proc-status-pill${
+                                            p.paused ? " paused" : ""
+                                          }`}
+                                        >
+                                          {p.paused ? "paused" : "running"}
+                                        </span>
+                                        <span className="proc-pid muted">
+                                          {p.pid}
+                                        </span>
+                                      </button>
+                                      {rowOpen && (
+                                        <div className="proc-row-detail">
+                                          <div
+                                            className="proc-cmd mono"
+                                            title={p.command}
+                                          >
+                                            {p.command}
+                                          </div>
+                                          <div className="proc-meta muted">
+                                            <span>pid {p.pid}</span>
+                                            <span>·</span>
+                                            <span>ppid {p.ppid}</span>
+                                            <span>·</span>
+                                            <span>{p.etime}</span>
+                                            <span>·</span>
+                                            <span>
+                                              {p.paused ? "paused" : p.state}
+                                            </span>
+                                            {p.cwd && (
+                                              <>
+                                                <span>·</span>
+                                                <span title={p.cwd}>
+                                                  {shortPath(p.cwd)}
+                                                </span>
+                                              </>
+                                            )}
+                                          </div>
+                                          {/* Controls only on the root service row. */}
+                                          {nest === 0 && (
+                                            <div className="proc-actions">
+                                              <button
+                                                type="button"
+                                                className="btn btn-ghost proc-btn proc-btn-danger"
+                                                disabled={busyRow}
+                                                title="Stop this service and its child processes"
+                                                onClick={() =>
+                                                  void stopSessionProcess(p.pid)
+                                                }
+                                              >
+                                                <IconStop size={12} />
+                                                Stop
+                                              </button>
+                                            </div>
+                                          )}
+                                          {p.children.length > 0 && (
+                                            <ul className="proc-list proc-list-nested">
+                                              {p.children.map((c) =>
+                                                renderNode(c, nest + 1),
+                                              )}
+                                            </ul>
+                                          )}
+                                        </div>
+                                      )}
+                                    </li>
+                                  );
+                                };
+                                return renderNode(root, 0);
+                              })}
+                            </ul>
+                          )}
+                        </>
+                      )}
+                    </div>
+                  )}
+
+                  {session && (
+                    <div className="card git-card">
+                      <div className="files-card-head">
+                        <h3>Git</h3>
+                        <button
+                          type="button"
+                          className="files-icon-btn"
+                          title="Refresh git status"
+                          disabled={gitLoading}
+                          onClick={() => void refreshGitStatus()}
+                        >
+                          <IconRefresh size={14} />
+                        </button>
+                      </div>
+                      {gitLoading && !gitInfo && (
+                        <p className="muted">Loading…</p>
+                      )}
+                      {gitError && (
+                        <p className="files-error">{gitError}</p>
+                      )}
+                      {gitInfo && !gitInfo.is_repo && (
+                        <p className="muted">
+                          {gitInfo.note || "Not a git repository"}
+                          <br />
+                          <span className="mono" title={gitInfo.path}>
+                            {shortPath(gitInfo.path)}
+                          </span>
+                        </p>
+                      )}
+                      {gitInfo && gitInfo.is_repo && (
+                        <>
+                          <dl className="kv">
+                            <dt>Branch</dt>
+                            <dd className="mono">
+                              {gitInfo.branch || "—"}
+                              {gitInfo.dirty ? (
+                                <span className="git-dirty-pill">dirty</span>
+                              ) : (
+                                <span className="git-clean-pill">clean</span>
+                              )}
+                            </dd>
+                            <dt>HEAD</dt>
+                            <dd className="mono" title={gitInfo.head || ""}>
+                              {gitInfo.head_short || "—"}
+                            </dd>
+                            {gitInfo.upstream && (
+                              <>
+                                <dt>Upstream</dt>
+                                <dd className="mono">{gitInfo.upstream}</dd>
+                              </>
+                            )}
+                            <dt>Changes</dt>
+                            <dd>
+                              {gitInfo.staged +
+                                gitInfo.unstaged +
+                                gitInfo.untracked ===
+                              0
+                                ? "none"
+                                : `${gitInfo.staged} staged · ${gitInfo.unstaged} unstaged · ${gitInfo.untracked} untracked`}
+                            </dd>
+                          </dl>
+                          {gitInfo.changes.length > 0 && (
+                            <div className="git-changes">
+                              <div className="git-section-label">
+                                This working tree
+                              </div>
+                              <ul className="git-change-list">
+                                {gitInfo.changes.map((line) => (
+                                  <li key={line} className="mono">
+                                    {line}
+                                  </li>
+                                ))}
+                              </ul>
+                            </div>
+                          )}
+                          {gitInfo.recent.length > 0 && (
+                            <div className="git-recent">
+                              <div className="git-section-label">
+                                Recent commits
+                              </div>
+                              <ul className="git-commit-list">
+                                {gitInfo.recent.map((c) => (
+                                  <li key={c.hash}>
+                                    <span className="git-hash mono">
+                                      {c.short}
+                                    </span>
+                                    <span
+                                      className="git-subject"
+                                      title={c.subject}
+                                    >
+                                      {c.subject}
+                                    </span>
+                                    <span className="git-meta muted">
+                                      {c.relative}
+                                    </span>
+                                  </li>
+                                ))}
+                              </ul>
+                            </div>
+                          )}
+                        </>
+                      )}
+                      {!session.project_root && !session.work_path && (
+                        <p className="muted">No project path for git.</p>
+                      )}
+                    </div>
+                  )}
+
+                  {!session && !pendingPerm && (
+                    <div className="card">
+                      <h3>Outputs</h3>
+                      <p className="muted">
+                        Permissions and task details show up here after you open
+                        a project from the sidebar.
+                      </p>
+                    </div>
+                  )}
+                </>
+              )}
+
+              {outputsTab === "files" && (
+                <div className="card files-card">
+                  <div className="files-card-head">
+                    <h3>Session files</h3>
                     <button
-                      className="btn btn-ghost"
-                      onClick={() => void onPermission("deny")}
+                      type="button"
+                      className="files-icon-btn"
+                      title="Refresh"
+                      disabled={!filesRootPath || filesLoading}
+                      onClick={() => refreshFilesTab()}
                     >
-                      Deny
+                      <IconRefresh size={14} />
                     </button>
                   </div>
-                  <p className="hint">
-                    Agent waiting · {pendingPerm.id.slice(0, 8)}
-                  </p>
-                </div>
-              )}
 
-              {session && !pendingPerm && (
-                <div className="card">
-                  <h3>Approvals</h3>
-                  <p className="muted">
-                    When auto-approve is off, tool permission requests appear
-                    here.
-                  </p>
-                </div>
-              )}
+                  {!session ? (
+                    <p className="muted">Open a task to browse its directory.</p>
+                  ) : (
+                    <>
+                      <div className="files-root-toggle" role="group">
+                        <button
+                          type="button"
+                          className={`files-root-btn${
+                            filesRootKind === "task" ? " active" : ""
+                          }`}
+                          disabled={!session.work_path}
+                          onClick={() => setFilesRootKind("task")}
+                          title={session.work_path || "No task cwd"}
+                        >
+                          Task
+                        </button>
+                        <button
+                          type="button"
+                          className={`files-root-btn${
+                            filesRootKind === "project" ? " active" : ""
+                          }`}
+                          disabled={!session.project_root}
+                          onClick={() => setFilesRootKind("project")}
+                          title={session.project_root || "No project"}
+                        >
+                          Project
+                        </button>
+                      </div>
 
-              {session && (
-                <div className="card">
-                  <h3>Current task</h3>
-                  <dl className="kv">
-                    {session.project_root && (
-                      <>
-                        <dt>Project</dt>
-                        <dd className="mono" title={session.project_root}>
-                          {shortPath(session.project_root)}
-                        </dd>
-                      </>
-                    )}
-                    {session.work_path && (
-                      <>
-                        <dt>Task cwd</dt>
-                        <dd className="mono" title={session.work_path}>
-                          {shortPath(session.work_path)}
-                        </dd>
-                      </>
-                    )}
-                  </dl>
-                  <p className="muted" style={{ marginTop: 8 }}>
-                    Temporary workspace under ~/.grokx/tasks/. Project sources
-                    via ./project.
-                  </p>
-                </div>
-              )}
+                      <div className="files-path-bar" title={filesBrowsePath || ""}>
+                        <button
+                          type="button"
+                          className="files-icon-btn"
+                          title="Go up"
+                          disabled={!filesCanGoUp || filesLoading}
+                          onClick={() => {
+                            const p = filesBrowsePath
+                              ? parentDir(filesBrowsePath)
+                              : null;
+                            if (p) void loadFilesDir(p);
+                          }}
+                        >
+                          ↑
+                        </button>
+                        <button
+                          type="button"
+                          className="files-path-text mono"
+                          title="Open in Finder / Explorer"
+                          disabled={!filesBrowsePath}
+                          onClick={() => {
+                            if (filesBrowsePath) {
+                              void onOpenFilesPath(filesBrowsePath);
+                            }
+                          }}
+                        >
+                          {filesBrowsePath
+                            ? shortPath(filesBrowsePath)
+                            : "—"}
+                        </button>
+                      </div>
 
-              {!session && !pendingPerm && (
-                <div className="card">
-                  <h3>Outputs</h3>
-                  <p className="muted">
-                    Permissions and task details show up here after you open a
-                    project from the sidebar.
-                  </p>
+                      {filesError && (
+                        <p className="files-error">{filesError}</p>
+                      )}
+                      {filesLoading && (
+                        <p className="muted files-loading">Loading…</p>
+                      )}
+
+                      {!filesLoading && !filesError && filesEntries.length === 0 && (
+                        <p className="muted">Empty folder</p>
+                      )}
+
+                      <ul className="files-list">
+                        {filesEntries.map((ent) => (
+                          <li key={ent.path}>
+                            <button
+                              type="button"
+                              className={`files-entry${
+                                ent.is_dir ? " is-dir" : ""
+                              }`}
+                              title={ent.path}
+                              onClick={() => onFilesEntryClick(ent)}
+                              onDoubleClick={() => {
+                                if (ent.is_dir) {
+                                  void loadFilesDir(ent.path);
+                                } else {
+                                  void onOpenFilesPath(ent.path);
+                                }
+                              }}
+                            >
+                              <span className="files-entry-icon" aria-hidden>
+                                {ent.is_dir ? (
+                                  <IconFolder size={14} />
+                                ) : (
+                                  <IconFile size={14} />
+                                )}
+                              </span>
+                              <span className="files-entry-name">{ent.name}</span>
+                              {!ent.is_dir && ent.size != null && (
+                                <span className="files-entry-meta">
+                                  {formatBytes(ent.size)}
+                                </span>
+                              )}
+                            </button>
+                          </li>
+                        ))}
+                      </ul>
+
+                      <p className="muted files-hint">
+                        Click a file to open · folder to enter · path bar opens
+                        in Finder
+                      </p>
+                    </>
+                  )}
                 </div>
               )}
             </aside>
+            </>
           )}
         </>
+      )}
+
+      {attachmentPreview && (
+        <div
+          className="attach-preview-overlay"
+          role="dialog"
+          aria-modal="true"
+          aria-label={`Preview ${attachmentPreview.name}`}
+          onClick={() => setAttachmentPreview(null)}
+        >
+          <div
+            className="attach-preview-panel"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="attach-preview-bar">
+              <span className="attach-preview-name" title={attachmentPreview.name}>
+                {attachmentPreview.name}
+              </span>
+              <button
+                type="button"
+                className="attach-preview-close"
+                onClick={() => setAttachmentPreview(null)}
+                aria-label="Close preview"
+              >
+                ×
+              </button>
+            </div>
+            <img
+              className="attach-preview-img"
+              src={attachmentPreview.src}
+              alt={attachmentPreview.name}
+            />
+          </div>
+        </div>
       )}
     </div>
   );
