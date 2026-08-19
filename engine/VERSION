@@ -1,7 +1,7 @@
 engine_name=grok-build
 engine_version=subtree
-engine_commit=34504ed548b8111baad479672375947b14cd0f0e
-engine_commit_short=34504ed
+engine_commit=be66b7c4f9e2722dc3ec40a89f387c4b5603c1e6
+engine_commit_short=be66b7c4
 upstream=https://github.com/xai-org/grok-build.git
 prefix=engine/grok-build
-pinned_at=2026-07-30T09:45:36Z
+pinned_at=2026-08-19T11:09:43Z

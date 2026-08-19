@@ -2,7 +2,7 @@
   "app_version": "0.2.5",
   "engine_name": "grok-build",
   "engine_version": "subtree",
-  "engine_commit": "34504ed548b8111baad479672375947b14cd0f0e",
+  "engine_commit": "be66b7c4f9e2722dc3ec40a89f387c4b5603c1e6",
   "engine_channel": "bundled",
   "compatible_app_range": ">=0.1.0 <0.3.0"
 }

@@ -2,6 +2,6 @@
   "app_version": "0.2.5",
   "engine_name": "grok-build",
   "engine_version": "subtree",
-  "engine_commit": "34504ed",
+  "engine_commit": "be66b7c4",
   "engine_channel": "bundled"
 }
