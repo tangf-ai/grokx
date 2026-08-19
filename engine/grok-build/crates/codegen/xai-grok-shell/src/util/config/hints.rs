@@ -31,14 +31,6 @@ impl WorktreeHintMode {
         }
     }
 
-    pub fn as_config_str(self) -> &'static str {
-        match self {
-            Self::Ask => "ask",
-            Self::Always => "always",
-            Self::Never => "never",
-        }
-    }
-
     /// Returns `(new_session_worktree_mode, fork_worktree_mode)`.
     ///
     /// - `/new`: `new_session_worktree_mode`, else legacy `worktree_mode`, else `Never`.
@@ -61,13 +53,12 @@ impl WorktreeHintMode {
     }
 }
 
-/// Resolved `[hints]` UI opt-outs (TUI "don't ask again" and related).
+/// Resolved `[hints]` worktree preferences for `/new` and `/fork`.
 ///
 /// Read via effective config merge when available; falls back to partial layer
 /// merge so a bad user `config.toml` does not drop managed/requirements hints.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedHints {
-    pub project_picker_disabled: bool,
     pub new_session_worktree_mode: WorktreeHintMode,
     pub fork_worktree_mode: WorktreeHintMode,
 }
@@ -75,7 +66,6 @@ pub struct ResolvedHints {
 impl Default for ResolvedHints {
     fn default() -> Self {
         Self {
-            project_picker_disabled: false,
             new_session_worktree_mode: WorktreeHintMode::Never,
             fork_worktree_mode: WorktreeHintMode::Ask,
         }
@@ -84,15 +74,8 @@ impl Default for ResolvedHints {
 
 impl ResolvedHints {
     fn from_hints_table(hints: Option<&TomlValue>) -> Self {
-        let hint_bool = |key: &str| -> bool {
-            hints
-                .and_then(|h| h.get(key))
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false)
-        };
         let (new_session, fork) = WorktreeHintMode::resolve_pair(hints);
         Self {
-            project_picker_disabled: hint_bool("project_picker_disabled"),
             new_session_worktree_mode: new_session,
             fork_worktree_mode: fork,
         }
@@ -154,26 +137,21 @@ pub fn resolve_contextual_hints(
     }
 }
 
-/// Merge config layers in effective-config order (system managed → managed →
-/// user → requirements). Used when [`load_effective_config`] fails but some
-/// layers still loaded (same pattern as tips/announcements).
 fn merge_hints_config_layers(
     requirements: Option<&TomlValue>,
     user: Option<&TomlValue>,
     managed: Option<&TomlValue>,
 ) -> TomlValue {
-    let mut merged = crate::config::load_system_managed_config()
-        .unwrap_or_else(|_| TomlValue::Table(TomlMap::new()));
-    if let Some(m) = managed {
-        xai_grok_config::deep_merge_toml(&mut merged, m);
-    }
-    if let Some(u) = user {
-        xai_grok_config::deep_merge_toml(&mut merged, u);
-    }
-    if let Some(r) = requirements {
-        xai_grok_config::deep_merge_toml(&mut merged, r);
-    }
-    merged
+    let empty = || TomlValue::Table(TomlMap::new());
+    let layers = crate::config::ConfigLayers {
+        system_managed: crate::config::load_system_managed_config().unwrap_or_else(|_| empty()),
+        managed: managed.cloned().unwrap_or_else(empty),
+        user: user.cloned().unwrap_or_else(empty),
+        env_overlay: crate::config::resolved_env_overlay().map(|o| o.value),
+        user_requirements: requirements.cloned(),
+        ..Default::default()
+    };
+    layers.effective_config_base()
 }
 
 /// Resolve `[hints]` from effective config or partial layer merge.
@@ -193,31 +171,24 @@ pub fn resolve_hints(
     ResolvedHints::from_hints_table(root.get("hints"))
 }
 
-/// Load config from disk and resolve `[hints]`.
-pub fn resolve_hints_from_disk() -> ResolvedHints {
-    let effective = crate::config::load_effective_config().ok();
-    let requirements = crate::config::load_merged_requirements();
-    let user = crate::config::load_from_disk().ok();
-    let managed = crate::config::load_managed_config().ok();
-    resolve_hints(
-        effective.as_ref(),
-        requirements.as_ref(),
-        user.as_ref(),
-        managed.as_ref(),
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn resolve_hints_requirements_overrides_user_when_effective_missing() {
-        let user: TomlValue = toml::from_str("[hints]\nproject_picker_disabled = false\n").unwrap();
+        let user: TomlValue = toml::from_str("[hints]\nfork_worktree_mode = \"never\"\n").unwrap();
         let requirements: TomlValue =
-            toml::from_str("[hints]\nproject_picker_disabled = true\n").unwrap();
+            toml::from_str("[hints]\nfork_worktree_mode = \"always\"\n").unwrap();
         let resolved = resolve_hints(None, Some(&requirements), Some(&user), None);
-        assert!(resolved.project_picker_disabled);
+        assert_eq!(resolved.fork_worktree_mode, WorktreeHintMode::Always);
+        assert_eq!(resolved.new_session_worktree_mode, WorktreeHintMode::Never);
+    }
+
+    /// `/new` defaults to Never and `/fork` to Ask, so an absent key is not the same answer for both.
+    #[test]
+    fn resolve_hints_defaults_differ_per_command() {
+        let resolved = resolve_hints(None, None, None, None);
         assert_eq!(resolved.new_session_worktree_mode, WorktreeHintMode::Never);
         assert_eq!(resolved.fork_worktree_mode, WorktreeHintMode::Ask);
     }
@@ -225,9 +196,9 @@ mod tests {
     #[test]
     fn resolve_hints_uses_effective_root_when_provided() {
         let effective: TomlValue =
-            toml::from_str("[hints]\nproject_picker_disabled = true\n").unwrap();
+            toml::from_str("[hints]\nnew_session_worktree_mode = \"always\"\n").unwrap();
         let resolved = resolve_hints(Some(&effective), None, None, None);
-        assert!(resolved.project_picker_disabled);
+        assert_eq!(resolved.new_session_worktree_mode, WorktreeHintMode::Always);
     }
 
     const ENV_CONTEXTUAL_HINTS: &str = "GROK_CONTEXTUAL_HINTS";

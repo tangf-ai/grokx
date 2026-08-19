@@ -1,8 +1,7 @@
 //! Plan, yolo, auto, and permission mode transitions and toasts.
 
-use super::ctx::with_active_agent;
+use super::ctx::{NO_SESSION_NOTICE, with_active_agent};
 use super::queue::{maybe_drain_queue, note_peek_page_flip};
-use super::session::lifecycle::skip_picker_and_create_session;
 use super::settings::ui::{refresh_open_settings_modals, save_success_toast};
 use crate::app::actions::Effect;
 use crate::app::app_view::{ActiveView, AppView};
@@ -54,7 +53,7 @@ pub(super) fn dispatch_enter_plan_mode(
 
     let agent = app.agents.get_mut(&id).unwrap();
     let Some(session_id) = agent.session.session_id.clone() else {
-        agent.show_toast("No active session");
+        agent.show_toast(NO_SESSION_NOTICE);
         return vec![];
     };
 
@@ -143,7 +142,7 @@ pub(super) fn set_plan_mode(
     };
 
     let Some(session_id) = agent.session.session_id.clone() else {
-        agent.show_toast("No active session");
+        agent.show_toast(NO_SESSION_NOTICE);
         return vec![];
     };
 
@@ -753,12 +752,7 @@ fn dispatch_cycle_mode_inner(app: &mut AppView) -> Vec<Effect> {
         };
         refresh_open_settings_modals(app);
         let mut effects = Vec::new();
-        // Persist the displayed mode to disk like the with-session arms do —
-        // otherwise a restart re-reads the stale launch value (e.g. cycling
-        // Always-Approve off pre-session still relaunched in yolo).
-        // `session_id: None` skips the ACP yolo_mode_changed push (nothing to
-        // notify yet; the created session takes its mode from the explicit
-        // `_meta` seeds — see `SessionFlags::to_meta`).
+        // Persist the displayed mode for the next launch; the pending CreateSession snapshots this mutation before execution.
         if let Some(canonical) = persist_canonical {
             effects.push(Effect::PersistPermissionMode {
                 canonical,
@@ -766,7 +760,6 @@ fn dispatch_cycle_mode_inner(app: &mut AppView) -> Vec<Effect> {
                 persist: crate::app::actions::PermissionModePersist::BestEffort,
             });
         }
-        effects.extend(skip_picker_and_create_session(app, id));
         return effects;
     };
 

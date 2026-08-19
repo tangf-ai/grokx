@@ -9,8 +9,8 @@
 use super::actions::Action;
 use super::agent_view::{
     AgentPane, AgentView, CONTEXT_CLICK_DEBOUNCE_MS, CtaPhase, MULTI_CLICK_TIMEOUT_MS,
-    PromptInputMode, PromptMode, TextClickState, app_should_open_link_on_click,
-    has_native_link_hover, is_link_modifier_held, is_text_selection_on_double_click,
+    PromptInputMode, PromptMode, TextClickState, is_link_modifier_held,
+    is_text_selection_on_double_click,
 };
 use super::app_view::InputOutcome;
 use crate::scrollback::block::BlockContent;
@@ -51,10 +51,6 @@ impl AgentView {
                     if self.active_pane == AgentPane::Queue {
                         self.set_active_pane(AgentPane::Scrollback, false);
                     }
-                    return InputOutcome::Changed;
-                }
-                if self.hit_queue_badge.contains(mouse.column, mouse.row) {
-                    self.toggle_queue_pane();
                     return InputOutcome::Changed;
                 }
                 if self.hit_bg_status.contains(mouse.column, mouse.row) {
@@ -259,18 +255,15 @@ impl AgentView {
                     self.copy_to_clipboard(&path);
                     return InputOutcome::Changed;
                 }
-                if self.hit_badge.contains(mouse.column, mouse.row) {
-                    self.todo.overlay.toggle();
-                    self.todo.on_state_change();
-                    if self.todo.overlay.focused {
-                        self.set_active_pane(AgentPane::Todo, false);
-                    } else if self.active_pane == AgentPane::Todo {
-                        self.set_active_pane(AgentPane::Scrollback, false);
-                    }
-                    return InputOutcome::Changed;
-                }
                 if self.hit_follow_indicator.contains(mouse.column, mouse.row) {
                     self.scrollback.goto_bottom();
+                    return InputOutcome::Changed;
+                }
+                if self
+                    .hit_response_top_indicator
+                    .contains(mouse.column, mouse.row)
+                {
+                    self.scrollback.prev_response();
                     return InputOutcome::Changed;
                 }
                 if let Some(hd_area) = self.history_dropdown_area
@@ -295,8 +288,7 @@ impl AgentView {
                             .map(str::to_owned)
                     {
                         self.prompt.history_search.deactivate();
-                        if self.prompt_input_mode != PromptInputMode::Feedback
-                            && self.prompt_input_mode != PromptInputMode::Remember
+                        if self.prompt_input_mode != PromptInputMode::Remember
                             && let Some(cmd) = text.strip_prefix("! ")
                         {
                             self.prompt_input_mode = PromptInputMode::Bash;
@@ -432,13 +424,9 @@ impl AgentView {
                 {
                     self.set_active_pane(AgentPane::Prompt, false);
                     self.btw_focused = true;
-                    if !has_native_link_hover()
-                        && is_link_modifier_held(mouse.modifiers)
-                        && !self.pos_occluded(mouse.column, mouse.row)
-                        && let Some(link) = self.visible_link_map.link_at(mouse.column, mouse.row)
+                    if is_link_modifier_held(mouse.modifiers)
+                        && self.try_arm_link_click(mouse.column, mouse.row)
                     {
-                        self.pending_link_click = app_should_open_link_on_click(link)
-                            .then(|| (mouse.column, mouse.row, link.target.clone()));
                         self.pending_scrollback_click = None;
                         return InputOutcome::Changed;
                     }
@@ -719,14 +707,9 @@ impl AgentView {
                         self.persistent_text_selection = None;
                         self.table_selection_geometry = None;
                         self.selection_created_at = None;
-                        if !has_native_link_hover()
-                            && is_link_modifier_held(mouse.modifiers)
-                            && !self.pos_occluded(mouse.column, mouse.row)
-                            && let Some(link) =
-                                self.visible_link_map.link_at(mouse.column, mouse.row)
+                        if is_link_modifier_held(mouse.modifiers)
+                            && self.try_arm_link_click(mouse.column, mouse.row)
                         {
-                            self.pending_link_click = app_should_open_link_on_click(link)
-                                .then(|| (mouse.column, mouse.row, link.target.clone()));
                             self.pending_scrollback_click = None;
                             return InputOutcome::Changed;
                         }
@@ -845,7 +828,7 @@ impl AgentView {
                                     }
                                     3 => {
                                         if !self.select_cell_at(&hit) {
-                                            self.select_line_at(&hit);
+                                            self.select_paragraph_at(&hit);
                                         }
                                         true
                                     }
@@ -924,9 +907,9 @@ impl AgentView {
                                     .scrollback
                                     .get_cached_entry_layouts()
                                     .and_then(|l| l.get(idx))
-                                    .is_some_and(|i| {
-                                        i.verb_group_header && i.group_collapse_header
-                                    })
+                                    .is_some_and(
+                                        crate::scrollback::EntryLayoutInfo::is_expanded_verb_header,
+                                    )
                                     && self
                                         .scrollback
                                         .entry_screen_area(idx, self.pane_areas.scrollback)
@@ -993,19 +976,6 @@ impl AgentView {
                     left_mouse_down = self.left_mouse_down,
                     "scrollback mouse moved"
                 );
-                if self.left_mouse_down
-                    && (self.pending_text_drag.is_some()
-                        || self.drag_selection.is_some()
-                        || self.pending_block_drag.is_some()
-                        || self.block_drag_selection.is_some()
-                        || self.deferred_text_press.is_some())
-                {
-                    self.pending_link_click = None;
-                    let outcome = self.handle_scrollback_drag_motion(mouse);
-                    if !matches!(outcome, InputOutcome::Unchanged) {
-                        return outcome;
-                    }
-                }
                 let suppress_scrollback_hover = self.pending_text_drag.is_some()
                     || self.drag_selection.is_some()
                     || self.pending_block_drag.is_some()
@@ -1071,12 +1041,10 @@ impl AgentView {
                 }
                 changed |= self
                     .set_hovered_follow_up_chip(self.follow_up_chip_at(mouse.column, mouse.row));
-                changed |= self.hit_badge.update_hover(mouse.column, mouse.row);
                 changed |= self.hit_context.update_hover(mouse.column, mouse.row);
                 changed |= self.hit_credits.update_hover(mouse.column, mouse.row);
                 changed |= self.hit_todo_close.update_hover(mouse.column, mouse.row);
                 changed |= self.hit_queue_close.update_hover(mouse.column, mouse.row);
-                changed |= self.hit_queue_badge.update_hover(mouse.column, mouse.row);
                 if matches!(
                     self.pane_areas.hit_test(mouse.column, mouse.row),
                     Some(AgentPane::Queue)
@@ -1097,6 +1065,9 @@ impl AgentView {
                     .update_hover(mouse.column, mouse.row);
                 changed |= self
                     .hit_follow_indicator
+                    .update_hover(mouse.column, mouse.row);
+                changed |= self
+                    .hit_response_top_indicator
                     .update_hover(mouse.column, mouse.row);
                 changed |= self.hit_cancel_button.update_hover(mouse.column, mouse.row);
                 changed |= self.hit_bg_button.update_hover(mouse.column, mouse.row);
@@ -1630,12 +1601,9 @@ mod tests {
             Some("draft")
         );
     }
-    /// Clicking `[edit]` on a server row still awaiting its enqueue
-    /// confirmation (an optimistic echo) is ignored: the shell has no row to
-    /// hold yet, so the `hold_edit` would no-op and the later-confirmed row
-    /// could be absorbed mid-edit.
+    /// Mouse edit on an optimistic server row toasts and does not emit HoldEdit.
     #[test]
-    fn mouse_edit_click_on_optimistic_server_row_is_ignored() {
+    fn mouse_edit_click_on_optimistic_server_row_toasts() {
         let mut agent = make_running_agent();
         agent.optimistic_queue_ids.insert("p1".into());
         let ids = agent.queue.entry_ids();
@@ -1646,6 +1614,10 @@ mod tests {
             "an unconfirmed echo must not be editable"
         );
         assert_eq!(agent.prompt.text(), "");
+        assert_eq!(
+            agent.toast.as_ref().map(|(message, _)| message.as_str()),
+            Some(crate::app::queue_edit::STILL_QUEUEING_TOAST),
+        );
         assert!(
             agent.pending_effects.is_empty(),
             "no QueueHoldEdit may be emitted for a row the shell doesn't have"

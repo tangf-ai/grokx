@@ -440,6 +440,9 @@ pub(super) mod paste_key_tests {
     use super::*;
     use crate::acp::model_state::ModelState;
     use crate::app::agent::{AgentId, AgentSession, AgentState};
+    use crate::app::agent_view::test_fixtures::{
+        make_followup_permission_state, make_plan_approval_view_state,
+    };
     use crate::app::app_view::InputOutcome;
     use crate::clipboard::ImageData;
     use crate::scrollback::state::ScrollbackState;
@@ -1148,65 +1151,6 @@ pub(super) mod paste_key_tests {
         assert_event_paste_arm_decodes_non_image("question_view", |agent| {
             agent.question_view = Some(make_question_view_state_in_input_mode());
         });
-    }
-    /// Build a `PermissionViewState` already in FollowupInput focus —
-    /// enough for the dispatcher's permission-followup paste arm.
-    pub(in crate::app::agent_view) fn make_followup_permission_state()
-    -> crate::views::permission_view::PermissionViewState {
-        let (response_tx, _rx) = tokio::sync::oneshot::channel();
-        let request = agent_client_protocol::RequestPermissionRequest::new(
-            agent_client_protocol::SessionId::new(std::sync::Arc::from("test")),
-            agent_client_protocol::ToolCallUpdate::new(
-                agent_client_protocol::ToolCallId::new(std::sync::Arc::from("call-1")),
-                agent_client_protocol::ToolCallUpdateFields::default(),
-            ),
-            vec![],
-        );
-        let perm = xai_acp_lib::AcpArgs {
-            request,
-            response_tx,
-        };
-        crate::views::permission_view::PermissionViewState {
-            request: perm,
-            id: 0,
-            focus: crate::views::permission_view::PermissionFocus::FollowupInput,
-            options: vec![],
-            active_idx: 0,
-            bash_highlights: None,
-            bash_selection_count: 0,
-            bash_command_raw: None,
-            mcp_scope: None,
-            title: String::new(),
-            description: vec![],
-            args_expanded: false,
-            desc_scroll: 0,
-            subagent_label: None,
-            options_area_height: 0,
-            options_scroll_offset: 0,
-        }
-    }
-    /// Build a minimal `PlanApprovalViewState` — enough for the
-    /// dispatcher's plan-approval-view paste arm.
-    pub(in crate::app::agent_view) fn make_plan_approval_view_state()
-    -> crate::views::plan_approval_view::PlanApprovalViewState {
-        let (tx, _rx) = tokio::sync::oneshot::channel();
-        let request = crate::views::plan_approval_view::ExitPlanModeExtRequest {
-            session_id: "test-session".into(),
-            tool_call_id: "call-1".into(),
-            plan_content: Some("# Plan\n\n## Step 1\nDo something".into()),
-        };
-        crate::views::plan_approval_view::PlanApprovalViewState::new(
-            request,
-            crate::views::prompt_widget::StashedPrompt {
-                text: String::new(),
-                cursor: 0,
-                images: Vec::new(),
-                chip_elements: Vec::new(),
-                image_counter: 0,
-                image_undo_stash: Vec::new(),
-            },
-            tx,
-        )
     }
     /// Build a `QuestionViewState` already in `InputMode` focus.
     pub(in crate::app::agent_view) fn make_question_view_state_in_input_mode()
@@ -1930,21 +1874,7 @@ pub(super) mod paste_key_tests {
         agent
             .inline_media_cache
             .insert(path.clone(), make_test_png(40, 20));
-        let placement = crate::scrollback::render::InlineMediaPlacement {
-            info: crate::prompt_images::InlineMediaInfo {
-                path: path.clone(),
-                width: 40,
-                height: 20,
-                is_video: false,
-                alt_text: String::new(),
-            },
-            screen_rect: ratatui::layout::Rect::new(0, 0, 20, 6),
-            full_rows: 6,
-            top_crop_rows: 0,
-            filepath_screen_rect: None,
-            open_button_screen_rect: None,
-            has_button_row: true,
-        };
+        let placement = tool_media_placement(path.clone());
         let first = agent
             .build_inline_media_escapes(&placement)
             .expect("first frame emits escapes");
@@ -1968,6 +1898,122 @@ pub(super) mod paste_key_tests {
             !second.contains("a=t"),
             "second frame must not re-transmit the bytes: {second:?}",
         );
+    }
+    fn tool_media_placement(
+        path: std::path::PathBuf,
+    ) -> crate::scrollback::render::InlineMediaPlacement {
+        crate::scrollback::render::InlineMediaPlacement {
+            info: crate::prompt_images::InlineMediaInfo {
+                path,
+                width: 40,
+                height: 20,
+                is_video: false,
+                alt_text: String::new(),
+            },
+            screen_rect: ratatui::layout::Rect::new(0, 0, 20, 6),
+            full_rows: 6,
+            top_crop_rows: 0,
+            filepath_screen_rect: None,
+            open_button_screen_rect: None,
+            has_button_row: true,
+        }
+    }
+    /// A place-only frame after the byte cache was dropped with the id kept
+    /// (subagent eviction, cap eviction) must reload the bytes from disk
+    /// instead of dead-ending on a permanent loading spinner.
+    #[test]
+    fn tool_media_place_only_frame_reloads_bytes_after_cache_drop() {
+        use crate::terminal::image::{GraphicsProtocol, set_protocol_for_test};
+        let _g = set_protocol_for_test(GraphicsProtocol::Kitty);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("evicted.png");
+        std::fs::write(&path, make_test_png(40, 20)).unwrap();
+        let mut agent = make_agent();
+        let placement = tool_media_placement(path.clone());
+        let first = agent
+            .build_inline_media_escapes(&placement)
+            .expect("first frame loads from disk and emits escapes");
+        assert!(first.contains("a=t"), "first frame transmits: {first:?}");
+        agent.inline_media_cache.clear();
+        let second = agent
+            .build_inline_media_escapes(&placement)
+            .expect("place-only frame must reload the bytes, not dead-end");
+        assert!(second.contains("a=p"), "reloaded frame places: {second:?}");
+        assert!(
+            !second.contains("a=t"),
+            "id kept → no re-transmit: {second:?}"
+        );
+        assert!(
+            agent.inline_media_cache.contains_key(&path),
+            "the reload must repopulate the byte cache"
+        );
+    }
+    /// A missing file keeps polling (generation may still be writing it);
+    /// a present-but-undecodable file is negative-cached by its `(len,
+    /// mtime)` so decode work doesn't re-run every frame while the file is
+    /// unchanged, but a rewrite (e.g. a file caught mid-write, finished
+    /// later) self-heals without needing an eviction.
+    #[test]
+    fn tool_media_load_failure_negative_cached_until_file_changes() {
+        use crate::terminal::image::{GraphicsProtocol, set_protocol_for_test};
+        let _g = set_protocol_for_test(GraphicsProtocol::Kitty);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("broken.png");
+        let mut agent = make_agent();
+        let placement = tool_media_placement(path.clone());
+        assert!(agent.build_inline_media_escapes(&placement).is_none());
+        assert!(!agent.inline_media_load_failed.contains_key(&path));
+        std::fs::write(&path, b"not a png").unwrap();
+        assert!(agent.build_inline_media_escapes(&placement).is_none());
+        assert!(agent.inline_media_load_failed.contains_key(&path));
+        assert!(
+            agent.build_inline_media_escapes(&placement).is_none(),
+            "an unchanged broken file must not be re-decoded every frame"
+        );
+        std::fs::write(&path, make_test_png(40, 20)).unwrap();
+        assert!(
+            agent.build_inline_media_escapes(&placement).is_some(),
+            "a changed file must retry and recover"
+        );
+        assert!(
+            !agent.inline_media_load_failed.contains_key(&path),
+            "a successful load must drop the stale failure marker"
+        );
+    }
+    /// A same-length in-place rewrite whose mtime does not move (coarse
+    /// clock) must still retry a negative-cached failure: the Unix stamp
+    /// includes inode + ctime, which a rewrite always advances.
+    #[cfg(unix)]
+    #[test]
+    fn tool_media_same_length_same_mtime_rewrite_retries_failed_load() {
+        use crate::terminal::image::{GraphicsProtocol, set_protocol_for_test};
+        let _g = set_protocol_for_test(GraphicsProtocol::Kitty);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("slow-write.png");
+        let png = make_test_png(40, 20);
+        let mtime =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let pin_mtime = |p: &std::path::Path| {
+            std::fs::File::options()
+                .write(true)
+                .open(p)
+                .unwrap()
+                .set_times(std::fs::FileTimes::new().set_modified(mtime))
+                .unwrap();
+        };
+        std::fs::write(&path, vec![0u8; png.len()]).unwrap();
+        pin_mtime(&path);
+        let mut agent = make_agent();
+        let placement = tool_media_placement(path.clone());
+        assert!(agent.build_inline_media_escapes(&placement).is_none());
+        assert!(agent.inline_media_load_failed.contains_key(&path));
+        std::fs::write(&path, &png).unwrap();
+        pin_mtime(&path);
+        assert!(
+            agent.build_inline_media_escapes(&placement).is_some(),
+            "a same-length same-mtime rewrite must retry and recover"
+        );
+        assert!(!agent.inline_media_load_failed.contains_key(&path));
     }
     /// Draining an agent with live inline-media placements returns delete
     /// escapes for every placed id — including ids placed by subagent
@@ -2074,6 +2120,7 @@ pub(super) mod paste_key_tests {
             false,
             crate::app::agent_view::BannerSlotParams::none(),
             &bundle,
+            false,
             false,
             &mut Vec::new(),
             crate::app::agent_view::AppRenderParams::default(),

@@ -16,6 +16,15 @@ pub(crate) use self::journal::{RelocationJournal, RelocationLease, RelocationPha
 pub(crate) use self::view::RelocationView;
 use crate::session::persistence::{PendingCwdSwitchReminder, Summary};
 
+/// True when `~/.grok/relocations/<session_id>.json` exists.
+///
+/// Replay's parent-cwd/sibling fast path must not trust a found `updates.jsonl`
+/// while a journal is present: source and target dirs can both exist, and the
+/// journal phase is the only authority.
+pub(crate) fn has_relocation_journal(grok_home: &Path, session_id: &str) -> bool {
+    journal::journal_path(grok_home, session_id).is_file()
+}
+
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum RelocationError {
     #[error("invalid relocation {field}: {value:?}")]
@@ -581,9 +590,13 @@ impl RelocationStorage {
     fn ensure_target_parent(&self, cwd: &str) -> Result<PathBuf> {
         let sessions = self.grok_home.join("sessions");
         fs::create_dir_durable(&sessions)?;
+        xai_grok_config::set_dir_owner_only(&sessions);
         let encoded = xai_grok_config::encode_cwd_dirname(cwd);
         let dir = self.target_parent(cwd);
         fs::create_dir_durable(&dir)?;
+        // Owner-only root + parent shield the dirs beneath (the staged copy
+        // preserves source modes).
+        xai_grok_config::set_dir_owner_only(&dir);
         if encoded != urlencoding::encode(cwd).as_ref() {
             let path = dir.join(".cwd");
             match std_fs::read_to_string(&path) {

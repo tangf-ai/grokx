@@ -67,7 +67,7 @@ fn drain_persistence(mut rx: tokio::sync::mpsc::UnboundedReceiver<PersistenceMsg
     tokio::task::spawn_local(async move {
         while let Some(msg) = rx.recv().await {
             if let PersistenceMsg::FlushAndAck { respond_to } = msg {
-                let _ = respond_to.send(());
+                let _ = respond_to.send(Ok(()));
             }
         }
     });
@@ -195,6 +195,7 @@ async fn mid_turn_user_injection_must_not_duplicate_tool_results_for_one_tool_us
                     None,
                     None,
                     true,
+                    /* send_now */ false,
                     None,
                     None,
                     None,

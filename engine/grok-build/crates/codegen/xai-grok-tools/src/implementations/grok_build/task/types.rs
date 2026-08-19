@@ -100,6 +100,18 @@ pub struct SubagentRequest {
     pub cancel_token: CancellationToken,
 }
 
+impl SubagentRequest {
+    pub fn from_scheduler_loop(&self) -> bool {
+        self.runtime_overrides.loop_task_id.is_some()
+    }
+
+    /// The caller blocks on the foreground await budget (neither backgrounded
+    /// nor awaiting to completion).
+    pub fn awaits_in_foreground(&self) -> bool {
+        !self.run_in_background && !self.await_to_completion
+    }
+}
+
 /// Spawn command envelope owned by the coordinator mailbox.
 #[derive(Educe)]
 #[educe(Debug)]
@@ -556,7 +568,10 @@ impl SubagentSnapshotStatus {
 #[derive(Debug, Clone)]
 pub enum SubagentCancelTarget {
     SubagentId(String),
+    /// Turn-scoped cancel (soft cancel / max-turns).
     ParentPromptId(String),
+    /// User Stop / Esc with cancel_subagents — prior-turn background too.
+    ParentSession,
     WorkflowRunId(String),
 }
 
@@ -663,6 +678,8 @@ pub struct SubagentRegistryCounts {
     pub pending: usize,
     pub active: usize,
     pub completed: usize,
+    /// Spawns parked at the session's concurrent limit, not yet started.
+    pub queued: usize,
 }
 
 #[derive(Educe)]
@@ -848,8 +865,17 @@ pub enum SubagentEvent {
     ListActive(SubagentListActiveRequest),
     ListRunning(SubagentListRunningRequest),
     Completions(SubagentCompletionsRequest),
-    /// Discard a closed session's buffered completions and cancel its children.
+    /// Cancel children of `parent_session_id` and drop its buffered completions.
+    /// `respond_to`, if set, resolves when no children remain (caller should
+    /// time-bound the wait).
     TeardownSession {
+        parent_session_id: String,
+        respond_to: Option<oneshot::Sender<()>>,
+    },
+    /// Re-open Task spawns for a parent session after a prior ParentSession stop.
+    /// Emitted at the start of each user turn so Stop's late-spawn gate does not
+    /// permanently block the next prompt.
+    OpenSpawnAdmission {
         parent_session_id: String,
     },
     Outstanding(SubagentOutstandingRequest),

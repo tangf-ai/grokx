@@ -41,7 +41,7 @@ pub struct InstallOutcome {
 /// Classify an install source as local (filesystem) vs git (remote) without
 /// installing — used for telemetry `install_kind` on the failure path, where no
 /// [`InstallOutcome`] is available.
-pub fn install_source_is_local(source: &str, cwd: &Path) -> bool {
+pub(crate) fn install_source_is_local(source: &str, cwd: &Path) -> bool {
     matches!(
         git_install::parse_install_source(source, cwd),
         git_install::InstallSource::Local { .. }
@@ -346,7 +346,7 @@ pub fn update_plugins(name: Option<&str>) -> Result<Vec<RepoUpdateOutcome>, Upda
     update_plugins_by_selector(name.map(|name| PluginUpdateSelector::PluginName(name.to_string())))
 }
 
-pub fn update_plugins_by_selector(
+pub(crate) fn update_plugins_by_selector(
     selector: Option<PluginUpdateSelector>,
 ) -> Result<Vec<RepoUpdateOutcome>, UpdateError> {
     let mut registry = InstallRegistry::load();
@@ -704,16 +704,23 @@ fn bullet_list(items: &[String]) -> String {
 }
 
 /// The require-sha pin policy for remote plugin code. Disk-only config + env,
-/// both tighten-only: a remote campaign overlay must not be able to relax a
-/// local security policy, and an unreadable config falls back to the env knob.
-pub fn marketplace_require_sha() -> bool {
-    xai_grok_config::load_effective_config_disk_only()
-        .map(|c| xai_grok_plugin_marketplace::load_require_sha(&c))
+/// both tighten-only: neither a remote campaign nor the `GROK_CONFIG` /
+/// `GROK_CONFIG_PATH` overlay must be able to relax a local security policy, and
+/// an unreadable config falls back to the env knob. Read from the overlay-free
+/// layer merge (the overlay-free contract in `ConfigLayers::env_overlay`) so an
+/// overlay `require_sha = false` cannot defeat a disk-set `true`.
+pub(crate) fn marketplace_require_sha() -> bool {
+    xai_grok_config::ConfigLayers::load()
+        .map(|layers| {
+            xai_grok_plugin_marketplace::load_require_sha(
+                &layers.effective_config_base_without_overlay(),
+            )
+        })
         .unwrap_or_else(|_| xai_grok_plugin_marketplace::env_require_sha())
 }
 
 /// Marketplace sources from config.toml + settings JSON, unfiltered.
-pub fn load_marketplace_sources() -> Vec<MarketplaceSource> {
+pub(crate) fn load_marketplace_sources() -> Vec<MarketplaceSource> {
     let config = crate::config::load_effective_config()
         .ok()
         .unwrap_or(toml::Value::Table(toml::map::Map::new()));
@@ -725,7 +732,7 @@ pub fn load_marketplace_sources() -> Vec<MarketplaceSource> {
 /// Like [`load_marketplace_sources`] but drops git sources blocked by the
 /// managed `marketplace_allowlist`. Install paths must use this so policy
 /// cannot be bypassed.
-pub fn load_filtered_marketplace_sources() -> Vec<MarketplaceSource> {
+pub(crate) fn load_filtered_marketplace_sources() -> Vec<MarketplaceSource> {
     let allowlist =
         &xai_grok_workspace::permission::resolution::managed_settings().marketplace_allowlist;
     filter_sources_by_allowlist(load_marketplace_sources(), allowlist)

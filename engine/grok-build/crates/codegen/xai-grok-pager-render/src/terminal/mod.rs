@@ -17,8 +17,11 @@ pub mod kitty_keyboard;
 pub mod overlay;
 pub(crate) mod probe;
 pub mod term_version;
+pub mod tmux;
 pub mod tmux_probe;
 pub mod xtversion;
+
+pub use tmux::{passthrough_available, should_wrap_osc11, tmux_passthrough, tmux_passthrough_str};
 
 pub use embedded_editor::{EmbeddedEditor, embedded_editor_from_env};
 pub use hyperlinks::{
@@ -121,6 +124,16 @@ impl TerminalName {
         matches!(
             self,
             Self::VsCode | Self::Cursor | Self::Windsurf | Self::Zed
+        )
+    }
+
+    /// Terminals that embed xterm.js (Zed's terminal is alacritty-based and
+    /// is NOT one). The boundary for xterm.js-specific quirks, e.g. the
+    /// wedged button tracker that eats mouse releases.
+    pub fn is_xtermjs_embed(self) -> bool {
+        matches!(
+            self,
+            Self::VsCode | Self::Cursor | Self::Windsurf | Self::GrokDesktop
         )
     }
 

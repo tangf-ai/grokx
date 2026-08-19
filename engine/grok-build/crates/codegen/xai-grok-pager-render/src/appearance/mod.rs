@@ -15,6 +15,7 @@
 
 pub mod cache;
 mod config;
+pub mod follow_up_behavior;
 pub mod permission_cursor;
 pub mod render_mermaid;
 pub mod scroll_mode;
@@ -25,9 +26,9 @@ pub use config::{
     AnimationConfig, AppearanceConfig, BlockBackground, BlocksConfig, EditBlockConfig,
     ExecuteHeaderStyle, FollowIndicator, LayoutConfig, PromptConfig, PromptViewConfig,
     RawAltScreenMode, RawAppearanceConfig, RawTerminalConfig, ScrollConfig, ScrollbackConfig,
-    ScrollbarConfig, TodoBadgeFormat, TodoConfig, ToolBullet, ToolConfig,
-    persist_respect_manual_folds,
+    ScrollbarConfig, ToolBullet, ToolConfig, persist_respect_manual_folds,
 };
+pub use follow_up_behavior::FollowUpBehavior;
 pub use render_mermaid::RenderMermaid;
 pub use scroll_mode::ScrollMode;
 pub use text_selection::TextSelection;

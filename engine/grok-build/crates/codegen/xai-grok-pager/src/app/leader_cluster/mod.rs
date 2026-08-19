@@ -130,22 +130,7 @@ impl ClusterClient {
     /// The event loop's `process_effects`, minus terminal/auth-handle wiring
     /// (that fn is event_loop-private; this mirrors its body).
     fn process_effects(&mut self, effs: Vec<super::actions::Effect>) {
-        let flags = effects::SessionFlags {
-            plan_mode: self.app.plan_mode,
-            subagents: self.app.subagents,
-            ask_user: self.app.ask_user,
-            restore_code: self.app.restore_code,
-            agent_override: self.app.agent_override.clone(),
-            yolo_mode: self.app.default_yolo,
-            auto_mode: dispatch::effective_auto(
-                self.app.default_yolo,
-                matches!(self.app.current_ui.permission_mode.as_deref(), Some("auto")),
-            ),
-            chat_mode: self.app.chat_mode,
-            screen_mode_label: Some(self.app.screen_mode.meta_label()),
-            is_api_key_auth: self.app.is_api_key_auth,
-            resume_local_miss: self.app.resume_local_miss.clone(),
-        };
+        let flags = super::event_loop::session_flags_for_effects(&mut self.app, &effs);
         for eff in effs {
             let (_quit, _meta) = effects::execute(
                 eff,
@@ -533,7 +518,6 @@ impl PagerLeaderCluster {
         app.leader_mode = true;
         app.auth_state = AuthState::Done;
         app.trust_state = TrustState::Done;
-        app.project_picker_shown = true;
         app.cwd = self.workdir.path().to_path_buf();
 
         let (progress_tx, progress_rx) = tokio::sync::mpsc::unbounded_channel();

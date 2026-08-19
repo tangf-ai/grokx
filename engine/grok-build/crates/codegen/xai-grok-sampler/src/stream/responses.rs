@@ -338,6 +338,10 @@ pub(crate) fn stream_responses_tracked<'a>(
                         model_metadata: None,
                         retry_after_secs: None,
                         should_retry: None,
+                        error_code: response
+                            .error
+                            .as_ref()
+                            .map(|e| xai_grok_sampling_types::ApiErrorCode::parse(&e.code)),
                     };
                     yield SamplingEvent::Failed {
                         request_id: request_id.clone(),
@@ -347,14 +351,22 @@ pub(crate) fn stream_responses_tracked<'a>(
                 }
 
                 ResponseStreamEvent::ResponseError(error_event) => {
-                    let code = error_event.code.unwrap_or_else(|| "error".to_string());
-                    let error_message = format!("{}: {}", code, error_event.message);
+                    let error_message = format!(
+                        "{}: {}",
+                        error_event.code.as_deref().unwrap_or("error"),
+                        error_event.message
+                    );
                     let err = SamplingError::Api {
                         status: reqwest::StatusCode::INTERNAL_SERVER_ERROR,
                         message: error_message,
                         model_metadata: None,
                         retry_after_secs: None,
                         should_retry: None,
+                        // The wire code, absent when the event carried none.
+                        error_code: error_event
+                            .code
+                            .as_deref()
+                            .map(xai_grok_sampling_types::ApiErrorCode::parse),
                     };
                     yield SamplingEvent::Failed {
                         request_id: request_id.clone(),
@@ -381,6 +393,25 @@ pub(crate) fn stream_responses_tracked<'a>(
                 ResponseStreamEvent::ResponseWebSearchCallCompleted(_)
                 | ResponseStreamEvent::ResponseWebSearchCallSearching(_) => {}
 
+                // Code interpreter (server-side, like web/x search). Surface it
+                // the same way x_search is: a generic backend tool call that the
+                // shell renders as a client `tool_use` + `user` `tool_result`
+                // split (grok has no HostedTool::CodeInterpreter, so these events
+                // are latent under the current hosted-tool set). The started
+                // event fires on InProgress; the full payload (code + outputs)
+                // rides ResponseOutputItemDone(CodeInterpreterCall) below.
+                ResponseStreamEvent::ResponseCodeInterpreterCallInProgress(ev) => {
+                    yield SamplingEvent::BackendToolCallStarted {
+                        request_id: request_id.clone(),
+                        call_id: ev.item_id.clone(),
+                        name: "code_interpreter".to_string(),
+                    };
+                }
+                // Interpreting/Completed carry no payload — the result arrives
+                // via ResponseOutputItemDone(CodeInterpreterCall) below.
+                ResponseStreamEvent::ResponseCodeInterpreterCallInterpreting(_)
+                | ResponseStreamEvent::ResponseCodeInterpreterCallCompleted(_) => {}
+
                 // OutputItemDone carries the full result for backend tools.
                 // For WebSearchCall this includes the query and source URLs.
                 // For CustomToolCall this includes x_search results.
@@ -406,6 +437,19 @@ pub(crate) fn stream_responses_tracked<'a>(
                                 request_id: request_id.clone(),
                                 call_id: ct.id.clone(),
                                 name: "x_search".to_string(),
+                                result,
+                            };
+                        }
+                        // Code interpreter: the full call (code + outputs) rides
+                        // the done item. Surfaced under the shared "code_interpreter"
+                        // name (matching the Started event); the shell renders it via
+                        // the client `tool_use` + `user` `tool_result` split.
+                        rs::OutputItem::CodeInterpreterCall(ci) => {
+                            let result = serde_json::to_value(ci).ok();
+                            yield SamplingEvent::BackendToolCallCompleted {
+                                request_id: request_id.clone(),
+                                call_id: ci.id.clone(),
+                                name: "code_interpreter".to_string(),
                                 result,
                             };
                         }
@@ -458,6 +502,8 @@ pub(crate) fn stream_responses_tracked<'a>(
                     model_metadata: None,
                     retry_after_secs: None,
                     should_retry: None,
+                    // Synthesized client-side; no wire envelope to read.
+                    error_code: None,
                 };
                 yield SamplingEvent::Failed {
                     request_id: request_id.clone(),
@@ -485,6 +531,7 @@ pub(crate) fn stream_responses_tracked<'a>(
             total_tokens: u.total_tokens,
             reasoning_tokens: u.output_tokens_details.reasoning_tokens,
             cached_prompt_tokens: u.input_tokens_details.cached_tokens,
+            cache_creation_prompt_tokens: 0,
         });
 
         let cost_usd_ticks = response
@@ -543,6 +590,9 @@ pub(crate) fn stream_responses_tracked<'a>(
             message_chunks_emitted: message_chunk_count,
             doom_loop_signals,
             stop_message: None, // not reported on the Responses API
+            message_id: None,   // no provider message id on the Responses API
+            raw_stop_reason: None,
+            stop_sequence: None,
         };
 
         yield SamplingEvent::Completed {
@@ -726,6 +776,46 @@ mod tests {
                 assert_eq!(error.kind, crate::events::SamplingErrorKind::Api);
                 assert_eq!(error.status_code, Some(500));
                 assert!(error.message.contains("boom"));
+                // The wire code passes through verbatim — dropping it here
+                // would disable strip recovery for coded Responses failures.
+                assert_eq!(
+                    error.error_code,
+                    Some(xai_grok_sampling_types::ApiErrorCode::Other(
+                        "server_error".into()
+                    ))
+                );
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    /// A coded `error` event must carry its code into the Failed info —
+    /// this is the whole mid-stream strip-recovery chain for the Responses
+    /// backend (the synthesized 500 + code classifies as an image error).
+    #[tokio::test]
+    async fn response_error_event_carries_code_into_failed() {
+        let error_event = rs::ResponseStreamEvent::ResponseError(rs_types::ResponseErrorEvent {
+            sequence_number: 0,
+            code: Some(xai_grok_sampling_types::INVALID_IMAGE_ERROR_CODE.into()),
+            message: "could not decode image".into(),
+            param: None,
+        });
+        let raw = stream::iter(vec![Ok(error_event)]).boxed();
+        let events = collect(stream_responses(
+            raw,
+            None,
+            rid(),
+            Duration::from_secs(60),
+            None,
+        ))
+        .await;
+
+        match events.last().unwrap() {
+            SamplingEvent::Failed { error, .. } => {
+                assert_eq!(
+                    error.error_code,
+                    Some(xai_grok_sampling_types::ApiErrorCode::InvalidImage)
+                );
             }
             other => panic!("expected Failed, got {other:?}"),
         }
@@ -872,6 +962,67 @@ mod tests {
         .await;
 
         assert!(output_observed.load(Ordering::Relaxed));
+    }
+
+    /// A server-side code-interpreter run surfaces as a generic backend tool
+    /// call (started on InProgress, completed on OutputItemDone) named
+    /// "code_interpreter" — the same shape as x_search — so it is no longer
+    /// silently dropped from the event stream.
+    #[tokio::test]
+    async fn code_interpreter_forwards_backend_tool_call() {
+        let in_progress = rs::ResponseStreamEvent::ResponseCodeInterpreterCallInProgress(
+            rs_types::ResponseCodeInterpreterCallInProgressEvent {
+                sequence_number: 0,
+                output_index: 0,
+                item_id: "ci-1".into(),
+            },
+        );
+        let done = rs::ResponseStreamEvent::ResponseOutputItemDone(
+            rs_types::ResponseOutputItemDoneEvent {
+                sequence_number: 1,
+                output_index: 0,
+                item: rs_types::OutputItem::CodeInterpreterCall(
+                    rs_types::CodeInterpreterToolCall {
+                        code: Some("print(1)".into()),
+                        container_id: "cont-1".into(),
+                        id: "ci-1".into(),
+                        outputs: None,
+                        status: rs_types::CodeInterpreterToolCallStatus::Completed,
+                    },
+                ),
+            },
+        );
+        let raw = stream::iter(vec![Ok(in_progress), Ok(done), Ok(completed_event())]).boxed();
+        let events = collect(stream_responses(
+            raw,
+            None,
+            rid(),
+            Duration::from_secs(60),
+            None,
+        ))
+        .await;
+
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                SamplingEvent::BackendToolCallStarted { call_id, name, .. }
+                    if call_id == "ci-1" && name == "code_interpreter"
+            )),
+            "expected a code_interpreter BackendToolCallStarted, got {events:?}"
+        );
+        let completed = events.iter().find_map(|e| match e {
+            SamplingEvent::BackendToolCallCompleted {
+                call_id,
+                name,
+                result,
+                ..
+            } if name == "code_interpreter" => Some((call_id.clone(), result.clone())),
+            _ => None,
+        });
+        let (call_id, result) = completed.expect("a code_interpreter BackendToolCallCompleted");
+        assert_eq!(call_id, "ci-1");
+        let result = result.expect("serialized code-interpreter payload");
+        assert_eq!(result["code"], "print(1)");
     }
 
     fn function_call_added_event(

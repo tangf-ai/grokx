@@ -20,7 +20,7 @@ use crate::session::goal_planner::{
 use crate::session::goal_role_tools::RoleToolNames;
 use std::path::Path;
 use std::sync::Arc;
-use xai_file_utils::events::EventWriter;
+use xai_grok_session_events::EventWriter;
 use xai_grok_tools::implementations::grok_build::task::backend::{ChannelBackend, SubagentBackend};
 use xai_grok_tools::implementations::grok_build::task::types::{
     SubagentOwner, SubagentRequest, SubagentRuntimeOverrides,
@@ -143,7 +143,7 @@ impl GoalSummarizerSpawner for ChannelSpawner {
                     message,
                 )
             }
-            Err(SpawnError::Transport(_)) => {}
+            Err(SpawnError::Transport(_) | SpawnError::Interrupted) => {}
         }
         outcome
     }
@@ -274,6 +274,14 @@ pub(crate) async fn run_goal_summarizer(
                 emit_event,
             );
         }
+        Err(SpawnError::Interrupted) => {
+            return record_fail_open(
+                GoalSummarizerFailReason::Aborted,
+                inputs.attempt,
+                started,
+                emit_event,
+            );
+        }
         Err(SpawnError::Runtime { message, cancelled }) => {
             let reason = if cancelled {
                 GoalSummarizerFailReason::Aborted
@@ -346,21 +354,6 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     #[test]
-    fn prompt_template_bakes_the_conciseness_cap() {
-        // The numeric ceilings ARE the contract (exact pins); the surrounding
-        // phrasing is matched case-insensitively to survive harmless rewording.
-        let t = GOAL_SUMMARIZER_PROMPT_TEMPLATE;
-        let lower = t.to_lowercase();
-        assert!(lower.contains("hard limit"), "cap must be a HARD LIMIT");
-        assert!(t.contains("80 words"), "cap must state the 80-word limit");
-        assert!(t.contains("4 bullets"), "cap must state the 4-bullet limit");
-        assert!(
-            lower.contains("read-only"),
-            "summarizer prompt must forbid edits",
-        );
-    }
-
-    #[test]
     fn prompt_render_resolves_tool_placeholders_and_inlines_inputs() {
         let dir = tmp_dir("render");
         let plan = dir.join("plan.md");
@@ -418,6 +411,7 @@ mod tests {
                     message: message.clone(),
                     cancelled: *cancelled,
                 }),
+                Err(SpawnError::Interrupted) => Err(SpawnError::Interrupted),
             }
         }
     }

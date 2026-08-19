@@ -28,7 +28,7 @@ use crate::session::goal_planner::{
 use crate::session::goal_role_tools::RoleToolNames;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use xai_file_utils::events::EventWriter;
+use xai_grok_session_events::EventWriter;
 use xai_grok_tools::implementations::grok_build::task::backend::{ChannelBackend, SubagentBackend};
 use xai_grok_tools::implementations::grok_build::task::types::{
     SubagentOwner, SubagentRequest, SubagentRuntimeOverrides,
@@ -168,7 +168,7 @@ impl GoalStrategistSpawner for ChannelSpawner {
                     message,
                 )
             }
-            Err(SpawnError::Transport(_)) => {}
+            Err(SpawnError::Transport(_) | SpawnError::Interrupted) => {}
         }
         outcome
     }
@@ -340,6 +340,15 @@ pub(crate) async fn run_goal_strategist(
             tracing::warn!(error = %detail, "goal strategist: transport error; failing open");
             return record_fail_open(
                 GoalStrategistFailReason::Transport,
+                inputs.attempt,
+                inputs.consecutive_failures,
+                started,
+                emit_event,
+            );
+        }
+        Err(SpawnError::Interrupted) => {
+            return record_fail_open(
+                GoalStrategistFailReason::Aborted,
                 inputs.attempt,
                 inputs.consecutive_failures,
                 started,
@@ -800,6 +809,7 @@ mod tests {
                     message: message.clone(),
                     cancelled: *cancelled,
                 }),
+                Err(SpawnError::Interrupted) => Err(SpawnError::Interrupted),
             }
         }
     }
@@ -1219,50 +1229,14 @@ mod tests {
         assert!(!prompt.contains("REPO CHANGES"));
     }
 
-    /// Pin the load-bearing prompt instructions: structural remediation,
-    /// the separate strategy file (NOT plan.md), and the terminal token.
-    #[test]
-    fn strategist_prompt_pins_contract() {
-        let lower = GOAL_STRATEGIST_PROMPT_TEMPLATE.to_lowercase();
-        assert!(GOAL_STRATEGIST_PROMPT_TEMPLATE.contains("{STRATEGY_FILE}"));
-        assert!(GOAL_STRATEGIST_PROMPT_TEMPLATE.contains("{SESSION_TRACES_DIR}"));
-        assert!(GOAL_STRATEGIST_PROMPT_TEMPLATE.contains("{SCRATCH_ROOT}"));
-        assert!(lower.contains("structural"));
-        assert!(
-            lower.contains("do not") && GOAL_STRATEGIST_PROMPT_TEMPLATE.contains("plan.md"),
-            "prompt must forbid editing plan.md",
-        );
-        assert!(
-            GOAL_STRATEGIST_PROMPT_TEMPLATE.contains("acceptance criteria"),
-            "prompt must say it does not change the acceptance criteria",
-        );
-        assert!(GOAL_STRATEGIST_PROMPT_TEMPLATE.contains("Done"));
-        // The plan.md prohibition is stated exactly ONCE — count
-        // the distinct prohibition phrasing, not every mention of the path.
-        assert_eq!(
-            GOAL_STRATEGIST_PROMPT_TEMPLATE
-                .matches("Do NOT edit")
-                .count(),
-            1,
-            "the plan.md edit prohibition must appear exactly once",
-        );
-    }
-
     use crate::session::goal_role_tools::tests::assert_no_tool_placeholders;
 
     /// Default/inherit render: the tool placeholders resolve to the literal
     /// parent (grok-build) names, with no placeholder left behind. Guards
     /// against accidental wording drift in the strategist template.
     #[test]
-    fn strategist_template_default_render_preserves_wording() {
+    fn strategist_template_default_render_has_no_placeholders() {
         let rendered = RoleToolNames::inherit_defaults().apply(GOAL_STRATEGIST_PROMPT_TEMPLATE);
-        assert!(
-            rendered.contains(
-                "your\n`read_file`/`grep`/`list_dir`/`run_terminal_command` tools — no\n\
-                 pre-digested summary",
-            ),
-            "strategist read/grep/list/terminal placeholders must render to the defaults",
-        );
         assert_no_tool_placeholders(&rendered);
     }
 

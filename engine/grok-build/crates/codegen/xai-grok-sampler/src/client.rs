@@ -21,15 +21,19 @@ use reqwest::header::{
 };
 use serde::Serialize;
 
-use xai_grok_sampling_types::error::{try_parse_stream_error, user_facing_api_error_message};
+use xai_grok_sampling_types::error::{
+    parse_error_code, try_parse_stream_error, user_facing_api_error_message,
+};
 use xai_grok_sampling_types::{
     ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, ConversationRequest,
     ConversationResponse, CreateResponseWrapper, DOOM_LOOP_CHECK_HEADER, MessagesRequestWrapper,
-    ResponseModelMetadata, Result, SamplingError, build_messages_request, is_check_event, messages,
-    rs,
+    ResponseModelMetadata, Result, SamplingError, SentCredential, build_messages_request,
+    is_check_event, messages, rs,
 };
 
 use crate::config::{AuthScheme, OriginClientInfo, SamplerConfig};
+use crate::events::SamplingErrorInfo;
+use xai_grok_auth::bearer_suffix;
 
 // Re-export ApiBackend from the shared types crate for downstream callers.
 pub use xai_grok_sampling_types::ApiBackend;
@@ -204,6 +208,26 @@ fn record_stream_request_failure(err: &reqwest::Error) {
     span.record("error", err.to_string().as_str());
 }
 
+/// Splice the raw-JSON hosted-tool entries for `web_search` and `x_search` into a serialized
+/// Responses request body's `tools` array. `x_search` has no `rs::Tool` variant at all, and
+/// `web_search` has one whose typed filters cannot carry `excluded_domains`, so both travel as raw
+/// JSON and neither may also be emitted as a typed `rs::Tool` (the API rejects the duplicate).
+/// Shared by the streaming (`create_response_stream`) and non-streaming (`create_response`) paths
+/// so neither can silently drop these tools.
+fn splice_extra_tool_entries(
+    request_body: &mut serde_json::Value,
+    entries: Vec<serde_json::Value>,
+) {
+    if entries.is_empty() {
+        return;
+    }
+    if let Some(tools) = request_body.get_mut("tools").and_then(|v| v.as_array_mut()) {
+        tools.extend(entries);
+    } else {
+        request_body["tools"] = serde_json::Value::Array(entries);
+    }
+}
+
 fn extract_retry_after(headers: &reqwest::header::HeaderMap) -> Option<u64> {
     headers
         .get(reqwest::header::RETRY_AFTER)
@@ -271,6 +295,30 @@ struct StreamingChatRequest<'a> {
 #[derive(Serialize)]
 struct StreamOptions {
     include_usage: bool,
+}
+
+fn append_response_includes(body: &mut serde_json::Value, extra_includes: &[String]) {
+    if extra_includes.is_empty() {
+        return;
+    }
+    let Some(body) = body.as_object_mut() else {
+        return;
+    };
+    let include = body.entry("include").or_insert(serde_json::Value::Null);
+    if include.is_null() {
+        *include = serde_json::Value::Array(Vec::new());
+    }
+    let Some(include) = include.as_array_mut() else {
+        return;
+    };
+    for value in extra_includes {
+        if !include
+            .iter()
+            .any(|existing| existing.as_str() == Some(value.as_str()))
+        {
+            include.push(serde_json::Value::String(value.clone()));
+        }
+    }
 }
 
 /// Resolve `env_http_headers` (`header -> env var`) into `headers` via `getenv`, skipping unset/blank/invalid entries and trimming values.
@@ -347,6 +395,7 @@ struct ClientDefaults {
     api_backend: ApiBackend,
     auth_scheme: AuthScheme,
     stream_tool_calls: bool,
+    extra_response_includes: Vec<String>,
     doom_loop_recovery: Option<xai_grok_sampling_types::DoomLoopRecoveryPolicy>,
 }
 
@@ -487,6 +536,28 @@ pub fn user_agent_string_for(origin: &OriginClientInfo) -> String {
     }
 }
 
+/// A request builder coupled to the credential state it was built with, so
+/// a 401 arm cannot classify from anything but the build-time capture. The
+/// wire default (`SentCredential::Unknown`, which charges the retry budget)
+/// stays the fail-closed one; only an explicit `sent_bearer: None` — a send
+/// the builder provably stamped no credential onto — reaches the uncharged
+/// lane via [`auth_rejected`].
+struct SentRequest {
+    builder: reqwest::RequestBuilder,
+    /// Tail fragment of the credential in the built headers (`None` = no
+    /// credential header at all).
+    sent_bearer: Option<String>,
+}
+
+/// The one way a 401 becomes a `SamplingError::Auth` with a wire-derived
+/// credential classification: from the fragment its [`SentRequest`] captured.
+fn auth_rejected(message: String, sent_bearer: Option<&str>) -> SamplingError {
+    SamplingError::Auth {
+        message,
+        credential: SentCredential::from_sent_fragment(sent_bearer),
+    }
+}
+
 // =============================================================================
 // SamplingClient
 // =============================================================================
@@ -509,9 +580,8 @@ impl SamplingClient {
                             api_key = %api_key,
                             "Invalid api_key: cannot be converted to a valid HTTP header"
                         );
-                        SamplingError::Auth(
-                            "Invalid api_key: cannot be converted to a valid HTTP header"
-                                .to_string(),
+                        SamplingError::auth_unknown(
+                            "Invalid api_key: cannot be converted to a valid HTTP header",
                         )
                     })?;
                     headers.insert(HeaderName::from_static("x-api-key"), header_value);
@@ -523,9 +593,8 @@ impl SamplingClient {
                             api_key = %api_key,
                             "Invalid api_key: cannot be converted to a valid HTTP Authorization header"
                         );
-                        SamplingError::Auth(
-                            "Invalid api_key: cannot be converted to a valid HTTP Authorization header"
-                                .to_string(),
+                        SamplingError::auth_unknown(
+                            "Invalid api_key: cannot be converted to a valid HTTP Authorization header",
                         )
                     })?;
                     headers.insert(AUTHORIZATION, header_value);
@@ -635,6 +704,7 @@ impl SamplingClient {
             api_backend: config.api_backend,
             auth_scheme: config.auth_scheme,
             stream_tool_calls: config.stream_tool_calls,
+            extra_response_includes: config.extra_response_includes,
             doom_loop_recovery: config.doom_loop_recovery,
         };
 
@@ -657,10 +727,15 @@ impl SamplingClient {
         self.defaults.api_backend.clone()
     }
 
-    /// POST with default headers. When a bearer_resolver is wired it is the
-    /// sole auth source: a missing live bearer strips default Authorization /
-    /// x-api-key so a hard-expired seed key cannot ride on the wire.
-    fn post(&self, url: impl reqwest::IntoUrl) -> reqwest::RequestBuilder {
+    /// POST with default headers, returning the builder coupled to the tail
+    /// fragment of the credential actually placed in its headers (`None` =
+    /// no credential) — captured at build time because a record-time
+    /// re-read races with the recovery a 401 triggers.
+    ///
+    /// A wired bearer_resolver is the sole auth source: a missing live
+    /// bearer strips default Authorization / x-api-key so a hard-expired
+    /// seed key cannot ride on the wire.
+    fn post(&self, url: impl reqwest::IntoUrl) -> SentRequest {
         let mut headers = self.default_headers.clone();
         if let Some(resolver) = &self.bearer_resolver {
             headers.remove(AUTHORIZATION);
@@ -703,55 +778,45 @@ impl SamplingClient {
                 x_api_key_prefix = x_api_key_prefix.as_deref().unwrap_or("none"),
             );
         }
+        let sent_bearer = Self::sent_fragment_from_headers(&headers, &self.defaults.auth_scheme);
         if let Some(injector) = &self.header_injector {
             injector.inject(&mut headers);
         }
-        self.http.post(url).headers(headers)
+        SentRequest {
+            builder: self.http.post(url).headers(headers),
+            sent_bearer,
+        }
     }
 
-    /// Bearer prefix for 401 attribution. When a resolver is wired it is
-    /// authoritative (including `None` ⇒ nothing was sent). Without a resolver,
-    /// fall back to construction-time default headers.
-    fn current_sent_bearer_prefix(&self) -> Option<String> {
+    /// Tail fragment of the credential in `headers` — `x-api-key`
+    /// (Messages-API scheme) or `Authorization` — per
+    /// [`crate::attribution::BEARER_SUFFIX_LEN`].
+    fn sent_fragment_from_headers(headers: &HeaderMap, scheme: &AuthScheme) -> Option<String> {
+        let raw = match scheme {
+            AuthScheme::XApiKey => headers
+                .get(HeaderName::from_static("x-api-key"))
+                .and_then(|v| v.to_str().ok()),
+            AuthScheme::Bearer => headers
+                .get(AUTHORIZATION)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.strip_prefix("Bearer ")),
+        };
+        raw.map(|s| bearer_suffix(s).to_string())
+    }
+
+    /// Best-effort *build-time* view of what the next request would carry
+    /// (resolver-authoritative). For request-start diagnostics
+    /// ([`Self::auth_info`]) only — 401 attribution must use the fragment
+    /// captured by [`Self::post`] instead, which cannot race a recovery.
+    fn current_sent_bearer_suffix(&self) -> Option<String> {
         if self.bearer_resolver.is_some() {
             return self
                 .bearer_resolver
                 .as_ref()
                 .and_then(|r| r.current_bearer())
-                .map(|mut s| {
-                    s.truncate(crate::attribution::SENT_BEARER_PREFIX_LEN.min(s.len()));
-                    s
-                });
+                .map(|s| bearer_suffix(&s).to_string());
         }
-        self.extract_sent_bearer()
-    }
-
-    /// Extract the bearer from `default_headers`, truncated to prefix length.
-    /// Reads `x-api-key` (Anthropic Messages API) or `Authorization` (OpenAI-completions).
-    fn extract_sent_bearer(&self) -> Option<String> {
-        let raw = match self.defaults.auth_scheme {
-            AuthScheme::XApiKey => self
-                .default_headers
-                .get(HeaderName::from_static("x-api-key"))
-                .and_then(|v| v.to_str().ok())
-                .map(|s| s.to_string()),
-            AuthScheme::Bearer => self
-                .default_headers
-                .get(AUTHORIZATION)
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.strip_prefix("Bearer "))
-                .map(|s| s.to_string()),
-        };
-        raw.map(|mut s| {
-            // Truncate in-place so we never materialize a heap-resident
-            // copy of the full bearer outside the local stack of this
-            // function. `String::truncate` operates on byte indices and
-            // panics on a non-char-boundary cut; bearer tokens are
-            // ASCII (per the `Authorization` and `x-api-key` header
-            // grammars) so the byte index is always safe.
-            s.truncate(crate::attribution::SENT_BEARER_PREFIX_LEN.min(s.len()));
-            s
-        })
+        Self::sent_fragment_from_headers(&self.default_headers, &self.defaults.auth_scheme)
     }
 
     /// Invoke the optional 401 attribution callback for one logical
@@ -761,20 +826,21 @@ impl SamplingClient {
     /// that saw the status, so higher layers that react to a 401 must
     /// not emit a duplicate event.
     ///
-    /// The bearer passed to the callback is already truncated to
-    /// [`crate::attribution::SENT_BEARER_PREFIX_LEN`] characters by
-    /// [`Self::extract_sent_bearer`]; the trait contract guarantees
-    /// that callers downstream of this crate never see the full
-    /// bearer.
-    fn record_401_attribution(&self, consumer: crate::attribution::SamplingConsumer) {
+    /// `sent_suffix` is the fragment [`Self::post`] captured for the
+    /// rejected request (already tail-truncated; the full bearer never
+    /// crosses this boundary).
+    fn record_401_attribution(
+        &self,
+        consumer: crate::attribution::SamplingConsumer,
+        sent_suffix: Option<&str>,
+    ) {
         if let Some(cb) = self.attribution_callback.as_ref() {
-            let sent_prefix = self.current_sent_bearer_prefix();
-            cb.record_401(consumer, sent_prefix.as_deref());
+            cb.record_401(consumer, sent_suffix);
         }
     }
 
     pub fn auth_info(&self) -> crate::sampling_log::AuthInfo {
-        let auth_prefix = self.current_sent_bearer_prefix();
+        let auth_prefix = self.current_sent_bearer_suffix();
         let auth_type = match (&self.defaults.auth_scheme, &auth_prefix) {
             (AuthScheme::XApiKey, Some(_)) => "x-api-key",
             (AuthScheme::Bearer, Some(_)) => "bearer",
@@ -842,7 +908,13 @@ impl SamplingClient {
         Ok(request)
     }
 
-    async fn handle_response(&self, response: reqwest::Response) -> Result<ChatCompletionResponse> {
+    /// `sent_bearer` is the fragment [`Self::post`] captured for the
+    /// request that produced `response` (401 attribution).
+    async fn handle_response(
+        &self,
+        response: reqwest::Response,
+        sent_bearer: Option<&str>,
+    ) -> Result<ChatCompletionResponse> {
         let status = response.status();
         let model_metadata = extract_model_metadata(response.headers());
         let retry_after_secs = extract_retry_after(response.headers());
@@ -851,11 +923,15 @@ impl SamplingClient {
 
         if !status.is_success() {
             if status == reqwest::StatusCode::UNAUTHORIZED {
-                self.record_401_attribution(crate::attribution::SamplingConsumer::ChatCompletions);
+                self.record_401_attribution(
+                    crate::attribution::SamplingConsumer::ChatCompletions,
+                    sent_bearer,
+                );
                 let server_message = user_facing_api_error_message(status, bytes.as_ref());
-                return Err(SamplingError::Auth(format!(
-                    "Unauthorized (401): {server_message}"
-                )));
+                return Err(auth_rejected(
+                    format!("Unauthorized (401): {server_message}"),
+                    sent_bearer,
+                ));
             }
             let message = user_facing_api_error_message(status, bytes.as_ref());
             return Err(SamplingError::Api {
@@ -864,6 +940,7 @@ impl SamplingClient {
                 model_metadata,
                 retry_after_secs,
                 should_retry,
+                error_code: parse_error_code(bytes.as_ref()),
             });
         }
 
@@ -908,9 +985,11 @@ impl SamplingClient {
             deployment_id: payload.x_grok_deployment_id.as_deref(),
             user_id: payload.x_grok_user_id.as_deref(),
         };
-        let http_request = grok_headers
-            .apply(self.post(self.endpoint("chat/completions")))
-            .json(&payload);
+        let SentRequest {
+            builder,
+            sent_bearer,
+        } = self.post(self.endpoint("chat/completions"));
+        let http_request = grok_headers.apply(builder).json(&payload);
 
         let response = http_request.send().await.map_err(|e| {
             // Log at debug level; errors are surfaced to the caller.
@@ -918,7 +997,7 @@ impl SamplingClient {
             e
         })?;
 
-        self.handle_response(response).await
+        self.handle_response(response, sent_bearer.as_deref()).await
     }
 
     /// Start a streaming chat completion request. Returns a stream of typed chunks.
@@ -966,8 +1045,12 @@ impl SamplingClient {
             deployment_id: payload.x_grok_deployment_id.as_deref(),
             user_id: payload.x_grok_user_id.as_deref(),
         };
+        let SentRequest {
+            builder,
+            sent_bearer,
+        } = self.post(self.endpoint("chat/completions"));
         let http_request = grok_headers
-            .apply(self.post(self.endpoint("chat/completions")))
+            .apply(builder)
             .header(ACCEPT, HeaderValue::from_static("text/event-stream"))
             .json(&streaming_request);
 
@@ -1001,13 +1084,15 @@ impl SamplingClient {
                 span.record("error", "unauthorized (401)");
                 self.record_401_attribution(
                     crate::attribution::SamplingConsumer::ChatCompletionsStream,
+                    sent_bearer.as_deref(),
                 );
                 let endpoint = self.endpoint("chat/completions");
                 let body = response.bytes().await.unwrap_or_default();
                 let server_message = user_facing_api_error_message(status, body.as_ref());
-                return Err(SamplingError::Auth(format!(
-                    "Unauthorized (401) from {endpoint}: {server_message}"
-                )));
+                return Err(auth_rejected(
+                    format!("Unauthorized (401) from {endpoint}: {server_message}"),
+                    sent_bearer.as_deref(),
+                ));
             }
 
             let bytes = response.bytes().await?;
@@ -1026,6 +1111,7 @@ impl SamplingClient {
                 model_metadata,
                 retry_after_secs,
                 should_retry,
+                error_code: parse_error_code(bytes.as_ref()),
             });
         }
 
@@ -1170,18 +1256,23 @@ impl SamplingClient {
             deployment_id: request.x_grok_deployment_id.as_deref(),
             user_id: request.x_grok_user_id.as_deref(),
         };
+        let extra_tool_entries = std::mem::take(&mut request.extra_tool_entries);
         let mut request_body = serde_json::to_value(&request.inner).map_err(|e| {
             tracing::error!("Failed to serialize responses request: {}", e);
             SamplingError::Serialization(e)
         })?;
+        splice_extra_tool_entries(&mut request_body, extra_tool_entries);
+        append_response_includes(&mut request_body, &self.defaults.extra_response_includes);
         // async-openai's ReasoningTextContent struct omits the `type`
         // discriminator that the Responses API requires on input. Patch
         // it in post-serialize. This is the last surviving piece of the
         // old raw_output machinery.
         xai_grok_sampling_types::patch_reasoning_text_types(&mut request_body);
-        let http_request = grok_headers
-            .apply(self.post(self.endpoint("responses")))
-            .json(&request_body);
+        let SentRequest {
+            builder,
+            sent_bearer,
+        } = self.post(self.endpoint("responses"));
+        let http_request = grok_headers.apply(builder).json(&request_body);
 
         let response = http_request.send().await.map_err(|e| {
             tracing::debug!("HTTP request failed: {}", e);
@@ -1196,12 +1287,16 @@ impl SamplingClient {
 
         if !status.is_success() {
             if status == reqwest::StatusCode::UNAUTHORIZED {
-                self.record_401_attribution(crate::attribution::SamplingConsumer::Responses);
+                self.record_401_attribution(
+                    crate::attribution::SamplingConsumer::Responses,
+                    sent_bearer.as_deref(),
+                );
                 let endpoint = self.endpoint("responses");
                 let server_message = user_facing_api_error_message(status, bytes.as_ref());
-                return Err(SamplingError::Auth(format!(
-                    "Unauthorized (401) from {endpoint}: {server_message}"
-                )));
+                return Err(auth_rejected(
+                    format!("Unauthorized (401) from {endpoint}: {server_message}"),
+                    sent_bearer.as_deref(),
+                ));
             }
 
             let message = user_facing_api_error_message(status, bytes.as_ref());
@@ -1218,6 +1313,7 @@ impl SamplingClient {
                 model_metadata,
                 retry_after_secs,
                 should_retry,
+                error_code: parse_error_code(bytes.as_ref()),
             });
         }
 
@@ -1305,15 +1401,8 @@ impl SamplingClient {
         if self.defaults.stream_tool_calls {
             request_body["stream_tool_calls"] = serde_json::json!(true);
         }
-        // Inject xAI-specific tools (e.g., x_search) that can't be expressed
-        // via async_openai's rs::Tool enum.
-        if !extra_tool_entries.is_empty() {
-            if let Some(tools) = request_body.get_mut("tools").and_then(|v| v.as_array_mut()) {
-                tools.extend(extra_tool_entries);
-            } else {
-                request_body["tools"] = serde_json::Value::Array(extra_tool_entries);
-            }
-        }
+        splice_extra_tool_entries(&mut request_body, extra_tool_entries);
+        append_response_includes(&mut request_body, &self.defaults.extra_response_includes);
         xai_grok_sampling_types::patch_reasoning_text_types(&mut request_body);
         // Fresh per attempt so signals never leak across retries; `None`
         // (check disabled) sends no header and does no peek work per event.
@@ -1321,12 +1410,16 @@ impl SamplingClient {
             .defaults
             .doom_loop_recovery
             .map(crate::doom_loop::DoomLoopSignalCollector::new);
+        let SentRequest {
+            builder,
+            sent_bearer,
+        } = self.post(self.endpoint("responses"));
         let mut http_request = grok_headers
-            .apply(self.post(self.endpoint("responses")))
+            .apply(builder)
             .header(ACCEPT, HeaderValue::from_static("text/event-stream"));
-        if doom_loop.is_some() {
-            // Presence opts in; the server ignores the value.
-            http_request = http_request.header(DOOM_LOOP_CHECK_HEADER, "true");
+        if let Some(policy) = self.defaults.doom_loop_recovery {
+            http_request =
+                http_request.header(DOOM_LOOP_CHECK_HEADER, policy.window_tokens.to_string());
         }
         let http_request = http_request.json(&request_body);
 
@@ -1355,13 +1448,17 @@ impl SamplingClient {
         if !status.is_success() {
             if status == reqwest::StatusCode::UNAUTHORIZED {
                 span.record("error", "unauthorized (401)");
-                self.record_401_attribution(crate::attribution::SamplingConsumer::ResponsesStream);
+                self.record_401_attribution(
+                    crate::attribution::SamplingConsumer::ResponsesStream,
+                    sent_bearer.as_deref(),
+                );
                 let endpoint = self.endpoint("responses");
                 let body = response.bytes().await.unwrap_or_default();
                 let server_message = user_facing_api_error_message(status, body.as_ref());
-                return Err(SamplingError::Auth(format!(
-                    "Unauthorized (401) from {endpoint}: {server_message}"
-                )));
+                return Err(auth_rejected(
+                    format!("Unauthorized (401) from {endpoint}: {server_message}"),
+                    sent_bearer.as_deref(),
+                ));
             }
             let model_metadata = extract_model_metadata(response.headers());
             let retry_after_secs = extract_retry_after(response.headers());
@@ -1382,6 +1479,7 @@ impl SamplingClient {
                 model_metadata,
                 retry_after_secs,
                 should_retry,
+                error_code: parse_error_code(bytes.as_ref()),
             });
         }
 
@@ -1518,9 +1616,11 @@ impl SamplingClient {
             deployment_id: request.x_grok_deployment_id.as_deref(),
             user_id: request.x_grok_user_id.as_deref(),
         };
-        let http_request = grok_headers
-            .apply(self.post(self.endpoint("messages")))
-            .json(&request.inner);
+        let SentRequest {
+            builder,
+            sent_bearer,
+        } = self.post(self.endpoint("messages"));
+        let http_request = grok_headers.apply(builder).json(&request.inner);
 
         let response = http_request.send().await.map_err(|e| {
             tracing::debug!("HTTP request failed: {}", e);
@@ -1535,12 +1635,16 @@ impl SamplingClient {
 
         if !status.is_success() {
             if status == reqwest::StatusCode::UNAUTHORIZED {
-                self.record_401_attribution(crate::attribution::SamplingConsumer::Messages);
+                self.record_401_attribution(
+                    crate::attribution::SamplingConsumer::Messages,
+                    sent_bearer.as_deref(),
+                );
                 let endpoint = self.endpoint("messages");
                 let server_message = user_facing_api_error_message(status, bytes.as_ref());
-                return Err(SamplingError::Auth(format!(
-                    "Unauthorized (401) from {endpoint}: {server_message}"
-                )));
+                return Err(auth_rejected(
+                    format!("Unauthorized (401) from {endpoint}: {server_message}"),
+                    sent_bearer.as_deref(),
+                ));
             }
 
             let message = user_facing_api_error_message(status, bytes.as_ref());
@@ -1557,6 +1661,7 @@ impl SamplingClient {
                 model_metadata,
                 retry_after_secs,
                 should_retry,
+                error_code: parse_error_code(bytes.as_ref()),
             });
         }
 
@@ -1625,8 +1730,12 @@ impl SamplingClient {
             deployment_id: request.x_grok_deployment_id.as_deref(),
             user_id: request.x_grok_user_id.as_deref(),
         };
+        let SentRequest {
+            builder,
+            sent_bearer,
+        } = self.post(self.endpoint("messages"));
         let http_request = grok_headers
-            .apply(self.post(self.endpoint("messages")))
+            .apply(builder)
             .header(ACCEPT, HeaderValue::from_static("text/event-stream"))
             .json(&request.inner);
 
@@ -1655,13 +1764,17 @@ impl SamplingClient {
         if !status.is_success() {
             if status == reqwest::StatusCode::UNAUTHORIZED {
                 span.record("error", "unauthorized (401)");
-                self.record_401_attribution(crate::attribution::SamplingConsumer::MessagesStream);
+                self.record_401_attribution(
+                    crate::attribution::SamplingConsumer::MessagesStream,
+                    sent_bearer.as_deref(),
+                );
                 let endpoint = self.endpoint("messages");
                 let body = response.bytes().await.unwrap_or_default();
                 let server_message = user_facing_api_error_message(status, body.as_ref());
-                return Err(SamplingError::Auth(format!(
-                    "Unauthorized (401) from {endpoint}: {server_message}"
-                )));
+                return Err(auth_rejected(
+                    format!("Unauthorized (401) from {endpoint}: {server_message}"),
+                    sent_bearer.as_deref(),
+                ));
             }
             let model_metadata = extract_model_metadata(response.headers());
             let retry_after_secs = extract_retry_after(response.headers());
@@ -1682,6 +1795,7 @@ impl SamplingClient {
                 model_metadata,
                 retry_after_secs,
                 should_retry,
+                error_code: parse_error_code(bytes.as_ref()),
             });
         }
 
@@ -1845,8 +1959,8 @@ impl SamplingClient {
         let x_grok_turn_idx = request.x_grok_turn_idx.clone();
         let x_grok_agent_id = request.x_grok_agent_id.clone();
 
-        // Collect xAI-specific tools that can't be expressed via rs::Tool
-        // (e.g., x_search). These are injected as raw JSON after serialization.
+        // The hosted tools travel as raw JSON, spliced in after serialization by
+        // `splice_extra_tool_entries`, whose doc explains why each one does.
         let extra_tools = xai_grok_sampling_types::extra_tool_entries(&request.hosted_tools);
 
         let responses_request: rs::CreateResponse = (&request).into();
@@ -1882,6 +1996,10 @@ impl SamplingClient {
         let x_grok_turn_idx = request.x_grok_turn_idx.clone();
         let x_grok_agent_id = request.x_grok_agent_id.clone();
 
+        // The hosted tools travel as raw JSON, spliced in by `create_response` through
+        // `splice_extra_tool_entries`, whose doc explains why each one does.
+        let extra_tools = xai_grok_sampling_types::extra_tool_entries(&request.hosted_tools);
+
         let responses_request: rs::CreateResponse = (&request).into();
 
         let mut wrapper = CreateResponseWrapper::new(responses_request);
@@ -1890,6 +2008,7 @@ impl SamplingClient {
         wrapper.x_grok_session_id = x_grok_session_id;
         wrapper.x_grok_turn_idx = x_grok_turn_idx;
         wrapper.x_grok_agent_id = x_grok_agent_id;
+        wrapper.extra_tool_entries = extra_tools;
 
         if let Some(trace) = trace {
             wrapper.trace = Some(trace);
@@ -1993,24 +2112,108 @@ impl SamplingClient {
         };
         result
             .map(|(response, _metrics)| response)
-            .map_err(|info| SamplingError::Api {
-                status: info
-                    .status_code
-                    .and_then(|c| reqwest::StatusCode::from_u16(c).ok())
-                    .unwrap_or(reqwest::StatusCode::INTERNAL_SERVER_ERROR),
-                message: info.message,
-                model_metadata: info.model_metadata,
-                retry_after_secs: info.retry_after_secs,
-                should_retry: None,
-            })
+            .map_err(stream_collect_error)
+    }
+}
+
+/// Rebuild `Api` from stream-collected info, preserving status,
+/// `Retry-After`, and `x-should-retry` (kind is lost on this path).
+fn stream_collect_error(info: SamplingErrorInfo) -> SamplingError {
+    SamplingError::Api {
+        status: info
+            .status_code
+            .and_then(|c| reqwest::StatusCode::from_u16(c).ok())
+            .unwrap_or(reqwest::StatusCode::INTERNAL_SERVER_ERROR),
+        message: info.message,
+        model_metadata: info.model_metadata,
+        retry_after_secs: info.retry_after_secs,
+        should_retry: info.should_retry,
+        error_code: info.error_code,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{Router, body::Bytes, routing::post};
     use indexmap::IndexMap;
+    use tokio::net::TcpListener;
+    use tokio::sync::oneshot;
+    use xai_grok_sampling_types::ApiErrorCode;
     use xai_grok_sampling_types::types::ChatRequestMessage;
+
+    #[test]
+    fn splice_extra_tool_entries_extends_existing_tools_array() {
+        let mut body = serde_json::json!({ "tools": [{ "type": "function" }] });
+        splice_extra_tool_entries(&mut body, vec![serde_json::json!({ "type": "web_search" })]);
+        assert_eq!(
+            body["tools"],
+            serde_json::json!([{ "type": "function" }, { "type": "web_search" }])
+        );
+    }
+
+    #[test]
+    fn splice_extra_tool_entries_creates_tools_array_when_absent() {
+        let mut body = serde_json::json!({});
+        splice_extra_tool_entries(&mut body, vec![serde_json::json!({ "type": "web_search" })]);
+        assert_eq!(body["tools"], serde_json::json!([{ "type": "web_search" }]));
+    }
+
+    #[test]
+    fn splice_extra_tool_entries_noop_when_empty() {
+        let mut body = serde_json::json!({ "tools": [{ "type": "function" }] });
+        splice_extra_tool_entries(&mut body, vec![]);
+        assert_eq!(body["tools"], serde_json::json!([{ "type": "function" }]));
+    }
+
+    #[test]
+    fn stream_collect_error_preserves_should_retry() {
+        let info = SamplingErrorInfo {
+            kind: crate::events::SamplingErrorKind::Api,
+            status_code: Some(529),
+            message: "Overloaded".into(),
+            is_retryable: true,
+            retry_after_secs: Some(3),
+            should_retry: Some(false),
+            error_code: Some(ApiErrorCode::InvalidImage),
+            model_metadata: None,
+            empty_response_context: None,
+            doom_loop_triggers: None,
+            doom_loop_aborted_at_chunk: None,
+            credential: xai_grok_sampling_types::SentCredential::Unknown,
+        };
+        // SamplingError is not PartialEq (it carries reqwest/serde errors),
+        // so destructure once and compare all fields in a single assert.
+        let SamplingError::Api {
+            status,
+            message,
+            model_metadata,
+            retry_after_secs,
+            should_retry,
+            error_code,
+        } = stream_collect_error(info)
+        else {
+            panic!("expected Api");
+        };
+        assert_eq!(
+            (
+                status.as_u16(),
+                message.as_str(),
+                model_metadata.is_none(),
+                retry_after_secs,
+                should_retry,
+                error_code,
+            ),
+            (
+                529,
+                "Overloaded",
+                true,
+                Some(3),
+                Some(false),
+                Some(ApiErrorCode::InvalidImage)
+            ),
+        );
+    }
 
     fn minimal_config() -> SamplerConfig {
         SamplerConfig {
@@ -2023,6 +2226,7 @@ mod tests {
             api_backend: ApiBackend::ChatCompletions,
             auth_scheme: AuthScheme::Bearer,
             extra_headers: IndexMap::new(),
+            extra_response_includes: Vec::new(),
             query_params: IndexMap::new(),
             env_http_headers: IndexMap::new(),
             context_window: 8192,
@@ -2108,6 +2312,126 @@ mod tests {
 
         assert!(obj.get("max_tokens").is_none());
         assert!(obj.get("tools").is_none());
+    }
+
+    async fn capture_response_body(streaming: bool) -> serde_json::Value {
+        let (body_tx, body_rx) = oneshot::channel();
+        let body_tx = std::sync::Arc::new(std::sync::Mutex::new(Some(body_tx)));
+        let app = Router::new().route(
+            "/v1/responses",
+            post(move |body: Bytes| {
+                let body_tx = body_tx.clone();
+                async move {
+                    let _ = body_tx.lock().unwrap().take().unwrap().send(body);
+                    if streaming {
+                        axum::response::Response::builder()
+                            .header("content-type", "text/event-stream")
+                            .body(axum::body::Body::from("data: [DONE]\n\n"))
+                            .unwrap()
+                    } else {
+                        axum::response::Response::builder()
+                            .header("content-type", "application/json")
+                            .body(axum::body::Body::from(r#"{"id":"resp","object":"response","created_at":0,"model":"test-model","status":"completed","output":[],"usage":{"input_tokens":0,"input_tokens_details":{"cached_tokens":0},"output_tokens":0,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":0}}"#))
+                            .unwrap()
+                    }
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let client = SamplingClient::new(SamplerConfig {
+            base_url: format!("http://{addr}/v1"),
+            api_backend: ApiBackend::Responses,
+            extra_response_includes: vec!["no_inline_citations".to_owned()],
+            ..minimal_config()
+        })
+        .unwrap();
+        let mut request = rs::CreateResponse {
+            input: rs::InputParam::Text("hi".to_owned()),
+            include: Some(vec![rs::IncludeEnum::ReasoningEncryptedContent]),
+            tools: Some(vec![rs::Tool::WebSearch(rs::WebSearchTool::default())]),
+            ..Default::default()
+        };
+        let mut wrapper = CreateResponseWrapper::new(request.clone());
+        wrapper.extra_tool_entries = vec![serde_json::json!({"type": "x_search"})];
+        if streaming {
+            let (_stream, _model_metadata, _doom_loop_collector) = client
+                .create_response_stream(wrapper)
+                .await
+                .expect("streaming request should succeed");
+        } else {
+            request.tools = None;
+            client
+                .create_response(CreateResponseWrapper::new(request))
+                .await
+                .expect("unary request should succeed");
+        }
+        let body = body_rx.await.unwrap();
+        server.abort();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn response_call_sites_emit_final_includes_and_stream_fields() {
+        let unary = capture_response_body(false).await;
+        assert_eq!(
+            serde_json::json!(["reasoning.encrypted_content", "no_inline_citations"]),
+            unary["include"],
+        );
+
+        let stream = capture_response_body(true).await;
+        assert_eq!(
+            serde_json::json!(["reasoning.encrypted_content", "no_inline_citations"]),
+            stream["include"],
+        );
+        assert_eq!(Some(true), stream["stream"].as_bool());
+        assert!(
+            stream["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tool| tool["type"] == "x_search")
+        );
+    }
+
+    #[test]
+    fn append_response_includes_preserves_typed_values_and_deduplicates() {
+        let typed = [
+            "reasoning.encrypted_content",
+            "web_search_call.action.sources",
+        ];
+        let mut body = serde_json::json!({ "include": typed });
+        append_response_includes(
+            &mut body,
+            &[
+                "no_inline_citations".to_owned(),
+                "no_inline_citations".to_owned(),
+            ],
+        );
+        assert_eq!(
+            serde_json::json!([
+                "reasoning.encrypted_content",
+                "web_search_call.action.sources",
+                "no_inline_citations",
+            ]),
+            body["include"],
+        );
+
+        let mut unchanged = serde_json::json!({ "include": typed });
+        let expected = unchanged.clone();
+        append_response_includes(&mut unchanged, &[]);
+        assert_eq!(expected, unchanged);
+
+        for mut body in [
+            serde_json::json!({}),
+            serde_json::json!({ "include": null }),
+        ] {
+            append_response_includes(&mut body, &["no_inline_citations".to_owned()]);
+            assert_eq!(serde_json::json!(["no_inline_citations"]), body["include"]);
+        }
     }
 
     #[test]
@@ -2307,10 +2631,8 @@ mod tests {
         let mut config = minimal_config();
         config.header_injector = Some(std::sync::Arc::new(TestInjector));
         let client = SamplingClient::new(config).expect("build");
-        let req = client
-            .post("http://localhost/test")
-            .build()
-            .expect("build request");
+        let SentRequest { builder, .. } = client.post("http://localhost/test");
+        let req = builder.build().expect("build request");
         assert!(
             req.headers().contains_key("traceparent"),
             "HeaderInjector should inject traceparent into post() requests"
@@ -2379,31 +2701,31 @@ mod tests {
         }
     }
 
-    /// `extract_sent_bearer` strips the `"Bearer "` prefix off
-    /// `Authorization` for OpenAI-completions backends and truncates the
-    /// remaining bearer to the cross-crate prefix length.
+    /// `post()` strips the `"Bearer "` scheme prefix off `Authorization`
+    /// and captures the tail fragment (see `BEARER_SUFFIX_LEN`).
     #[test]
-    fn extract_sent_bearer_strips_bearer_prefix_for_openai_compat() {
+    fn post_captures_bearer_tail_for_openai_compat() {
         let cfg = SamplerConfig {
             api_key: Some("test-bearer-1234567890".to_string()),
             api_backend: ApiBackend::ChatCompletions,
             ..minimal_config()
         };
         let client = SamplingClient::new(cfg).expect("client should build");
-        let bearer = client.extract_sent_bearer();
-        // Bearer is truncated at the crate boundary -- callers
-        // downstream of this method only ever see the prefix.
-        assert_eq!(bearer.as_deref(), Some("test-bearer-"));
+        let SentRequest {
+            sent_bearer: bearer,
+            ..
+        } = client.post("https://example.test/v1/chat/completions");
+        assert_eq!(bearer.as_deref(), Some("r-1234567890"));
         assert_eq!(
             bearer.as_deref().map(str::len),
-            Some(crate::attribution::SENT_BEARER_PREFIX_LEN),
+            Some(crate::attribution::BEARER_SUFFIX_LEN),
         );
     }
 
-    /// `extract_sent_bearer` reads `x-api-key` for Anthropic Messages API
-    /// and truncates the value to the cross-crate prefix length.
+    /// `post()` captures `x-api-key` for Messages-API backends and keeps
+    /// the value's tail fragment.
     #[test]
-    fn extract_sent_bearer_reads_x_api_key_for_messages() {
+    fn post_captures_x_api_key_tail_for_messages() {
         let cfg = SamplerConfig {
             api_key: Some("anthropic-key-abc123".to_string()),
             api_backend: ApiBackend::Messages,
@@ -2411,24 +2733,77 @@ mod tests {
             ..minimal_config()
         };
         let client = SamplingClient::new(cfg).expect("client should build");
-        let bearer = client.extract_sent_bearer();
-        assert_eq!(bearer.as_deref(), Some("anthropic-ke"));
+        let SentRequest {
+            sent_bearer: bearer,
+            ..
+        } = client.post("https://example.test/v1/messages");
+        assert_eq!(bearer.as_deref(), Some("c-key-abc123"));
         assert_eq!(
             bearer.as_deref().map(str::len),
-            Some(crate::attribution::SENT_BEARER_PREFIX_LEN),
+            Some(crate::attribution::BEARER_SUFFIX_LEN),
         );
     }
 
-    /// `extract_sent_bearer` returns `None` when no auth header is set.
+    /// `post()` captures `None` when the request carries no auth header.
     #[test]
-    fn extract_sent_bearer_returns_none_when_no_header() {
+    fn post_captures_none_when_no_header() {
         let cfg = SamplerConfig {
             api_key: None,
             api_backend: ApiBackend::ChatCompletions,
             ..minimal_config()
         };
         let client = SamplingClient::new(cfg).expect("client should build");
-        assert!(client.extract_sent_bearer().is_none());
+        let SentRequest {
+            sent_bearer: bearer,
+            ..
+        } = client.post("https://example.test/v1/chat/completions");
+        assert!(bearer.is_none());
+    }
+
+    /// The race this design closes: a 401 triggers a recovery that rotates
+    /// the resolver, so a record-time re-read attributes a bearer the
+    /// rejected request never carried. The attributed fragment must be the
+    /// one captured when the request was built.
+    #[test]
+    fn post_capture_is_immune_to_resolver_rotation_after_build() {
+        #[derive(Debug)]
+        struct RotatingResolver(std::sync::Mutex<String>);
+        impl crate::config::BearerResolver for RotatingResolver {
+            fn current_bearer(&self) -> Option<String> {
+                Some(self.0.lock().unwrap().clone())
+            }
+        }
+
+        let resolver = std::sync::Arc::new(RotatingResolver(std::sync::Mutex::new(
+            "rejected-token-oldtail1".to_string(),
+        )));
+        let cfg = SamplerConfig {
+            api_key: None,
+            api_backend: ApiBackend::Responses,
+            bearer_resolver: Some(resolver.clone()),
+            ..minimal_config()
+        };
+        let client = SamplingClient::new(cfg).expect("client should build");
+
+        let SentRequest {
+            sent_bearer: sent_at_build,
+            ..
+        } = client.post("https://example.test/v1/responses");
+        // The 401 kicks recovery; the resolver rotates before the callback runs.
+        *resolver.0.lock().unwrap() = "fresh-token-newtail99".to_string();
+
+        assert_eq!(
+            sent_at_build.as_deref(),
+            Some("ken-oldtail1"),
+            "attribution must describe the bearer the rejected request carried"
+        );
+        // A record-time re-read (the pre-fix behavior) would report the
+        // rotated token instead:
+        assert_eq!(
+            client.current_sent_bearer_suffix().as_deref(),
+            Some("en-newtail99"),
+            "sanity: the build-time capture and a live re-read now differ"
+        );
     }
 
     #[test]
@@ -2441,10 +2816,8 @@ mod tests {
             ..minimal_config()
         };
         let client = SamplingClient::new(cfg).expect("client should build");
-        let request = client
-            .post("https://example.test/v1/messages")
-            .build()
-            .expect("request should build");
+        let SentRequest { builder, .. } = client.post("https://example.test/v1/messages");
+        let request = builder.build().expect("request should build");
         let auth = request
             .headers()
             .get(AUTHORIZATION)
@@ -2469,10 +2842,8 @@ mod tests {
             ..minimal_config()
         };
         let client = SamplingClient::new(cfg).expect("client should build");
-        let request = client
-            .post("https://example.test/v1/responses")
-            .build()
-            .expect("request should build");
+        let SentRequest { builder, .. } = client.post("https://example.test/v1/responses");
+        let request = builder.build().expect("request should build");
         let auth_count = request.headers().get_all(AUTHORIZATION).iter().count();
         assert_eq!(
             auth_count, 1,
@@ -2497,10 +2868,8 @@ mod tests {
             ..minimal_config()
         };
         let client = SamplingClient::new(cfg).expect("client should build");
-        let request = client
-            .post("https://example.test/v1/messages")
-            .build()
-            .expect("request should build");
+        let SentRequest { builder, .. } = client.post("https://example.test/v1/messages");
+        let request = builder.build().expect("request should build");
         let api_key = request
             .headers()
             .get("x-api-key")
@@ -2509,27 +2878,10 @@ mod tests {
         assert!(request.headers().get(AUTHORIZATION).is_none());
     }
 
-    /// Bearers shorter than the prefix length pass through unchanged.
-    /// Defensive against the truncation logic inadvertently widening
-    /// short bearers (no panics, no zero-padding).
+    /// The callback receives the `post()`-captured fragment only — the
+    /// full bearer never crosses the crate boundary.
     #[test]
-    fn extract_sent_bearer_short_bearer_passes_through_unchanged() {
-        let cfg = SamplerConfig {
-            api_key: Some("abc".to_string()),
-            api_backend: ApiBackend::ChatCompletions,
-            ..minimal_config()
-        };
-        let client = SamplingClient::new(cfg).expect("client should build");
-        assert_eq!(client.extract_sent_bearer().as_deref(), Some("abc"));
-    }
-
-    /// `record_401_attribution` invokes the wired callback with the
-    /// expected `consumer` and the truncated bearer prefix that the
-    /// wire would carry. The key assertion is that the callback
-    /// receives the prefix only -- the full bearer never crosses the
-    /// crate boundary.
-    #[test]
-    fn record_401_attribution_invokes_callback_with_extracted_bearer() {
+    fn record_401_attribution_invokes_callback_with_captured_bearer() {
         let cb = std::sync::Arc::new(CountingCallback::default());
         let cb_dyn: crate::attribution::SharedAttributionCallback = cb.clone();
         let cfg = SamplerConfig {
@@ -2540,19 +2892,22 @@ mod tests {
             ..minimal_config()
         };
         let client = SamplingClient::new(cfg).expect("client should build");
-        client.record_401_attribution(crate::attribution::SamplingConsumer::ChatCompletionsStream);
+        let SentRequest { sent_bearer, .. } =
+            client.post("https://example.test/v1/chat/completions");
+        client.record_401_attribution(
+            crate::attribution::SamplingConsumer::ChatCompletionsStream,
+            sent_bearer.as_deref(),
+        );
         let calls = cb.invocations.lock().unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(
             calls[0].0,
             crate::attribution::SamplingConsumer::ChatCompletionsStream
         );
-        // Prefix-only -- the `extra-tail` portion of the bearer is
-        // dropped by `extract_sent_bearer` before the callback fires.
-        assert_eq!(calls[0].1.as_deref(), Some("the-bearer-1"));
+        assert_eq!(calls[0].1.as_deref(), Some("0-extra-tail"));
         assert_eq!(
             calls[0].1.as_deref().map(str::len),
-            Some(crate::attribution::SENT_BEARER_PREFIX_LEN),
+            Some(crate::attribution::BEARER_SUFFIX_LEN),
         );
     }
 
@@ -2576,7 +2931,7 @@ mod tests {
         };
         let client = SamplingClient::new(cfg).expect("client should build");
         assert_eq!(
-            client.current_sent_bearer_prefix(),
+            client.current_sent_bearer_suffix(),
             None,
             "resolver None must not attribute a stripped default seed"
         );
@@ -2602,11 +2957,12 @@ mod tests {
             ..minimal_config()
         };
         let client = SamplingClient::new(cfg).expect("client should build");
-        let request = client
-            .post("https://example.test/v1/responses")
-            .body("")
-            .build()
-            .expect("request should build");
+        let SentRequest {
+            builder,
+            sent_bearer: sent,
+        } = client.post("https://example.test/v1/responses");
+        let request = builder.body("").build().expect("request should build");
+        assert_eq!(sent, None, "capture must agree: nothing was sent");
         assert!(
             request.headers().get(AUTHORIZATION).is_none(),
             "stale default Authorization must not be sent when resolver is empty"
@@ -2638,7 +2994,7 @@ mod tests {
         let client = SamplingClient::new(cfg).expect("client should build");
 
         // Build a request to inspect the final headers.
-        let builder = client.post("https://example.test/v1/responses");
+        let SentRequest { builder, .. } = client.post("https://example.test/v1/responses");
         let request = builder.body("").build().expect("request should build");
 
         let auth_values: Vec<_> = request.headers().get_all(AUTHORIZATION).iter().collect();
@@ -2671,7 +3027,10 @@ mod tests {
         };
         let client = SamplingClient::new(cfg).expect("client should build");
         // Must not panic.
-        client.record_401_attribution(crate::attribution::SamplingConsumer::ChatCompletions);
+        client.record_401_attribution(
+            crate::attribution::SamplingConsumer::ChatCompletions,
+            Some("bearer-tail-12"),
+        );
     }
 
     /// `response.completed` carrying

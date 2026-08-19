@@ -239,6 +239,33 @@ fn create_valid_target(root: &Path, journal: &RelocationJournal) -> PathBuf {
 }
 
 #[test]
+fn stage_and_publish_creates_owner_only_target_parent() {
+    let temp = tempfile::tempdir().unwrap();
+    let storage = RelocationStorage::new(temp.path().into());
+    create_source(temp.path(), "/source", "perm", 0);
+    let lease = storage.acquire("perm").unwrap();
+    storage
+        .stage_and_publish(&lease, request("perm", "/source", "/target", 1))
+        .unwrap();
+
+    let parent = session_dir(temp.path(), "/target", "perm")
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    use crate::test_support::unix_mode;
+    assert_eq!(
+        unix_mode(&parent),
+        0o700,
+        "<encoded-cwd> target parent must be 0700"
+    );
+    assert_eq!(
+        unix_mode(&temp.path().join("sessions")),
+        0o700,
+        "sessions root must be 0700"
+    );
+}
+
+#[test]
 fn commit_and_rollback_terminal_proofs_allow_retries_and_second_relocation() {
     let temp = tempfile::tempdir().unwrap();
     let storage = RelocationStorage::new(temp.path().into());
@@ -513,6 +540,58 @@ fn storage_view_follows_journal_authority_and_fails_closed_without_it() {
             .unwrap()
             .iter()
             .all(|path| !path.file_name().unwrap().to_string_lossy().starts_with('.'))
+    );
+}
+
+#[test]
+fn hinted_replay_skips_non_authoritative_source_while_journal_exists() {
+    let temp = tempfile::tempdir().unwrap();
+    let sid = "reloc-child";
+    let source = create_source(temp.path(), "/source", sid, 0);
+    let journal = RelocationJournal::test_new(sid, "/source", "/target", RelocationPhase::Ready);
+    let target = create_valid_target(temp.path(), &journal);
+    super::journal::write(temp.path(), &journal, None).unwrap();
+
+    let source_line = r#"{"timestamp":1,"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"source-transcript"}}}}"#;
+    let target_line = r#"{"timestamp":1,"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"target-transcript"}}}}"#;
+    fs::write(
+        source.join(super::super::UPDATES_FILE),
+        format!("{source_line}\n"),
+    )
+    .unwrap();
+    fs::write(
+        target.join(super::super::UPDATES_FILE),
+        format!("{target_line}\n"),
+    )
+    .unwrap();
+
+    let mut texts = Vec::new();
+    let emission =
+        super::super::stream_replay_updates_at_hinted(
+            sid,
+            temp.path(),
+            super::super::ReplayPathHint {
+                parent_cwd: Some(Path::new("/source")),
+                child_cwd: None,
+                ..Default::default()
+            },
+            |update| {
+                if let super::super::ReplayedUpdate::Acp(
+                    acp::SessionUpdate::UserMessageChunk(chunk),
+                    _,
+                ) = update
+                    && let acp::ContentBlock::Text(text) = chunk.content
+                {
+                    texts.push(text.text);
+                }
+            },
+        )
+        .unwrap();
+    assert_eq!(emission, super::super::ReplayEmission::Emitted);
+    assert_eq!(
+        texts,
+        vec!["target-transcript".to_string()],
+        "Ready journal must win over the parent-cwd/sibling fast path"
     );
 }
 

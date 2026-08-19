@@ -1,4 +1,5 @@
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::notifications::NotificationEvent;
@@ -23,47 +24,74 @@ fn execute_hook(
         cmd.env("GROK_SESSION_ID", sid);
     }
 
-    // Create a new process group so we can kill the entire tree on timeout,
-    // preventing orphaned subprocesses from accumulating.
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        // SAFETY: setsid is async-signal-safe per POSIX and does not
-        // allocate or take locks. Called between fork and exec.
-        unsafe {
-            cmd.pre_exec(|| {
-                nix::unistd::setsid().ok();
-                Ok(())
-            });
+    xai_tty_utils::detach_std_command(&mut cmd);
+
+    #[allow(clippy::disallowed_methods)] // enrolled below, once the child exists
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(e) => {
+            tracing::debug!(error = %e, command, "hook spawn failed");
+            return;
+        }
+    };
+
+    let group = match xai_tty_utils::global_process_scope().enroll_std(&child) {
+        Ok(group) => group,
+        Err(error) => {
+            tracing::debug!(error = %error, command, "hook process group enrollment failed");
+            let _ = child.kill();
+            if !matches!(
+                xai_tty_utils::wait_child_bounded(&mut child, xai_tty_utils::KILL_REAP_TIMEOUT,),
+                Ok(Some(_))
+            ) && let Err((error, child, _)) =
+                xai_tty_utils::spawn_child_reaper("notification-hook-reaper", child, None)
+            {
+                tracing::error!(error = %error, command, child_id = child.id(), "hook cleanup bounded abandonment after enrollment failure");
+            }
+            return;
+        }
+    };
+
+    match xai_tty_utils::wait_child_bounded(&mut child, timeout) {
+        Ok(Some(_)) => drop(group),
+        Ok(None) => {
+            tracing::warn!(command, "hook timed out");
+            kill_tree_and_reap(child, group, command);
+        }
+        Err(error) if xai_tty_utils::is_child_wait_identity_uncertain(&error) => {
+            tracing::error!(error = %error, command, "hook wait lost child identity; numeric cleanup forbidden");
+            // ECHILD makes this group unsafe for this and later numeric cleanup.
+            drop(group);
+            abandon_child(child, None, command);
+        }
+        Err(error) => {
+            tracing::debug!(error = %error, command, "hook wait failed");
+            kill_tree_and_reap(child, group, command);
         }
     }
+}
 
-    match cmd.spawn() {
-        Ok(mut child) => {
-            use wait_timeout::ChildExt;
-            match child.wait_timeout(timeout) {
-                Ok(Some(_)) => {}
-                Ok(None) => {
-                    // Kill the entire process group, not just the direct child.
-                    #[cfg(unix)]
-                    {
-                        let pid = child.id() as i32;
-                        let _ = nix::sys::signal::killpg(
-                            nix::unistd::Pid::from_raw(pid),
-                            nix::sys::signal::Signal::SIGKILL,
-                        );
-                    }
-                    #[cfg(not(unix))]
-                    {
-                        let _ = child.kill();
-                    }
-                    let _ = child.wait();
-                    tracing::warn!("hook timed out");
-                }
-                Err(e) => tracing::debug!(error = %e, command, "hook wait failed"),
-            }
+fn kill_tree_and_reap(mut child: Child, group: Arc<xai_tty_utils::ProcessGroup>, command: &str) {
+    if let Err(group_error) = group.kill()
+        && let Err(child_error) = child.kill()
+    {
+        tracing::warn!(error = %group_error, fallback_error = %child_error, command, "hook group and direct-child kill failed");
+    }
+    match xai_tty_utils::wait_child_bounded(&mut child, xai_tty_utils::KILL_REAP_TIMEOUT) {
+        Ok(Some(_)) => drop(group),
+        Ok(None) => abandon_child(child, Some(group), command),
+        Err(error) => {
+            tracing::warn!(error = %error, command, "hook bounded reap failed");
+            abandon_child(child, Some(group), command);
         }
-        Err(e) => tracing::debug!(error = %e, command, "hook spawn failed"),
+    }
+}
+
+fn abandon_child(child: Child, group: Option<Arc<xai_tty_utils::ProcessGroup>>, command: &str) {
+    if let Err((error, child, group)) =
+        xai_tty_utils::spawn_child_reaper("notification-hook-reaper", child, group)
+    {
+        tracing::error!(error = %error, command, child_id = child.id(), has_group = group.is_some(), "hook cleanup bounded abandonment: reaper thread spawn failed");
     }
 }
 
@@ -155,20 +183,22 @@ mod tests {
     }
 
     #[test]
-    fn kills_on_timeout() {
-        let start = Instant::now();
+    fn kills_descendants_on_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("descendant-finished");
+        let command = format!("(sleep 2; touch {}) & wait", marker.display());
         execute_hook(
-            "sleep 100",
+            &command,
             "Turn complete",
             "msg",
             None,
-            Duration::from_secs(1),
+            Duration::from_millis(100),
         );
-        let elapsed = start.elapsed();
-        assert!(
-            elapsed < Duration::from_secs(3),
-            "should return within timeout, took {elapsed:?}"
-        );
+        let deadline = Instant::now() + Duration::from_millis(2300);
+        while Instant::now() < deadline {
+            assert!(!marker.exists(), "timeout must kill hook descendants");
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 
     #[test]

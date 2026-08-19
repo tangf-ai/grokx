@@ -17,6 +17,7 @@ use xai_grok_shell::extensions::notification::{
     SessionNotification, SessionUpdate as XaiSessionUpdate, is_reauthable_failure,
 };
 use xai_grok_shell::tools::todo::todo_item_from_plan_entry;
+use xai_grok_tools::notification::ScheduledTaskRemovedReason;
 use xai_grok_workspace::permission::bash_command_splitting::BashCommandHighlights;
 
 use crate::acp::meta::NotificationMeta;
@@ -48,11 +49,15 @@ mod routing;
 mod session_notification;
 mod settings;
 mod subagent_activity;
+mod subagent_lifecycle;
 mod workflow_ingest;
 
 #[cfg(test)]
 use permissions::{MCP_ARGS_MAX_LINE_CHARS, MCP_ARGS_MAX_LINES, mcp_args_lines};
-use permissions::{apply_recap_block, handle_permission_request, should_drop_late_auto_recap};
+use permissions::{
+    apply_recap_block, handle_permission_request, should_drop_duplicate_auto_recap,
+    should_drop_late_auto_recap,
+};
 
 // Hub + child modules (via `use super::*`) need sibling symbols in this scope.
 use routing::{
@@ -68,14 +73,20 @@ pub(crate) use prompt_origin::{
 
 pub(crate) use subagent_activity::finalize_killed_subagent;
 use subagent_activity::{subagent_activity_label, sync_subagent_activity};
+use subagent_lifecycle::{
+    LifecycleDelivery, LifecycleOrigin, classify_subagent_lifecycle, gate_subagent_lifecycle,
+    redispatched_subagent_finish, take_deferred_subagent_finish,
+};
 
 use workflow_ingest::ingest_workflow_update;
 
+pub(crate) use session_notification::apply_child_view_session_event;
 #[cfg(test)]
 pub(crate) use session_notification::apply_session_event_for_test;
+pub(crate) use session_notification::drop_unexpected_replay;
 use session_notification::{
     advance_reconnect_cursor, confirm_context_used, detect_plan_mode_change,
-    drop_unexpected_replay, handle_session_notification,
+    handle_session_notification, handle_session_notification_with_origin,
 };
 
 pub(crate) use queue::PendingRunningAdoption;
@@ -387,44 +398,41 @@ pub(crate) fn handle(msg: AcpClientMessage, app: &mut AppView) -> bool {
                             // the turn is current.
                             agent.flush_pending_follow_ups(notif_pid);
                         }
+                        // A live delta for a wake prompt id: record the
+                        // streaming wake turn so the stop affordance can offer
+                        // a cancel for it. Lifecycle on
+                        // `note_streaming_wake_turn`.
+                        if !meta.is_replay
+                            && let Some(notif_pid) = meta.prompt_id.as_deref()
+                            && is_wake_prompt(notif_pid)
+                        {
+                            agent.note_streaming_wake_turn(notif_pid);
+                        }
+
                         // Detect plan mode transitions from tool call completions.
                         plan_mode_modal_refresh_needed |=
                             detect_plan_mode_change(&notif.request.update, agent);
 
                         let had_activity_before = agent.session.tracker.activity().is_some();
-                        agent.session.handle_update(
-                            notif.request.update,
-                            &meta,
-                            &mut agent.scrollback,
-                        );
+                        let update = notif.request.update;
+                        let user_echo = matches!(update, acp::SessionUpdate::UserMessageChunk(_));
+                        agent
+                            .session
+                            .handle_update(update, &meta, &mut agent.scrollback);
+                        // Skip user echo: shell broadcasts it before history commit.
+                        if !user_echo
+                            && !meta.is_replay
+                            && !agent.session.loading_replay
+                            && meta.prompt_id.as_deref()
+                                == agent.session.current_prompt_id.as_deref()
+                        {
+                            agent.front_message_committed = true;
+                        }
                         // Once the server has emitted any activity (chunk, tool,
                         // retry, etc.), the in-flight prompt can no longer be
                         // "rewound" by Ctrl+C. Clear the stash on the transition.
                         if !had_activity_before && agent.session.tracker.activity().is_some() {
-                            agent.session.in_flight_prompt = None;
-
-                            // Log initial TTFA once per turn (activity flips None→Some each loop).
-                            if let Some(started) = agent.turn_started_at
-                                && agent.first_activity_logged_for != Some(started)
-                            {
-                                agent.first_activity_logged_for = Some(started);
-                                let activity_label = agent
-                                    .session
-                                    .tracker
-                                    .activity()
-                                    .map(|a| a.as_label())
-                                    .unwrap_or("unknown");
-                                let ttfa_ms = started.elapsed().as_millis() as u64;
-                                let sid = agent.session.session_id.as_ref().map(|s| s.0.as_ref());
-                                crate::unified_log::info(
-                                    "turn.first_activity",
-                                    sid,
-                                    Some(serde_json::json!({
-                                        "ttfa_ms": ttfa_ms,
-                                        "activity": activity_label,
-                                    })),
-                                );
-                            }
+                            note_first_turn_activity(agent);
                         }
 
                         // Drain pending ACP commands immediately after handle_update.
@@ -583,6 +591,36 @@ pub(crate) fn handle(msg: AcpClientMessage, app: &mut AppView) -> bool {
     }
 }
 
+/// The turn's first activity (tracker flip None→Some): the server has started
+/// producing, so drop the Ctrl+C rewind stash and log TTFA once per turn.
+/// Shared by `handle_update` and the `ToolCallDeltaChunk` arm so the rails can't drift.
+pub(super) fn note_first_turn_activity(agent: &mut AgentView) {
+    agent.session.in_flight_prompt = None;
+
+    // Log initial TTFA once per turn (activity flips None→Some each loop).
+    if let Some(started) = agent.turn_started_at
+        && agent.first_activity_logged_for != Some(started)
+    {
+        agent.first_activity_logged_for = Some(started);
+        let activity_label = agent
+            .session
+            .tracker
+            .activity()
+            .map(|a| a.as_label())
+            .unwrap_or("unknown");
+        let ttfa_ms = started.elapsed().as_millis() as u64;
+        let sid = agent.session.session_id.as_ref().map(|s| s.0.as_ref());
+        crate::unified_log::info(
+            "turn.first_activity",
+            sid,
+            Some(serde_json::json!({
+                "ttfa_ms": ttfa_ms,
+                "activity": activity_label,
+            })),
+        );
+    }
+}
+
 fn workflow_commands(
     commands: &[acp::AvailableCommand],
 ) -> Vec<(&str, &str, Option<&str>, Option<&str>)> {
@@ -663,10 +701,11 @@ fn queue_open_workflows_modal_refresh(app: &mut AppView, agent_id: AgentId) {
 
 /// Handle an xAI extension notification.
 fn handle_ext_notification(notif: &acp::ExtNotification, app: &mut AppView) -> bool {
-    match notif.method.as_ref() {
-        "x.ai/session_notification" | "x.ai/session/update" => {
-            handle_session_notification(notif, app)
-        }
+    let method = notif.method.as_ref();
+    if crate::acp::is_session_update_ext_method(method) {
+        return handle_session_notification(notif, app);
+    }
+    match method {
         "x.ai/follow_ups" => handle_follow_ups(notif, app),
         "x.ai/task_backgrounded" => handle_task_backgrounded(notif, app),
         "x.ai/task_completed" => handle_task_completed(notif, app),
@@ -684,6 +723,7 @@ fn handle_ext_notification(notif: &acp::ExtNotification, app: &mut AppView) -> b
         "x.ai/scheduled_task_inject_prompt" => handle_scheduled_task_inject_prompt(notif, app),
         "x.ai/announcements/update" => handle_announcements_update(notif, app),
         "x.ai/git_head_changed" => handle_git_head_changed(notif, app),
+        "x.ai/leader/version_mismatch" => handle_version_mismatch(notif, app),
         "x.ai/mcp/init_progress" => handle_mcp_init_progress(notif, app),
         "x.ai/mcp/tools_changed" | "x.ai/mcp_initialized" => handle_mcp_tools_changed(notif, app),
         "x.ai/mcp/server_status" if push_server_status_enabled() => {
@@ -692,6 +732,15 @@ fn handle_ext_notification(notif: &acp::ExtNotification, app: &mut AppView) -> b
         "x.ai/mcp/servers_updated" => handle_mcp_servers_updated(notif, app),
         _ => false,
     }
+}
+
+fn handle_version_mismatch(notif: &acp::ExtNotification, app: &mut AppView) -> bool {
+    let Some(banner) = crate::acp::version_mismatch_banner(notif.params.get()) else {
+        tracing::warn!("ignoring x.ai/leader/version_mismatch without usable versions");
+        return false;
+    };
+    app.show_toast(&banner);
+    true
 }
 
 /// Handle `x.ai/session/interjection` — the leader broadcasts this
@@ -729,12 +778,32 @@ fn handle_interjection(notif: &acp::ExtNotification, app: &mut AppView) -> bool 
         return false;
     };
 
-    // Dedup our own optimistic echo: if we minted this id we already rendered
-    // the block locally — drop the broadcast copy (and forget the id).
-    if let Some(iid) = interjection_id
-        && agent.self_interjection_ids.remove(iid)
-    {
-        return false;
+    if let Some(iid) = interjection_id {
+        // Two self-message flows land here, painted differently on the
+        // originator: a direct interjection (already an interjection block,
+        // tracked by `self_interjection_ids`) is a pure dedup — drop it; a goal
+        // Send Now (a plain user-prompt block in `send_now_painted_blocks`) must
+        // instead be converted to interjection styling.
+        if agent.self_interjection_ids.remove(iid) {
+            return false;
+        }
+        // `edited` is ignored: the painted block already holds the authoritative
+        // (possibly edited) text — we only restyle it. Drift resolution via
+        // `edited` matters only on the turn-start adoption path.
+        if agent.is_self_originated_prompt(iid)
+            && let Some((entry_id, _)) = agent.send_now_painted_blocks.remove(iid)
+        {
+            agent.clear_send_now_expectation();
+            if let Some(index) = agent.scrollback.index_of_id(entry_id)
+                && let Some(RenderBlock::UserPrompt(block)) = agent
+                    .scrollback
+                    .entry_mut(index)
+                    .map(|entry| &mut entry.block)
+            {
+                block.is_interjection = true;
+            }
+            return false;
+        }
     }
 
     agent

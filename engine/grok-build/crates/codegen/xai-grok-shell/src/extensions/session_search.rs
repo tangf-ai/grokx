@@ -14,6 +14,7 @@
 use agent_client_protocol as acp;
 use serde::{Deserialize, Serialize};
 
+use crate::agent::MvpAgent;
 use crate::session::storage::search::{SessionSearchRequest, SessionSearchResponse};
 use crate::session::storage::search_fts::SessionSearchRow;
 
@@ -21,7 +22,7 @@ use super::ExtResult;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct SearchSessionsRequest {
+pub(crate) struct SearchSessionsRequest {
     /// The search query string.
     pub query: String,
     /// Optional workspace directory to scope results to.
@@ -44,7 +45,7 @@ fn default_limit() -> usize {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct SearchSessionsResponse {
+pub(crate) struct SearchSessionsResponse {
     pub results: Vec<SearchSessionHit>,
     pub next_offset: Option<usize>,
     pub total_estimate: Option<usize>,
@@ -68,7 +69,7 @@ pub struct SearchSessionHit {
 }
 
 /// Route `x.ai/session/search` extension method calls.
-pub async fn handle(args: &acp::ExtRequest) -> ExtResult {
+pub async fn handle(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
     match args.method.as_ref() {
         "x.ai/session/search" => {
             let req: SearchSessionsRequest = super::parse_params(args)?;
@@ -81,10 +82,14 @@ pub async fn handle(args: &acp::ExtRequest) -> ExtResult {
             };
 
             let root_dir = crate::util::grok_home::grok_home();
-            let result = crate::session::storage::search::execute_search(&root_dir, &internal_req)
-                .await
-                .map(to_response)
-                .map_err(|e| anyhow::anyhow!(e));
+            let result = crate::session::storage::search::execute_search(
+                agent.search_index(),
+                &root_dir,
+                &internal_req,
+            )
+            .await
+            .map(to_response)
+            .map_err(|e| anyhow::anyhow!(e));
 
             super::to_ext_response(result)
         }

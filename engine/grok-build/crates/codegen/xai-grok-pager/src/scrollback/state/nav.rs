@@ -350,6 +350,32 @@ impl ScrollbackState {
         false
     }
 
+    /// Whether the response being read starts above the viewport top: the
+    /// active turn (the one owning the top row) has a response anchor whose
+    /// first line is scrolled off screen. Drives the ▲ jump-to-response-top
+    /// indicator, whose click runs [`Self::prev_response`] — from inside an
+    /// answer that anchor is exactly the nearest one above, so the indicator
+    /// only shows when the click has that answer's top to land on.
+    ///
+    /// Cache-only estimate (`&self`, headers ignored) so render can poll it
+    /// every frame; the estimate never undershoots the exact target, so a
+    /// visible indicator always has a real jump behind it.
+    pub fn has_response_top_above(&self) -> bool {
+        let Some(turn) = self
+            .active_turn_for_viewport()
+            .and_then(|t| self.turns.get(t))
+        else {
+            return false;
+        };
+        let Some(idx) = response_anchor_in_range(&self.entries, turn.range()) else {
+            return false;
+        };
+        self.visible_entry_range().contains(&idx)
+            && self
+                .entry_top_estimate(idx)
+                .is_some_and(|estimate| estimate < self.scroll_offset)
+    }
+
     /// Set status of the last turn.
     pub fn set_last_turn_status(&mut self, status: TurnStatus) {
         if let Some(turn) = self.turns.last_mut() {
@@ -1064,8 +1090,14 @@ impl ScrollbackState {
             .get_cached_entry_height(entry_idx)
             .unwrap_or(0)
             .saturating_sub(1);
+        let header_rows = self
+            .layout_cache
+            .as_ref()
+            .and_then(|cache| cache.entries.get(entry_idx))
+            .map_or(0, |info| u16::from(info.is_expanded_verb_header()));
         let row_offset = self
             .rendered_row_offset_within_entry(entry_idx, line_in_entry)
+            .saturating_add(header_rows)
             .min(max_row_offset);
         let max_offset = self
             .total_height
@@ -1092,7 +1124,7 @@ impl ScrollbackState {
         let theme = Theme::current();
         let entry_area_width = self.entry_area_width(self.last_width);
         EntryRenderer::new(entry, &theme)
-            .with_appearance(self.appearance.clone())
+            .with_appearance_ref(&self.appearance)
             .with_cwd(self.cwd())
             .rendered_row_of_logical_line(entry_area_width, line_in_entry)
     }
@@ -1908,6 +1940,36 @@ mod tests {
     }
 
     #[test]
+    fn reveal_offsets_expanded_verb_head_past_group_header() {
+        crate::appearance::cache::set_group_tool_verbs(true);
+        let mut state = ScrollbackState::new();
+        for i in 0..20 {
+            state.push_block(RenderBlock::agent_message(format!("pre {i}")));
+        }
+        let head_idx = state.len();
+        for i in 0..3 {
+            state.push_block(RenderBlock::read(format!("f{i}.rs"), None));
+        }
+        for i in 0..20 {
+            state.push_block(RenderBlock::agent_message(format!("post {i}")));
+        }
+        state.prepare_layout(80, 6);
+        state.set_selected(Some(head_idx));
+        assert!(state.toggle_group_expansion());
+        state.prepare_layout(80, 6);
+        assert!(state.layout_cache.as_ref().unwrap().entries[head_idx].is_expanded_verb_header());
+
+        state.scroll_to_entry_center(head_idx);
+        let header_row_offset = state.scroll_offset();
+        state.reveal_entry_line(head_idx, 0);
+        assert_eq!(
+            state.scroll_offset(),
+            header_row_offset + 1,
+            "logical member row 0 starts below the synthetic group header"
+        );
+    }
+
+    #[test]
     fn reveal_skips_thinking_header_rows_when_mapping_logical_line() {
         crate::appearance::cache::set_show_thinking_blocks(true);
         let mut state = ScrollbackState::new();
@@ -2422,5 +2484,86 @@ mod tests {
             expected as usize,
             "page-down should advance a full viewport - 2 with sticky headers off"
         );
+    }
+
+    #[test]
+    fn response_top_above_tracks_the_answer_being_read() {
+        let mut state = ScrollbackState::new();
+        state.push_block(user_block("Q1")); // 0
+        state.push_block(tall_agent_block()); // 1
+        state.prepare_layout(80, 6);
+
+        // Follow mode parks at the tail of the long answer: its first line
+        // is above the viewport, so the indicator has a jump to offer.
+        assert!(state.is_follow_mode());
+        assert!(state.has_response_top_above());
+
+        // Taking the jump (the indicator click = K) lands on the answer's
+        // top; from there there is nothing further up to jump to.
+        assert!(state.prev_response());
+        assert_eq!(state.selected(), Some(1));
+        assert!(!state.has_response_top_above());
+    }
+
+    #[test]
+    fn response_top_above_is_false_for_short_answers_and_without_layout() {
+        let mut state = ScrollbackState::new();
+        state.push_block(user_block("Q1"));
+        state.push_block(agent_block("short answer"));
+
+        // No layout yet: no viewport top to compare against.
+        assert!(!state.has_response_top_above());
+
+        // Fully visible answer: nothing above the viewport top.
+        state.prepare_layout(80, 20);
+        assert!(!state.has_response_top_above());
+    }
+
+    #[test]
+    fn response_top_above_works_for_earlier_turns_too() {
+        let mut state = ScrollbackState::new();
+        state.push_block(user_block("Q1")); // 0
+        state.push_block(tall_agent_block()); // 1
+        state.push_block(user_block("Q2")); // 2
+        state.push_block(tall_agent_block()); // 3
+        state.prepare_layout(80, 6);
+
+        // Park the viewport mid-way through turn 0's answer: the indicator
+        // is not reserved for the last turn.
+        state.goto_top();
+        while !state.has_response_top_above() {
+            let before = state.scroll_offset();
+            state.scroll_down(1);
+            assert_ne!(
+                state.scroll_offset(),
+                before,
+                "hit the bottom without ever entering turn 0's answer"
+            );
+        }
+        assert_eq!(state.active_turn_for_viewport(), Some(0));
+
+        // The jump snaps to THIS answer's top, not the last one's.
+        assert!(state.prev_response());
+        assert_eq!(state.selected(), Some(1));
+    }
+
+    #[test]
+    fn response_top_above_is_false_while_the_answer_is_still_below() {
+        let mut state = ScrollbackState::new();
+        state.push_block(user_block("Q1")); // 0
+        state.push_block(tall_agent_block()); // 1
+        state.push_block(user_block("Q2")); // 2
+        for i in 0..8 {
+            state.push_block(tool_block(&format!("tool {i}"))); // 3..=10
+        }
+        state.push_block(agent_block("A2")); // 11
+        state.prepare_layout(80, 6);
+
+        // Viewport top inside turn 1's tool run: turn 1's answer starts
+        // BELOW the top, so there is no "top of the response" to return to
+        // even though turn 0's answer sits further up.
+        state.scroll_to_entry_top(8);
+        assert_eq!(state.active_turn_for_viewport(), Some(1));
+        assert!(!state.has_response_top_above());
     }
 }

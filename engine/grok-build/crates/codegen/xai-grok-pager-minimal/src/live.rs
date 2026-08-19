@@ -85,6 +85,7 @@ pub(super) fn prompt_style(
         accent_color_override: input_mode.accent_color(theme),
         border_color_override: None,
         prefix_override: input_mode.prefix_override(theme),
+        placeholder_when_focused: false,
         placeholder_override: input_mode.placeholder_override(multiline),
         show_accent_line: false,
         show_borders: false,
@@ -326,6 +327,7 @@ pub fn draw_live(app: &mut AppView, terminal: &mut PagerTerminal) {
                 &mut agent.last_btw_selection_model,
                 None,
                 &[],
+                None,
             );
             agent.last_btw_area = btw_area;
         }

@@ -181,10 +181,10 @@ impl xai_tool_runtime::Tool for GrepTool {
 
         cmd.arg(search_path.to_string_lossy().as_ref());
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-        crate::util::detach_command(&mut cmd);
-        cmd.stdin(Stdio::null());
+        crate::util::detach_search_command(&mut cmd);
 
         // Spawn.
+        #[allow(clippy::disallowed_methods)] // search helper, waited on below
         let mut child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => {
@@ -279,7 +279,7 @@ impl xai_tool_runtime::Tool for GrepTool {
         }
 
         // Sort by mtime (most recent first).
-        matches.sort_by(|a, b| b.mtime_ms.cmp(&a.mtime_ms));
+        matches.sort_by_key(|b| std::cmp::Reverse(b.mtime_ms));
 
         let total_matches = matches.len();
         let truncated = total_matches > RESULT_LIMIT;

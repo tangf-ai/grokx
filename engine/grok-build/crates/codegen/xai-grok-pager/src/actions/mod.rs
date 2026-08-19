@@ -166,6 +166,21 @@ pub enum When {
     DashboardOverlay,
 }
 
+impl When {
+    /// Stable product-event label for this context (`prompt_focused`, …).
+    pub fn telemetry_name(self) -> &'static str {
+        match self {
+            When::Always => "always",
+            When::PromptFocused => "prompt_focused",
+            When::ScrollbackFocused => "scrollback_focused",
+            When::AgentScreen => "agent_screen",
+            When::WelcomeScreen => "welcome_screen",
+            When::DashboardFocused => "dashboard_focused",
+            When::DashboardOverlay => "dashboard_overlay",
+        }
+    }
+}
+
 /// Action category (for grouping in command palette).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Category {
@@ -267,6 +282,8 @@ impl ActionRegistry {
     ///
     /// Uses **exact** context matching — each layer in the input chain
     /// calls this with its own context level.
+    ///
+    /// Peek/probe only: does **not** emit telemetry.
     pub fn lookup(&self, event: &KeyEvent, context: When) -> Option<ActionId> {
         for def in &self.actions {
             if def.context != context {
@@ -486,6 +503,32 @@ impl ActionRegistry {
     }
 }
 
+/// Emit [`xai_grok_telemetry::events::ShortcutUsed`] for an allowlisted binding.
+///
+/// See that event's docs for the product contract (intent-only allowlist).
+/// `context` is a free-form surface label (`When::telemetry_name()` or e.g.
+/// `"queue"` when focus is not a registry `When`). Call only on the commit
+/// path that handles the allowlisted id, not peeks.
+pub fn log_shortcut_used(key: &KeyEvent, action_id: ActionId, context: &str) {
+    let Some(action) = shortcut_used_action_label(action_id) else {
+        return;
+    };
+    xai_grok_telemetry::session_ctx::log_event(xai_grok_telemetry::events::ShortcutUsed {
+        key: KeyShortcut::from(*key).display_telemetry(),
+        action: action.to_string(),
+        context: context.to_string(),
+    });
+}
+
+/// Stable product-event labels for the allowlisted actions. `None` = do not emit.
+fn shortcut_used_action_label(id: ActionId) -> Option<&'static str> {
+    match id {
+        ActionId::InterjectPrompt => Some("interject_prompt"),
+        ActionId::OpenExtensions => Some("open_extensions"),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -506,6 +549,32 @@ mod tests {
         assert_eq!(key!(Enter).display(), "Enter");
         assert_eq!(key!('c', CONTROL).display(), "Ctrl+c");
         assert_eq!(key!('l', CONTROL).display(), "Ctrl+l");
+    }
+
+    #[test]
+    fn shortcut_used_allowlist_is_ctrl_l_actions_only() {
+        assert_eq!(
+            shortcut_used_action_label(ActionId::InterjectPrompt),
+            Some("interject_prompt")
+        );
+        assert_eq!(
+            shortcut_used_action_label(ActionId::OpenExtensions),
+            Some("open_extensions")
+        );
+        assert_eq!(shortcut_used_action_label(ActionId::OpenDashboard), None);
+        assert_eq!(shortcut_used_action_label(ActionId::SendPrompt), None);
+        assert_eq!(When::PromptFocused.telemetry_name(), "prompt_focused");
+        assert_eq!(When::AgentScreen.telemetry_name(), "agent_screen");
+    }
+
+    #[test]
+    fn telemetry_chord_is_platform_stable() {
+        let ctrl_l = key!('l', CONTROL);
+        assert_eq!(ctrl_l.display_telemetry(), "Ctrl+L");
+        // UI pretty form lowercases the letter; telemetry must not.
+        assert_eq!(ctrl_l.display_pretty(), "Ctrl+l");
+        assert_eq!(key!('o', CONTROL).display_telemetry(), "Ctrl+O");
+        assert_eq!(key!(Enter, CONTROL).display_telemetry(), "Ctrl+Enter");
     }
 
     #[test]
@@ -887,6 +956,87 @@ mod tests {
     fn exit_session_is_command_only() {
         let registry = ActionRegistry::defaults();
         assert!(registry.find(ActionId::ExitSession).is_none());
+    }
+
+    fn binds_ctrl_4(def: &ActionDef) -> bool {
+        let ctrl_4 = key!('4', CONTROL);
+        def.default_key == ctrl_4 || def.alt_keys.contains(&ctrl_4)
+    }
+
+    // Host-default registry: at most one of these two owns Ctrl+4.
+    #[test]
+    fn open_dashboard_and_toggle_queue_do_not_both_bind_ctrl_4() {
+        let registry = ActionRegistry::defaults();
+        let dashboard = registry.find(ActionId::OpenDashboard).unwrap();
+        let queue = registry.find(ActionId::ToggleQueue).unwrap();
+        assert!(!(binds_ctrl_4(dashboard) && binds_ctrl_4(queue)));
+        assert_eq!(dashboard.default_key, key!('\\', CONTROL));
+        // Exactly one of the two binds Ctrl+4 under host defaults (legacy alt XOR queue primary).
+        assert!(
+            binds_ctrl_4(dashboard) ^ binds_ctrl_4(queue),
+            "exactly one of OpenDashboard/ToggleQueue must bind Ctrl+4 on this host"
+        );
+    }
+
+    // Crossterm maps C0 FS (physical Ctrl+\) to Char('4')+CONTROL without KKP.
+    #[test]
+    fn open_dashboard_accepts_legacy_ctrl_4_encoding() {
+        let mut actions = default_actions(crate::app::ScreenMode::Fullscreen, false);
+        for def in actions.iter_mut() {
+            if def.id == ActionId::OpenDashboard {
+                def.alt_keys = vec![key!('4', CONTROL)];
+            }
+            if def.id == ActionId::ToggleQueue {
+                def.default_key = key!(';', CONTROL);
+                def.alt_keys = vec![key!('\'', CONTROL)];
+            }
+        }
+        let registry = ActionRegistry::new(actions);
+        let ctrl_backslash = KeyEvent::new(KeyCode::Char('\\'), KeyModifiers::CONTROL);
+        let ctrl_4 = KeyEvent::new(KeyCode::Char('4'), KeyModifiers::CONTROL);
+        let ctrl_semicolon = KeyEvent::new(KeyCode::Char(';'), KeyModifiers::CONTROL);
+
+        assert_eq!(
+            registry.lookup(&ctrl_backslash, When::Always),
+            Some(ActionId::OpenDashboard)
+        );
+        assert_eq!(
+            registry.lookup(&ctrl_4, When::Always),
+            Some(ActionId::OpenDashboard)
+        );
+        assert_eq!(registry.lookup(&ctrl_4, When::AgentScreen), None);
+        assert_eq!(
+            registry.lookup(&ctrl_semicolon, When::AgentScreen),
+            Some(ActionId::ToggleQueue)
+        );
+    }
+
+    // Mac-VS pin: ToggleQueue primary Ctrl+4; OpenDashboard keeps Ctrl+\ only.
+    #[test]
+    fn mac_vscode_ctrl_4_stays_toggle_queue_not_open_dashboard() {
+        let mut actions = default_actions(crate::app::ScreenMode::Fullscreen, false);
+        for def in actions.iter_mut() {
+            if def.id == ActionId::ToggleQueue {
+                def.default_key = key!('4', CONTROL);
+                def.alt_keys = vec![key!(';', CONTROL), key!('\'', CONTROL)];
+            }
+            if def.id == ActionId::OpenDashboard {
+                def.alt_keys = vec![];
+            }
+        }
+        let registry = ActionRegistry::new(actions);
+        let ctrl_4 = KeyEvent::new(KeyCode::Char('4'), KeyModifiers::CONTROL);
+        let ctrl_backslash = KeyEvent::new(KeyCode::Char('\\'), KeyModifiers::CONTROL);
+
+        assert_eq!(
+            registry.lookup(&ctrl_4, When::AgentScreen),
+            Some(ActionId::ToggleQueue)
+        );
+        assert_eq!(registry.lookup(&ctrl_4, When::Always), None);
+        assert_eq!(
+            registry.lookup(&ctrl_backslash, When::Always),
+            Some(ActionId::OpenDashboard)
+        );
     }
 
     #[test]

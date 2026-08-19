@@ -25,13 +25,28 @@ pub fn bootstrap(
 ) -> Result<(AgentConfig, ModelsManager), String> {
     // Remote kill-switch before the gate (settings-only prefetch — no managed-config
     // sync, so a live server cannot heal a tampered policy before fail-closed).
+    xai_grok_telemetry::startup::enter(xai_grok_telemetry::startup::StartupPhase::Bootstrap);
     let mut cfg = cfg.clone();
-    ensure_remote_settings_side_effects(&mut cfg, false);
+    {
+        let _timer = crate::instrumentation_timer!("startup.bootstrap.remote_settings");
+        ensure_remote_settings_side_effects(&mut cfg, false);
+    }
     crate::managed_config::managed_policy_gate()?;
-    let cfg = resolve_config(&cfg, auth_manager);
-    cfg.validate_model_filters()?;
-    init_process(&cfg, auth_manager);
-    let models_manager = ModelsManager::from_config(&cfg, prefetched, auth_manager.clone())?;
+    let cfg = {
+        let _timer = crate::instrumentation_timer!("startup.bootstrap.resolve_config");
+        let cfg = resolve_config(&cfg, auth_manager);
+        cfg.validate_model_filters()?;
+        cfg
+    };
+    {
+        let _timer = crate::instrumentation_timer!("startup.bootstrap.init_process");
+        init_process(&cfg, auth_manager);
+    }
+    xai_grok_telemetry::startup::enter(xai_grok_telemetry::startup::StartupPhase::ModelCatalog);
+    let models_manager = {
+        let _timer = crate::instrumentation_timer!("startup.bootstrap.models_manager");
+        ModelsManager::from_config(&cfg, prefetched, auth_manager.clone())?
+    };
 
     // Refresh on every auth refresh — the FSEvents watcher can silently die after
     // macOS sleep, stranding the catalog on bundled defaults.
@@ -106,12 +121,7 @@ fn resolve_config(cfg: &AgentConfig, auth_manager: &AuthManager) -> AgentConfig 
         }
     }
 
-    let managed_enforced = crate::config::apply_managed_settings_features(&mut cfg);
-    let requirements_enforced = crate::config::apply_requirements(&mut cfg);
-
-    for e in managed_enforced.iter().chain(&requirements_enforced) {
-        tracing::info!(field = %e.path, value = %e.value, source = %e.source, "policy override");
-    }
+    crate::config::apply_policy(&mut cfg);
 
     // Idempotent: bootstrap may already have fetched + applied side effects for the gate.
     // Full prefetch (with managed-config sync when stale) is allowed after the gate.
@@ -152,7 +162,8 @@ fn init_process(cfg: &AgentConfig, auth_manager: &AuthManager) {
         // agent) passes through here, so diagnostic uploads always carry
         // the version stamp and the resource ceilings in effect.
         xai_grok_telemetry::unified_log::set_version(xai_grok_version::VERSION);
-        crate::util::limits::log_effective_limits();
+        let limits = crate::util::limits::ProcessLimits::read();
+        limits.log();
 
         if !cfg!(test) {
             // Clear a logged-out team's files before the background sync runs.
@@ -162,6 +173,10 @@ fn init_process(cfg: &AgentConfig, auth_manager: &AuthManager) {
 
         let grok_home = crate::util::grok_home::grok_home();
         crate::builtin::extract_builtin_files(&grok_home);
+        if !cfg!(test) {
+            // Deletes dirs; must never touch a unit-test process's real home.
+            crate::builtin::purge_stale_extracted_skills(&grok_home);
+        }
 
         crate::extensions::marketplace::purge_default_skills_installs(&grok_home);
 
@@ -174,7 +189,7 @@ fn init_process(cfg: &AgentConfig, auth_manager: &AuthManager) {
 
         let telemetry_mode = cfg.resolve_telemetry_mode();
         let trace_upload = cfg.resolve_trace_upload();
-        let feedback = cfg.resolve_feedback();
+        let feedback = cfg.feature(config::Feature::Feedback);
         let feedback_url = cfg.endpoints.resolve_feedback_base_url();
         let trace_upload_url = cfg.endpoints.resolve_trace_upload_url();
         tracing::info!(
@@ -196,12 +211,23 @@ fn init_process(cfg: &AgentConfig, auth_manager: &AuthManager) {
             );
         }
         update_telemetry_config(cfg, auth_manager);
+        // Emitted here: the event needs the client update_telemetry_config installs.
+        xai_grok_telemetry::session_ctx::log_event(limits.into_event());
     });
 }
 
 /// Apply current telemetry config + auth identity. Tears down the client
 /// when telemetry is disabled, so it's safe to call repeatedly.
 pub fn update_telemetry_config(config: &AgentConfig, auth_manager: &AuthManager) {
+    // shared_client() aborts (panic = "abort") on an invalid user agent,
+    // and that string comes from the GROK_CLIENT_NAME env var. Telemetry
+    // init must never take down its caller — `grok update` is a repair
+    // command — so validate the one user-controlled input first.
+    let user_agent = crate::http::process_user_agent_string();
+    if reqwest::header::HeaderValue::from_str(&user_agent).is_err() {
+        tracing::warn!("telemetry init skipped: GROK_CLIENT_NAME yields an invalid user agent");
+        return;
+    }
     let grok_auth = auth_manager.current().filter(|a| a.is_xai_auth());
     let user_id = grok_auth.as_ref().map(|a| a.user_id.clone());
     let team_id = grok_auth.as_ref().and_then(|a| a.team_id.clone());

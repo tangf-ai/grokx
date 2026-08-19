@@ -1,61 +1,14 @@
 //! Filesystem locations for grok config files and binaries.
 
 use std::path::PathBuf;
-use std::sync::OnceLock;
 
-static GROK_HOME: OnceLock<PathBuf> = OnceLock::new();
+pub use xai_grok_home::{default_grok_home, grok_home, user_grok_home};
 
 #[cfg(target_os = "macos")]
 const CLAUDE_MANAGED_SETTINGS_PATH: &str =
     "/Library/Application Support/ClaudeCode/managed-settings.json";
 #[cfg(target_os = "linux")]
 const CLAUDE_MANAGED_SETTINGS_PATH: &str = "/etc/claude-code/managed-settings.json";
-
-/// The default user grok directory (`~/.grok`, canonicalized) used when
-/// `GROK_HOME` is unset. Exposed so callers (e.g. display helpers) can detect
-/// whether [`grok_home()`] is the default without duplicating the computation.
-///
-/// Uses [`dunce::canonicalize`] instead of [`std::fs::canonicalize`]: on
-/// Windows, std returns a verbatim path (`\\?\C:\Users\...`) which external
-/// tools choke on — e.g. `git clone` rejects `\\?\` destinations with
-/// "Invalid argument", breaking marketplace cache clones under
-/// `~/.grok/marketplace-cache`. `dunce` strips the prefix whenever the path
-/// is safely representable in legacy form; on non-Windows it is identical to
-/// `std::fs::canonicalize`.
-///
-/// Keep the dunce canonicalization in sync with the hand-rolled duplicate in
-/// `xai_fast_worktree::db::resolve_grok_home` (deliberately standalone crate).
-pub fn default_grok_home() -> PathBuf {
-    #[allow(deprecated)]
-    let home = std::env::home_dir().unwrap_or_else(|| PathBuf::from("."));
-    dunce::canonicalize(&home).unwrap_or(home).join(".grok")
-}
-
-/// Per-user config directory: `$GROK_HOME` or `~/.grok`. Created if needed.
-pub fn grok_home() -> PathBuf {
-    GROK_HOME
-        .get_or_init(|| {
-            let grok_home = if let Ok(v) = std::env::var("GROK_HOME") {
-                PathBuf::from(v)
-            } else {
-                default_grok_home()
-            };
-            let _ = std::fs::create_dir_all(&grok_home);
-            grok_home
-        })
-        .clone()
-}
-
-/// The user-global grok home, but only when one genuinely resolves: `Some` when
-/// `$GROK_HOME` is set or a home directory is found, `None` otherwise. Unlike
-/// [`grok_home()`], this never falls back to a cwd-relative `.grok`, so callers
-/// that *scan* user-global grok resources (hooks, marketplace sources, ...) don't
-/// mistake a project's `.grok` tree for the user-global one when no home resolves.
-pub fn user_grok_home() -> Option<PathBuf> {
-    #[allow(deprecated)]
-    let resolvable = std::env::var_os("GROK_HOME").is_some() || std::env::home_dir().is_some();
-    resolvable.then(grok_home)
-}
 
 /// Canonical grok application path: `$GROK_HOME/bin/grok` (Unix) or `grok.exe` (Windows).
 pub fn grok_application() -> PathBuf {
@@ -151,13 +104,56 @@ pub fn decode_cwd_from_dirname(dir: &std::path::Path) -> Option<String> {
         .map(|s| s.trim().to_string())
 }
 
+/// Best-effort chmod 0700 on Unix, no-op elsewhere: session dirs hold chat
+/// history, and creators re-run on every touch so the mode self-heals.
+/// Failures are logged (not returned): on chmod-hostile filesystems (FAT,
+/// some network mounts) healing pre-existing loose dirs can never succeed,
+/// and that must be visible.
+pub fn set_dir_owner_only(dir: &std::path::Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(e) = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)) {
+            tracing::debug!(?e, dir = %dir.display(), "failed to chmod session dir owner-only");
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+    }
+}
+
+/// `create_dir_all` with directories born 0700 on Unix (no umask window),
+/// plus a self-heal chmod for a pre-existing `dir`. Prefer this over bare
+/// `create_dir_all` for anything under `sessions/`.
+pub fn create_dir_all_owner_only(dir: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)?;
+    }
+    #[cfg(not(unix))]
+    std::fs::create_dir_all(dir)?;
+    set_dir_owner_only(dir);
+    Ok(())
+}
+
 /// Build the CWD-level session directory path:
 /// `grok_home()/sessions/{encode_cwd_dirname(cwd)}`.
 ///
 /// Does **not** create the directory on disk — use [`ensure_sessions_cwd_dir`]
 /// when the directory must exist.
 pub fn sessions_cwd_dir(cwd: &str) -> PathBuf {
-    grok_home().join("sessions").join(encode_cwd_dirname(cwd))
+    sessions_cwd_dir_in(&grok_home(), cwd)
+}
+
+/// [`sessions_cwd_dir`] with an injectable grok home — the single source of
+/// truth for the `sessions/<encoded-cwd>` path shape.
+pub fn sessions_cwd_dir_in(grok_home: &std::path::Path, cwd: &str) -> PathBuf {
+    grok_home.join("sessions").join(encode_cwd_dirname(cwd))
 }
 
 /// Create the CWD-level session directory and write a `.cwd` metadata file
@@ -166,9 +162,20 @@ pub fn sessions_cwd_dir(cwd: &str) -> PathBuf {
 /// For short paths the `.cwd` file is not written because the directory name
 /// itself is reversible via URL-decoding.
 pub fn ensure_sessions_cwd_dir(cwd: &str) -> std::io::Result<PathBuf> {
+    ensure_sessions_cwd_dir_in(&grok_home(), cwd)
+}
+
+/// [`ensure_sessions_cwd_dir`] with an injectable grok home.
+pub fn ensure_sessions_cwd_dir_in(
+    grok_home: &std::path::Path,
+    cwd: &str,
+) -> std::io::Result<PathBuf> {
     let encoded_name = encode_cwd_dirname(cwd);
-    let dir = grok_home().join("sessions").join(&encoded_name);
-    std::fs::create_dir_all(&dir)?;
+    let dir = sessions_cwd_dir_in(grok_home, cwd);
+    // 0700 dir + root shield everything beneath (children with looser modes,
+    // cwd-path dirnames, the session search index).
+    create_dir_all_owner_only(&dir)?;
+    set_dir_owner_only(&grok_home.join("sessions"));
     // Hash-based encoding is in use when the dirname differs from the
     // plain URL-encoded form.  Write a `.cwd` file so decode can recover
     // the original path.  O_CREAT|O_EXCL via create_new avoids TOCTOU
@@ -305,14 +312,100 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    fn unix_mode(path: &std::path::Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
     #[test]
-    fn default_grok_home_has_no_verbatim_prefix() {
-        // On Windows, std::fs::canonicalize returns `\\?\C:\...` verbatim
-        // paths that external tools (notably `git clone`) reject. The dunce
-        // canonicalization must yield a plain path. No-op assertion on Unix.
-        let home = default_grok_home();
-        assert!(!home.to_string_lossy().starts_with(r"\\?\"));
-        assert!(home.ends_with(".grok"));
+    #[cfg(unix)]
+    fn set_dir_owner_only_restricts_mode_to_0700() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("child");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        set_dir_owner_only(&dir);
+
+        assert_eq!(unix_mode(&dir), 0o700);
+    }
+
+    #[test]
+    fn set_dir_owner_only_is_best_effort_on_missing_path() {
+        // Must not panic or error — chmod failures are intentionally ignored.
+        set_dir_owner_only(std::path::Path::new("/nonexistent/definitely/not/here"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn create_dir_all_owner_only_creates_chain_born_0700() {
+        let tmp = TempDir::new().unwrap();
+        let leaf = tmp.path().join("a").join("b");
+        create_dir_all_owner_only(&leaf).unwrap();
+        assert_eq!(unix_mode(&leaf), 0o700, "leaf must be 0700");
+        assert_eq!(
+            unix_mode(leaf.parent().unwrap()),
+            0o700,
+            "created intermediate must be born 0700"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn create_dir_all_owner_only_retightens_existing_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("existing");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        create_dir_all_owner_only(&dir).unwrap();
+
+        assert_eq!(unix_mode(&dir), 0o700);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn ensure_sessions_cwd_dir_creates_owner_only_dir_and_root() {
+        let home = TempDir::new().unwrap();
+        let dir = ensure_sessions_cwd_dir_in(home.path(), "/some/project").unwrap();
+        assert!(dir.is_dir());
+        assert_eq!(unix_mode(&dir), 0o700);
+        assert_eq!(
+            unix_mode(&home.path().join("sessions")),
+            0o700,
+            "sessions root must be 0700 (shields stale children and the search index)"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn ensure_sessions_cwd_dir_retightens_existing_loose_dirs() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = TempDir::new().unwrap();
+        let root = home.path().join("sessions");
+        let dir = ensure_sessions_cwd_dir_in(home.path(), "/some/project").unwrap();
+        // Simulate dirs created by an older grok with umask-default perms.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let again = ensure_sessions_cwd_dir_in(home.path(), "/some/project").unwrap();
+
+        assert_eq!(again, dir);
+        assert_eq!(unix_mode(&dir), 0o700, "mode must self-heal on next touch");
+        assert_eq!(unix_mode(&root), 0o700, "root must self-heal on next touch");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn ensure_sessions_cwd_dir_hash_encoded_writes_cwd_file_and_owner_only() {
+        let home = TempDir::new().unwrap();
+        let long_cwd = format!("/Users/test/{}", "中".repeat(30));
+        let dir = ensure_sessions_cwd_dir_in(home.path(), &long_cwd).unwrap();
+        assert_eq!(unix_mode(&dir), 0o700);
+        assert_eq!(std::fs::read_to_string(dir.join(".cwd")).unwrap(), long_cwd);
     }
 
     #[test]

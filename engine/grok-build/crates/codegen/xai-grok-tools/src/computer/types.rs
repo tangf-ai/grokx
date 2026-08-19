@@ -55,6 +55,22 @@ pub trait AsyncFileSystem: Send + Sync {
     async fn write_file(&self, path: &Path, data: &[u8]) -> Result<(), ComputerError>;
 
     async fn delete_file(&self, path: &Path) -> Result<(), ComputerError>;
+
+    /// Whether `path` exists as a readable regular file, without reading
+    /// its contents. `Ok(false)` means a definitive not-found; other probe
+    /// failures surface as `Err`.
+    ///
+    /// The default errs with `ErrorKind::Unsupported` — callers must treat
+    /// `Err` as "unknown" and fail closed. Backends opt in by overriding
+    /// with a cheap stat/lookup; a full-content read is never an acceptable
+    /// probe (the target may be arbitrarily large or remote).
+    async fn file_exists(&self, path: &Path) -> Result<bool, ComputerError> {
+        let _ = path;
+        Err(ComputerError::io_with_kind(
+            "file_exists is not supported by this backend",
+            std::io::ErrorKind::Unsupported,
+        ))
+    }
 }
 
 // ============================================================================
@@ -190,7 +206,13 @@ pub struct TaskSnapshot {
     pub end_time: Option<std::time::SystemTime>,
     pub output: String,
     pub output_file: PathBuf,
+    /// `output` may not be the whole output: read `output_file` for the rest.
+    /// Says the copy is partial, not how it came to be.
     pub truncated: bool,
+    /// Total bytes the task has written, when the source tracks it. `output`
+    /// may hold only part of that; zero means unknown.
+    #[serde(default)]
+    pub output_total_bytes: usize,
     pub exit_code: Option<i32>,
     pub signal: Option<String>,
     pub completed: bool,
@@ -202,14 +224,15 @@ pub struct TaskSnapshot {
     /// because the blocking caller already received the result directly.
     #[serde(default)]
     pub block_waited: bool,
-    /// Whether this task was explicitly killed via the `kill_command_or_subagent` tool.
-    /// When set, auto-wake synthetic prompts are suppressed because the model
-    /// already received the kill result via `KillTaskResult`.
-    /// Also set during `kill_all_background_tasks` teardown (e.g. subagent
-    /// cleanup), where auto-wake suppression is irrelevant since the session
-    /// is shutting down.
+    /// Whether this task was explicitly killed (kill tool, UI Stop, or
+    /// teardown) rather than exiting on its own. Display/tombstone flag;
+    /// auto-wake uses [`Self::is_auto_wake_suppressed`].
     #[serde(default)]
     pub explicitly_killed: bool,
+    /// Model already got a kill/wait tool result, or the kill was teardown.
+    /// False for UI/Stop with no live waiter. Missing on the wire is false.
+    #[serde(default)]
+    pub kill_result_delivered: bool,
 
     /// Session that owns this task. Used for scoped kill operations so
     /// subagent teardown only kills the subagent's own tasks, not
@@ -242,9 +265,20 @@ impl TaskSnapshot {
         !self.completed
     }
 
+    /// The output on hand, and the size of the output it came from. Readers
+    /// take the size from here so the "not tracked" case is handled once.
+    pub fn output_view(&self) -> crate::util::truncate::PartialOutput<'_> {
+        crate::util::truncate::PartialOutput::part_of(&self.output, self.output_total_bytes)
+    }
+
     /// Incomplete and backgrounded — tray/`tasks_snapshot` predicate (not FG in-flight).
     pub fn is_outstanding_background(&self) -> bool {
         !self.completed && self.is_backgrounded
+    }
+
+    /// True when a TaskCompleted auto-wake would be redundant.
+    pub fn is_auto_wake_suppressed(&self) -> bool {
+        self.block_waited || (self.explicitly_killed && self.kill_result_delivered)
     }
 }
 
@@ -259,6 +293,25 @@ pub enum KillOutcome {
     Killed,
     AlreadyExited,
     NotFound,
+}
+
+/// Who initiated a background-task kill.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KillSource {
+    /// Model `kill_task` / `kill_command_or_subagent` tool.
+    ModelTool,
+    /// Single-task client UI kill (task-pane `[×]`).
+    ClientUi,
+    /// Bulk teardown: owner sweep, dashboard stop-all, session delete, headless reap.
+    Teardown,
+}
+
+impl KillSource {
+    /// Model-tool and teardown kills count as delivered; a client/UI kill
+    /// counts only when a waiter actually received the result.
+    pub fn marks_result_delivered(self, waiter_delivered: bool) -> bool {
+        matches!(self, Self::ModelTool | Self::Teardown) || waiter_delivered
+    }
 }
 
 // ============================================================================
@@ -286,7 +339,19 @@ pub trait TerminalBackend: Send + Sync {
     async fn get_task(&self, task_id: &str) -> Option<TaskSnapshot>;
 
     /// Kill a background task.
+    ///
+    /// Equivalent to [`Self::kill_task_with_source`] with
+    /// [`KillSource::ModelTool`].
     async fn kill_task(&self, task_id: &str) -> KillOutcome;
+
+    /// Kill a background task, recording who initiated the kill.
+    ///
+    /// The default ignores `source` and delegates to [`Self::kill_task`],
+    /// which existing backends treat as a model-tool kill.
+    async fn kill_task_with_source(&self, task_id: &str, source: KillSource) -> KillOutcome {
+        let _ = source;
+        self.kill_task(task_id).await
+    }
 
     /// Kill all running foreground processes.
     async fn kill_foreground_commands(&self) {}
@@ -418,6 +483,127 @@ mod tests {
             ce.io_error_kind(),
             Some(std::io::ErrorKind::PermissionDenied)
         );
+    }
+
+    #[tokio::test]
+    async fn file_exists_default_is_unsupported() {
+        struct MinimalFs;
+
+        #[async_trait::async_trait]
+        impl AsyncFileSystem for MinimalFs {
+            async fn read_file(&self, _path: &Path) -> Result<Vec<u8>, ComputerError> {
+                panic!("the default file_exists must not read file contents");
+            }
+            async fn write_file(&self, _path: &Path, _data: &[u8]) -> Result<(), ComputerError> {
+                unreachable!()
+            }
+            async fn delete_file(&self, _path: &Path) -> Result<(), ComputerError> {
+                unreachable!()
+            }
+        }
+
+        let err = MinimalFs
+            .file_exists(Path::new("/any"))
+            .await
+            .expect_err("default probe must err");
+        assert_eq!(err.io_error_kind(), Some(std::io::ErrorKind::Unsupported));
+    }
+
+    #[test]
+    fn kill_source_marks_result_delivered() {
+        assert!(KillSource::ModelTool.marks_result_delivered(false));
+        assert!(KillSource::ModelTool.marks_result_delivered(true));
+        assert!(KillSource::Teardown.marks_result_delivered(false));
+        assert!(KillSource::Teardown.marks_result_delivered(true));
+        assert!(!KillSource::ClientUi.marks_result_delivered(false));
+        assert!(KillSource::ClientUi.marks_result_delivered(true));
+    }
+
+    #[test]
+    fn snapshot_suppresses_auto_wake_only_when_result_was_delivered() {
+        let mut snap = TaskSnapshot {
+            task_id: "t".into(),
+            command: "sleep 1".into(),
+            display_command: None,
+            cwd: "/tmp".into(),
+            start_time: std::time::SystemTime::UNIX_EPOCH,
+            end_time: None,
+            output: String::new(),
+            output_file: PathBuf::new(),
+            truncated: false,
+            output_total_bytes: 0,
+            exit_code: None,
+            signal: None,
+            completed: false,
+            kind: TaskKind::Bash,
+            block_waited: false,
+            explicitly_killed: false,
+            kill_result_delivered: false,
+            owner_session_id: None,
+            description: None,
+            is_backgrounded: false,
+        };
+        assert!(!snap.is_auto_wake_suppressed());
+
+        snap.block_waited = true;
+        assert!(snap.is_auto_wake_suppressed());
+        snap.block_waited = false;
+
+        snap.explicitly_killed = true;
+        assert!(
+            !snap.is_auto_wake_suppressed(),
+            "UI/Stop kill with no delivered result must wake"
+        );
+        snap.kill_result_delivered = true;
+        assert!(
+            snap.is_auto_wake_suppressed(),
+            "model-tool/teardown/delivered kill must suppress"
+        );
+        snap.explicitly_killed = false;
+        assert!(
+            !snap.is_auto_wake_suppressed(),
+            "delivered bit alone is not a kill"
+        );
+    }
+
+    #[test]
+    fn kill_result_delivered_deserializes_default_false() {
+        let mut snap = TaskSnapshot {
+            task_id: "t".into(),
+            command: "echo".into(),
+            display_command: None,
+            cwd: "/tmp".into(),
+            start_time: std::time::SystemTime::UNIX_EPOCH,
+            end_time: None,
+            output: String::new(),
+            output_file: PathBuf::from("/tmp/t.log"),
+            truncated: false,
+            output_total_bytes: 0,
+            exit_code: None,
+            signal: None,
+            completed: true,
+            kind: TaskKind::Bash,
+            block_waited: false,
+            explicitly_killed: true,
+            kill_result_delivered: true,
+            owner_session_id: None,
+            description: None,
+            is_backgrounded: false,
+        };
+        let mut value = serde_json::to_value(&snap).expect("serialize");
+        value
+            .as_object_mut()
+            .expect("object")
+            .remove("kill_result_delivered");
+        let decoded: TaskSnapshot = serde_json::from_value(value).expect("legacy snapshot");
+        assert!(!decoded.kill_result_delivered);
+        assert!(decoded.explicitly_killed);
+        assert!(
+            !decoded.is_auto_wake_suppressed(),
+            "legacy explicitly_killed without the new field is not a delivered kill"
+        );
+        snap.kill_result_delivered = false;
+        assert_eq!(decoded, snap);
     }
 
     #[test]

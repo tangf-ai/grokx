@@ -391,18 +391,19 @@ impl xai_tool_runtime::Tool for GrepTool {
                 tracing::Span::current().record("wall_ms", started.elapsed().as_millis() as u64);
                 tracing::warn!(timeout_secs = timeout.as_secs(), "grep timed out");
                 let _ = child.start_kill();
-                let _ = child.wait().await;
+                crate::util::reap_killed_search_child(&mut child).await;
                 return Ok(grep_timeout_output(timeout.as_secs()));
             }
         };
 
-        // `rg` was already killed inside the timeout block when `stdout_truncated`
-        // (before the stderr drain); just reap it here.
-        let status = child.wait().await.ok();
+        // Truncated output means `rg` was already killed above — bounded reap,
+        // and the exit code is defined as 0. A natural EOF means rg is exiting,
+        // so the plain wait is prompt.
         let exit_code = if stdout_truncated {
+            crate::util::reap_killed_search_child(&mut child).await;
             0
         } else {
-            status.and_then(|s| s.code()).unwrap_or(-1)
+            child.wait().await.ok().and_then(|s| s.code()).unwrap_or(-1)
         };
 
         tracing::Span::current().record("early_kill", stdout_truncated);
@@ -570,7 +571,7 @@ fn grep_progress_stream(
                 tracing::warn!(timeout_secs = secs, "grep timed out");
             });
             let _ = child.start_kill();
-            let _ = child.wait().await;
+            crate::util::reap_killed_search_child(&mut child).await;
             // Timeout: finalize what was read (marked truncated) plus an
             // explicit notice, so the stream isn't contradicted; with
             // nothing streamed, fall back to the timeout-only card.
@@ -621,11 +622,14 @@ fn grep_progress_stream(
             .await;
         }
 
-        let status = child.wait().await.ok();
+        // Truncated output means `rg` was already killed above — bounded reap,
+        // and the exit code is defined as 0. A natural EOF means rg is exiting,
+        // so the plain wait is prompt.
         let exit_code = if stdout_truncated {
+            crate::util::reap_killed_search_child(&mut child).await;
             0
         } else {
-            status.and_then(|s| s.code()).unwrap_or(-1)
+            child.wait().await.ok().and_then(|s| s.code()).unwrap_or(-1)
         };
 
         let wall_ms = stream_started.elapsed().as_millis() as u64;
@@ -823,9 +827,11 @@ async fn prepare_grep(
     cmd.arg("--max-filesize").arg("5M");
 
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-    crate::util::detach_command(&mut cmd);
-    cmd.stdin(Stdio::null());
+    crate::util::detach_search_command(&mut cmd);
 
+    #[allow(clippy::disallowed_methods)]
+    // search helper; killed and reaped with a bound on timeout/truncation,
+    // abandoned to the orphan reaper if unreapable (D-state)
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
@@ -2592,5 +2598,45 @@ mod tests {
             deltas, body_from_card,
             "accumulated deltas must equal the terminal card body even when truncated"
         );
+    }
+
+    /// A cancelled tool future drops the `Child` before any wait/kill path
+    /// runs; the spawn config must kill rg on drop.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropping_spawned_grep_child_kills_rg() {
+        let tmp = TempDir::new().unwrap();
+        // Overflow the stdout pipe so rg blocks on write and stays alive until killed.
+        let line = format!("needle {}\n", "x".repeat(120));
+        fs::write(tmp.path().join("big.txt"), line.repeat(20_000)).unwrap();
+
+        let mut resources = Resources::new();
+        resources.insert(Cwd(tmp.path().to_path_buf()));
+        let ctx = test_ctx(resources.into_shared());
+
+        let step = prepare_grep(&ctx, &make_grep_input("needle"))
+            .await
+            .expect("prepare_grep");
+        let ready = match step {
+            GrepStep::Ready(r) => r,
+            GrepStep::Early(out) => panic!("expected spawned rg, got early output: {out:?}"),
+        };
+        let pid = ready.child.id().expect("child pid");
+
+        // Hold the read end open (no EPIPE death) and drop the child mid-run.
+        let GrepReady {
+            child, stdout_pipe, ..
+        } = ready;
+        drop(child);
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !xai_tty_utils::process_not_running(pid) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "rg (pid {pid}) still running 5s after its Child was dropped — leaked"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        drop(stdout_pipe);
     }
 }

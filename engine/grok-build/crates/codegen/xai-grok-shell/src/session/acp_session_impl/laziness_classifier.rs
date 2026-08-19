@@ -111,11 +111,8 @@ impl LazinessAbortReason {
 /// "Do not roleplay", JSON-only, no chain-of-thought,
 /// no role context, transcript framed as third-party data.
 /// Prefix on `x_grok_req_id` for laziness-classifier sampler calls.
-/// Centralised here so the production producer
-/// (`maybe_fire_laziness_check`) AND the offline replay harness
-/// (`crate::trace_classifier::build_classifier_request`) share a
-/// single source of truth — a drift would otherwise pass the F17
-/// fidelity test by re-typing the literal in both sites.
+/// Centralised here as the single source of truth for the production
+/// producer (`maybe_fire_laziness_check`).
 pub(crate) const LAZINESS_REQ_ID_PREFIX: &str = "xai-laziness-";
 
 /// Preamble on the User-item text of the classifier request. The
@@ -229,10 +226,9 @@ Example INVALID outputs (do not produce any of these):\n\
 - \"The agent appears stalled. {...}\" (no prose around JSON)\n";
 
 /// Harness-wide default for `[assistant reasoning]` emission in the
-/// classifier transcript. Per-model
-/// (`LazinessDetectorPerModelConfig::include_reasoning`) and CLI
-/// (`trace_classify --include-reasoning`) overrides resolve through
-/// this default when absent. Flip to `false` for a one-line revert if
+/// classifier transcript. The per-model override
+/// (`LazinessDetectorPerModelConfig::include_reasoning`) resolves
+/// through this default when absent. Flip to `false` for a one-line revert if
 /// the live classifier proves biased by chain-of-thought in shadow.
 pub(crate) const LAZINESS_INCLUDE_REASONING: bool = true;
 
@@ -264,10 +260,8 @@ pub(crate) fn turn_elapsed_seconds_from_start_ms(
 }
 
 /// Render the harness-truth `[runtime_state] ...` line that precedes
-/// the flattened transcript. Shared between production
-/// (`maybe_fire_laziness_check`) and the offline replay
-/// (`trace_classifier::build_classifier_request`) so the wire format
-/// stays in lock-step.
+/// the flattened transcript, for the production classifier
+/// (`maybe_fire_laziness_check`).
 ///
 /// `turn_elapsed_seconds` is omitted when `None` (no signal available)
 /// so the classifier sees only the fields the harness actually
@@ -309,7 +303,8 @@ pub(crate) fn format_runtime_state_line(
 /// continuing the conversation as the agent.
 ///
 /// Format per item:
-/// - `[user] <text>` — concatenation of all `Text` content parts
+/// - `[user] <text>` — genuine human input
+/// - `[agent_message] <warning> <text>` — typed agent-authored input
 ///   (images dropped; this is a text classifier)
 /// - `[assistant reasoning] <text>` — chain-of-thought (emitted only
 ///   when `reasoning.text` is a non-empty, non-whitespace string;
@@ -361,7 +356,16 @@ pub(crate) fn flatten_transcript_for_classifier(
                         text.push_str(t);
                     }
                 }
-                let _ = writeln!(out, "[user] {}", truncate(&text));
+                if user.synthetic_reason == Some(SyntheticReason::AgentMessage) {
+                    let _ = writeln!(
+                        out,
+                        "[agent_message] {} {}",
+                        xai_chat_state::compaction_utils::AGENT_MESSAGE_MODEL_LABEL,
+                        truncate(&text)
+                    );
+                } else {
+                    let _ = writeln!(out, "[user] {}", truncate(&text));
+                }
             }
             ConversationItem::Assistant(asst) => {
                 if !asst.content.is_empty() {
@@ -457,54 +461,37 @@ pub(crate) fn neutralize_transcript_user_text(s: &str) -> String {
     out
 }
 
-/// Recency window (conversation-item count) for the auto-mode classifier
-/// transcript SEED at session spawn. Smaller than the per-permission refresh:
-/// the spawn seed only primes the first classify, before any tool has run.
-pub(crate) const CLASSIFIER_SPAWN_SEED_TURNS: usize = 12;
-
-/// Recency window (conversation-item count) for the per-permission classifier
-/// transcript REFRESH. Larger than the spawn seed so a mid-session classify sees
-/// enough recent turns to interpret a terse final action in context.
-pub(crate) const CLASSIFIER_REFRESH_TURNS: usize = 16;
-
-/// Per-turn text cap (bytes) for the classifier transcript so one giant pasted
-/// user message or huge tool args can't blow up the per-call classifier request
-/// (token/latency, or context overflow → error → silent heuristic fallback).
-/// Mirrors the laziness classifier's 400-char field cap; truncation appends the
 const CLASSIFIER_TURN_MAX_LEN: usize = xai_grok_workspace::permission::CLASSIFIER_TURN_MAX_LEN;
+const LEGACY_TOOL_IMAGE_FOLLOWUP: &str = "[Image extracted from tool result above]";
 
-/// Build the auto-mode classifier transcript from the most recent `max_items`
-/// conversation items, chronological. Captures GENUINE user text (real input or
-/// a Ctrl+Enter interjection) and assistant tool_use only — every other
-/// synthetic user item is dropped (not user intent, and an injection vector),
-/// and assistant free-text and tool results are excluded so the agent can't
-/// prompt-inject its own permission classifier. User text
-/// and tool args are neutralized (one turn = one line, no forgeable role labels)
-/// and length-capped.
+/// Project the complete resident conversation, retaining only trusted user intent
+/// and assistant tool calls. Every projected field is neutralized and capped.
 pub(crate) fn build_classifier_turns(
     items: &[ConversationItem],
-    max_items: usize,
 ) -> Vec<xai_grok_workspace::permission::ClassifierTurn> {
     use xai_grok_workspace::permission::ClassifierTurn;
-    let start = items.len().saturating_sub(max_items);
     let mut turns = Vec::new();
-    for item in &items[start..] {
+    for item in items {
         match item {
             ConversationItem::User(user) => {
-                // Only genuine user intent feeds the security classifier: real
-                // input (`synthetic_reason == None`) or a Ctrl+Enter interjection.
-                // Drop every other synthetic user item — ProjectInstructions (also
-                // sent via set_project_instructions, so it would double-include
-                // AGENTS.md), AutoContinue, SystemReminder, etc. — which are not
-                // user input and are an injection vector into the classifier.
-                let genuine_user = user.synthetic_reason.is_none()
-                    || user.synthetic_reason == Some(SyntheticReason::Interjection);
-                if !genuine_user {
+                let item_text = item.text_content();
+                // Older sessions persisted tool-extracted images as untagged user items.
+                let is_legacy_tool_image = item_text == LEGACY_TOOL_IMAGE_FOLLOWUP
+                    && user
+                        .content
+                        .iter()
+                        .any(|part| matches!(part, ContentPart::Image { .. }));
+                let text = if user.synthetic_reason == Some(SyntheticReason::Interjection) {
+                    item_text
+                } else if xai_chat_state::compaction_utils::is_real_user_turn(item)
+                    && !is_project_instructions(item)
+                    && !is_legacy_tool_image
+                {
+                    xai_chat_state::compaction_utils::extract_user_query(&item_text)
+                } else {
                     continue;
-                }
-                let text = item.text_content();
+                };
                 if !text.is_empty() {
-                    // Neutralize so the user's own text can't forge a turn, then cap.
                     let text = neutralize_transcript_user_text(&text);
                     let text = xai_grok_tools::util::truncate_str_with_marker(
                         &text,
@@ -516,29 +503,35 @@ pub(crate) fn build_classifier_turns(
             }
             ConversationItem::Assistant(assistant) => {
                 for tc in &assistant.tool_calls {
-                    // Compact the stored JSON args; fall back to the raw string.
                     let args = serde_json::from_str::<serde_json::Value>(&tc.arguments)
                         .map(|v| v.to_string())
                         .unwrap_or_else(|_| tc.arguments.to_string());
-                    // Neutralize the final args (the raw fallback can carry
-                    // unescaped newlines / a leading role label that would forge a
-                    // transcript line via the assistant-tool_use channel), then cap.
                     let args = neutralize_transcript_user_text(&args);
                     let args = xai_grok_tools::util::truncate_str_with_marker(
                         &args,
                         CLASSIFIER_TURN_MAX_LEN,
                     )
                     .into_owned();
-                    turns.push(ClassifierTurn::AssistantToolUse {
-                        tool: tc.name.clone(),
-                        args,
-                    });
+                    let tool = neutralize_transcript_user_text(&tc.name);
+                    let tool = xai_grok_tools::util::truncate_str_with_marker(
+                        &tool,
+                        CLASSIFIER_TURN_MAX_LEN,
+                    )
+                    .into_owned();
+                    turns.push(ClassifierTurn::AssistantToolUse { tool, args });
                 }
             }
             _ => {}
         }
     }
     turns
+}
+
+pub(crate) fn refresh_classifier_transcript(
+    permissions: &PermissionHandle,
+    items: &[ConversationItem],
+) {
+    permissions.set_classifier_transcript(build_classifier_turns(items));
 }
 
 /// Raw AGENTS.md body for the auto-mode classifier's project-instructions: the

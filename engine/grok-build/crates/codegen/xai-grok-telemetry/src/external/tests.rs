@@ -180,6 +180,9 @@ fn metric_attr_keys_are_pinned() {
         "access_kind",
         "permission_mode",
         "error_category",
+        "phase",
+        "stuck_in",
+        "auth_mode",
         "session.id",
         "app.version",
         "user.id",
@@ -270,6 +273,8 @@ fn screen_mode_allowlist_is_pinned() {
 #[test]
 fn tool_name_sanitization() {
     assert_eq!(schema::sanitize_tool_name("read_file"), "read_file");
+    assert_eq!(schema::sanitize_tool_name("memory_search"), "memory_search");
+    assert_eq!(schema::sanitize_tool_name("memory_get"), "memory_get");
     assert_eq!(
         schema::sanitize_tool_name("nebula__post_message"),
         "mcp_tool"
@@ -314,6 +319,7 @@ fn sentinel_session_harness() -> events::SessionHarness {
         hook_names: vec!["h1".into()],
         agents_md_dir_names: vec!["proj".into()],
         memory_enabled: true,
+        memory_retrieval_mode: events::MemoryRetrievalMode::Hybrid,
         is_git_repo: true,
         auto_update: None,
     }
@@ -369,6 +375,57 @@ fn session_new_increments_session_count_only() {
     assert!(exported_events(&stream).is_empty(), "metric-only mapping");
     let names = exported_metric_names(&stream);
     assert_eq!(names, vec!["grok_code.session.count".to_owned()]);
+}
+
+#[test]
+fn agent_connect_timeout_emits_phase_histogram_and_timeout_counter() {
+    let stream = build(gates_off());
+    let mut phase_durations_ms = std::collections::BTreeMap::new();
+    phase_durations_ms.insert("load_config".into(), 12);
+    phase_durations_ms.insert("model_catalog".into(), 28_700);
+    emit_event_into(
+        &stream,
+        &events::AgentConnect {
+            connect_target: crate::startup::AgentKind::Embedded,
+            outcome: crate::startup::StartupOutcome::Timeout,
+            stuck_in: Some("model_catalog".into()),
+            phases: "load_config=12ms, model_catalog>=28.7s".into(),
+            phase_durations_ms,
+            elapsed_ms: 30_000,
+            timeout_secs: Some(30),
+            embedded_fallback: false,
+            auth_mode: crate::startup::AuthMode::Deployment,
+        },
+    );
+    assert!(exported_events(&stream).is_empty());
+    let mut names = exported_metric_names(&stream);
+    names.sort();
+    assert_eq!(
+        names,
+        vec![
+            "grok_code.startup.phase_duration".to_owned(),
+            "grok_code.startup.timeout".to_owned(),
+        ]
+    );
+}
+
+#[test]
+fn startup_complete_records_the_total_histogram_only() {
+    let stream = build(gates_off());
+    emit_event_into(
+        &stream,
+        &events::StartupComplete {
+            total_ms: 1_234,
+            outcome: crate::startup::StartupOutcome::Ok,
+            phases: "load_config=12ms, session_create=800ms".into(),
+            auth_mode: crate::startup::AuthMode::Team,
+        },
+    );
+    assert!(exported_events(&stream).is_empty());
+    assert_eq!(
+        exported_metric_names(&stream),
+        vec!["grok_code.startup.total".to_owned()]
+    );
 }
 
 #[test]
@@ -489,7 +546,7 @@ fn tool_result_gates_off_collapses_and_reduces() {
         &stream,
         &events::ToolCallCompleted {
             tool_name: "nebula__post_message".into(),
-            outcome: xai_file_utils::events::types::ToolOutcome::Success,
+            outcome: xai_grok_session_events::types::ToolOutcome::Success,
             duration_ms: 42,
             file_path: Some("/Users/alice/secret-project/main.rs".into()),
             parameters: Some(serde_json::json!({"text": "CANARY_TOOL_ARGS"})),
@@ -527,7 +584,7 @@ fn tool_result_details_gate_exposes_verbatim_scrubbed() {
         &stream,
         &events::ToolCallCompleted {
             tool_name: "nebula__post_message".into(),
-            outcome: xai_file_utils::events::types::ToolOutcome::Success,
+            outcome: xai_grok_session_events::types::ToolOutcome::Success,
             duration_ms: 42,
             file_path: Some(path.clone()),
             parameters: Some(serde_json::json!({"key": "sk-CANARYabcdefghij1234567890"})),
@@ -670,6 +727,15 @@ fn tool_decision_snapshot() {
             source: Some("user_reject".into()),
             subagent_session_id: None,
             subagent_type: None,
+            manager_prompt_attempted: Some(true),
+            prompt_outcome: Some(events::PermissionPromptOutcome::Reject),
+            decision_reason: Some(events::PermissionDecisionReason::AutoDenialLimit),
+            classifier_source: Some(events::PermissionClassifierSource::Llm),
+            classifier_verdict: Some(events::PermissionClassifierVerdict::Block),
+            security_findings: Some(vec![events::PermissionSecurityFinding::DangerousCommand]),
+            classifier_latency_ms: Some(42),
+            auto_denials_consecutive: Some(3),
+            auto_denials_total: Some(3),
         },
     );
     let events = exported_events(&stream);
@@ -684,6 +750,24 @@ fn tool_decision_snapshot() {
         exported_metric_names(&stream),
         vec!["grok_code.tool.decision"]
     );
+    for key in [
+        "manager_prompt_attempted",
+        "prompt_outcome",
+        "decision_reason",
+        "classifier_source",
+        "classifier_verdict",
+        "security_findings",
+        "classifier_latency_ms",
+        "auto_denials_consecutive",
+        "auto_denials_total",
+    ] {
+        assert_eq!(attr(ev, key), None, "external record must not export {key}");
+    }
+    let dbg = format!("{events:?}");
+    assert!(
+        !dbg.contains("dangerous_command") && !dbg.contains("auto_denial_limit"),
+        "no manager finding/reason value may appear in the external record"
+    );
 }
 
 #[test]
@@ -694,13 +778,36 @@ fn skill_activated_name_gated() {
         &events::SkillDispatched {
             skill_name: "internal-deploy-runbook".into(),
             plugin_source: None,
+            trigger: events::SkillTrigger::SlashCommand,
         },
     );
     let events = exported_events(&stream);
     let ev = &events[0];
     assert_eq!(attr(ev, "skill_source").as_deref(), Some("local"));
+    assert_eq!(attr(ev, "trigger").as_deref(), Some("slash_command"));
     assert_eq!(attr(ev, "skill.name"), None);
     assert!(!format!("{events:?}").contains("internal-deploy-runbook"));
+}
+
+#[test]
+fn skill_activated_exports_every_trigger() {
+    for (trigger, label) in [
+        (events::SkillTrigger::SlashCommand, "slash_command"),
+        (events::SkillTrigger::SkillMdRead, "skill_md_read"),
+        (events::SkillTrigger::SkillTool, "skill_tool"),
+    ] {
+        let stream = build(gates_off());
+        emit_event_into(
+            &stream,
+            &events::SkillDispatched {
+                skill_name: "pdf".into(),
+                plugin_source: None,
+                trigger,
+            },
+        );
+        let events = exported_events(&stream);
+        assert_eq!(attr(&events[0], "trigger").as_deref(), Some(label));
+    }
 }
 
 #[test]
@@ -995,6 +1102,40 @@ fn settings_gate_suppresses_until_resolved() {
     assert!(
         super::is_settings_gate_open(),
         "gate must reopen after settings are resolved"
+    );
+}
+
+#[test]
+fn settings_gate_opens_when_the_bounded_window_expires() {
+    let _serial = GATE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    struct RestoreGate(std::time::Duration);
+    impl Drop for RestoreGate {
+        fn drop(&mut self) {
+            super::set_settings_gate_max_wait(self.0);
+            super::mark_external_otel_settings_resolved();
+        }
+    }
+    let _restore = RestoreGate(super::settings_gate_max_wait());
+
+    super::set_settings_gate_max_wait(std::time::Duration::from_secs(600));
+    super::suppress_external_otel_until_settings();
+    assert!(
+        !super::is_settings_gate_open(),
+        "inside the window the gate stays fail-closed"
+    );
+
+    super::set_settings_gate_max_wait(std::time::Duration::ZERO);
+    assert!(
+        super::is_settings_gate_open(),
+        "an expired window must resolve the gate open onto local policy"
+    );
+
+    super::set_settings_gate_max_wait(std::time::Duration::from_secs(600));
+    super::suppress_external_otel_until_settings();
+    assert!(
+        !super::is_settings_gate_open(),
+        "re-closing must restart the window, not stay open"
     );
 }
 

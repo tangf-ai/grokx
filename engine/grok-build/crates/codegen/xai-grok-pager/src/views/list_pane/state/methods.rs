@@ -135,9 +135,22 @@ impl ListPaneState {
     #[inline]
     pub fn to_physical(&self, vi: usize) -> usize {
         match &self.vis_map {
-            Some(v) => v[vi],
+            Some(v) => v.get(vi).copied().unwrap_or(vi),
             None => vi,
         }
+    }
+
+    /// Resolve a visible index to an item.
+    ///
+    /// Returns `None` when layout/`vis_map` is stale relative to `items`
+    /// (model cleared or shrunk between `prepare_layout` and a key/mouse handler).
+    #[inline]
+    fn item_at<'a, T: ListItem>(&self, vi: usize, items: &'a [T]) -> Option<&'a T> {
+        let pi = match &self.vis_map {
+            Some(v) => *v.get(vi)?,
+            None => vi,
+        };
+        items.get(pi)
     }
 
     /// Total height in visual lines (from the layout cache).
@@ -164,6 +177,14 @@ impl ListPaneState {
     /// Whether a scrollbar drag is in progress.
     pub fn is_scrollbar_dragging(&self) -> bool {
         self.scrollbar_dragging
+    }
+
+    /// Whether a mouse position lands in the scrollbar's grab zone
+    /// ([`crate::render::scrollbar::scrollbar_grab_zone`]).
+    pub fn scrollbar_hit(&self, column: u16, row: u16) -> bool {
+        self.scrollbar_area().is_some_and(|sb| {
+            crate::render::scrollbar::scrollbar_grab_zone(sb).contains((column, row).into())
+        })
     }
 
     /// Whether search/filter is enabled in the config.
@@ -380,8 +401,9 @@ impl ListPaneState {
             if let Some(ref range) = self.multi_range {
                 let mut lines = Vec::with_capacity(range.len());
                 for vi in range.clone() {
-                    let pi = self.to_physical(vi);
-                    lines.push(items[pi].copy_text());
+                    if let Some(item) = self.item_at(vi, items) {
+                        lines.push(item.copy_text());
+                    }
                 }
                 let joined = lines.join("\n");
                 if !joined.is_empty() {
@@ -396,8 +418,10 @@ impl ListPaneState {
         let Some(vi) = self.selected_index else {
             return false;
         };
-        let pi = self.to_physical(vi);
-        let text = items[pi].copy_text();
+        let Some(item) = self.item_at(vi, items) else {
+            return false;
+        };
+        let text = item.copy_text();
         if text.is_empty() {
             return false;
         }
@@ -575,12 +599,14 @@ impl ListPaneState {
                 }
             }
         };
-        if let Some(vi) = target_vi {
+        if let Some(vi) = target_vi
+            && let Some(item) = items.get(target_pi)
+        {
             self.follow_mode = false;
             self.reset_edge_state();
             self.scroll_screen_y = None;
             self.selected_index = Some(vi);
-            self.selected_id = Some(items[target_pi].stable_id());
+            self.selected_id = Some(item.stable_id());
             self.ensure_selected_visible();
         }
     }
@@ -992,7 +1018,7 @@ impl ListPaneState {
     /// but only within the current viewport to avoid selecting off-screen items.
     fn select_nearest_at_y<T: ListItem>(&mut self, y: usize, items: &[T]) {
         let count = self.layout.item_count();
-        if count == 0 {
+        if count == 0 || items.is_empty() {
             return;
         }
         let Some(target_vi) = self.layout.item_at_y(y) else {
@@ -1000,10 +1026,11 @@ impl ListPaneState {
         };
 
         // Try the target item first.
-        let pi = self.to_physical(target_vi);
-        if items[pi].is_selectable() {
+        if let Some(item) = self.item_at(target_vi, items)
+            && item.is_selectable()
+        {
             self.selected_index = Some(target_vi);
-            self.selected_id = Some(items[pi].stable_id());
+            self.selected_id = Some(item.stable_id());
             return;
         }
 
@@ -1016,10 +1043,11 @@ impl ListPaneState {
             if self.layout.virtual_y(vi) >= vp_bottom {
                 break;
             }
-            let pi = self.to_physical(vi);
-            if items[pi].is_selectable() {
+            if let Some(item) = self.item_at(vi, items)
+                && item.is_selectable()
+            {
                 self.selected_index = Some(vi);
-                self.selected_id = Some(items[pi].stable_id());
+                self.selected_id = Some(item.stable_id());
                 return;
             }
         }
@@ -1031,10 +1059,11 @@ impl ListPaneState {
             if vy + vh <= vp_top {
                 break;
             }
-            let pi = self.to_physical(vi);
-            if items[pi].is_selectable() {
+            if let Some(item) = self.item_at(vi, items)
+                && item.is_selectable()
+            {
                 self.selected_index = Some(vi);
-                self.selected_id = Some(items[pi].stable_id());
+                self.selected_id = Some(item.stable_id());
                 return;
             }
         }
@@ -1237,10 +1266,11 @@ impl ListPaneState {
         // Materialize cursor at last visible selectable item.
         let range = self.visible_range();
         for vi in range.rev() {
-            let pi = self.to_physical(vi);
-            if items[pi].is_selectable() {
+            if let Some(item) = self.item_at(vi, items)
+                && item.is_selectable()
+            {
                 self.selected_index = Some(vi);
-                self.selected_id = Some(items[pi].stable_id());
+                self.selected_id = Some(item.stable_id());
                 return Some(vi);
             }
         }
@@ -1278,14 +1308,12 @@ impl ListPaneState {
         // Try to move down.
         let start = self.selected_index.map(|i| i + 1).unwrap_or(0);
         for vi in start..count {
-            let pi = self.to_physical(vi);
-            if pi >= items.len() {
-                break;
-            }
-            if items[pi].is_selectable() {
+            if let Some(item) = self.item_at(vi, items)
+                && item.is_selectable()
+            {
                 // Moved successfully — reset edge state.
                 self.selected_index = Some(vi);
-                self.selected_id = Some(items[pi].stable_id());
+                self.selected_id = Some(item.stable_id());
                 self.ensure_selected_visible();
                 self.reset_edge_state();
                 return;
@@ -1324,13 +1352,11 @@ impl ListPaneState {
             Some(i) => i - 1,
         };
         for vi in (0..=start).rev() {
-            let pi = self.to_physical(vi);
-            if pi >= items.len() {
-                continue;
-            }
-            if items[pi].is_selectable() {
+            if let Some(item) = self.item_at(vi, items)
+                && item.is_selectable()
+            {
                 self.selected_index = Some(vi);
-                self.selected_id = Some(items[pi].stable_id());
+                self.selected_id = Some(item.stable_id());
                 self.ensure_selected_visible();
                 return;
             }
@@ -1350,10 +1376,11 @@ impl ListPaneState {
         self.scroll_screen_y = None;
         let count = self.layout.item_count();
         for vi in 0..count {
-            let pi = self.to_physical(vi);
-            if items[pi].is_selectable() {
+            if let Some(item) = self.item_at(vi, items)
+                && item.is_selectable()
+            {
                 self.selected_index = Some(vi);
-                self.selected_id = Some(items[pi].stable_id());
+                self.selected_id = Some(item.stable_id());
                 self.ensure_selected_visible();
                 return;
             }
@@ -1382,10 +1409,11 @@ impl ListPaneState {
         self.scroll_screen_y = None;
         let count = self.layout.item_count();
         for vi in (0..count).rev() {
-            let pi = self.to_physical(vi);
-            if items[pi].is_selectable() {
+            if let Some(item) = self.item_at(vi, items)
+                && item.is_selectable()
+            {
                 self.selected_index = Some(vi);
-                self.selected_id = Some(items[pi].stable_id());
+                self.selected_id = Some(item.stable_id());
                 self.ensure_selected_visible();
                 return;
             }
@@ -1401,14 +1429,15 @@ impl ListPaneState {
         if target_vi >= count {
             return;
         }
-        let pi = self.to_physical(target_vi);
-        if items[pi].is_selectable() {
+        if let Some(item) = self.item_at(target_vi, items)
+            && item.is_selectable()
+        {
             self.clear_visual_if_active();
             self.follow_mode = false;
             self.reset_edge_state();
             self.scroll_screen_y = None;
             self.selected_index = Some(target_vi);
-            self.selected_id = Some(items[pi].stable_id());
+            self.selected_id = Some(item.stable_id());
         }
     }
 
@@ -2172,14 +2201,15 @@ impl ListPaneState {
         let Some(vi) = self.layout.item_at_y(y) else {
             return false;
         };
-        let pi = self.to_physical(vi);
-        if items[pi].is_selectable() {
+        if let Some(item) = self.item_at(vi, items)
+            && item.is_selectable()
+        {
             self.clear_visual_if_active();
             self.follow_mode = false;
             self.reset_edge_state();
             self.scroll_screen_y = None;
             self.selected_index = Some(vi);
-            self.selected_id = Some(items[pi].stable_id());
+            self.selected_id = Some(item.stable_id());
             true
         } else {
             false
@@ -2208,14 +2238,15 @@ impl ListPaneState {
 
         match kind {
             MouseEventKind::Down(MouseButton::Left) => {
-                // Scrollbar click?
-                if let Some(sb) = self.scrollbar_area()
-                    && column >= sb.x
-                    && column < sb.x + sb.width
-                {
+                if self.scrollbar_hit(column, row) {
                     self.scrollbar_dragging = true;
                     return self.apply_scrollbar_click(row, items);
                 }
+                // A new press elsewhere ends any stale thumb latch (lost Up
+                // from terminal coalescing / SSH / focus loss). Callers that
+                // treat `is_scrollbar_dragging()` after this dispatch as
+                // "this Down hit the track" rely on that.
+                self.scrollbar_dragging = false;
                 // Content click → select item.
                 if pane_area.width > 0 && pane_area.height > 0 && row >= pane_area.y {
                     let ry = (row - pane_area.y) as usize;
@@ -2252,12 +2283,7 @@ impl ListPaneState {
         items: &[T],
     ) {
         // Check if mouse is on scrollbar → percentage scroll.
-        if let Some(sb) = self.scrollbar_area()
-            && column >= sb.x
-            && column < sb.x + sb.width
-            && row >= sb.y
-            && row < sb.y + sb.height
-        {
+        if self.scrollbar_hit(column, row) {
             let total = self.total_height();
             let pct_delta = ((total as f64) * 0.0025).round() as i32;
             let effective = pct_delta.max(lines.abs()) * lines.signum();

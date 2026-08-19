@@ -10,27 +10,30 @@ pub mod activity;
 pub mod capability;
 pub mod channel;
 pub mod config;
-pub mod daemonize;
-pub mod diag_server;
 pub mod discovery;
 pub mod envrc;
 pub mod error;
 pub mod export_github;
 pub mod file_system;
 pub mod folder_trust;
-pub mod foreign_sessions;
 pub mod fs_notify;
+pub(crate) mod git_odb;
 pub mod handle;
 pub mod hub;
 pub mod hub_auth;
 pub mod hub_channel;
 pub mod hub_ids;
 pub mod hub_server;
+pub mod image_capabilities;
 pub mod mcp;
 pub mod permission;
-pub mod preview_supervisor;
 pub mod project_config;
+pub mod publish;
 pub mod recovery;
+mod restore_fetch;
+pub mod scheduler_liveness;
+pub use restore_fetch::{EnsureCommitsOutcome, ensure_commits_reachable};
+pub use session::git::git_object_exists;
 pub mod rpc_envelope;
 pub mod session;
 pub mod status_config;
@@ -183,7 +186,7 @@ mod init_metrics_tests {
         ));
         assert!(has(
             "grok_workspace_rpc_errors_total",
-            &[("method", "unknown"), ("error_kind", "hub_error")]
+            &[("method", "unknown"), ("error_kind", "unknown_method")]
         ));
         for stage in [
             "startup_recovery",

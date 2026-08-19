@@ -976,6 +976,30 @@ pub(in crate::app::dispatch) fn set_page_flip_on_send(app: &mut AppView, new: bo
     }]
 }
 
+pub(in crate::app::dispatch) fn set_confirm_before_rewind_inner(app: &mut AppView, new: bool) {
+    app.current_ui.confirm_before_rewind = Some(new);
+}
+
+/// SHARED: `[ui].confirm_before_rewind` via `Effect::PersistSetting`.
+pub(in crate::app::dispatch) fn set_confirm_before_rewind(
+    app: &mut AppView,
+    new: bool,
+) -> Vec<Effect> {
+    let prev = app.current_ui.confirm_before_rewind_enabled();
+    if prev == new {
+        return vec![];
+    }
+    set_confirm_before_rewind_inner(app, new);
+    refresh_open_settings_modals(app);
+    tracing::info!(target: "settings", key = "confirm_before_rewind", value = new, "setting changed");
+    app.show_toast(&save_success_toast("Confirm before rewind", new));
+    vec![Effect::PersistSetting {
+        key: "confirm_before_rewind",
+        value: crate::settings::SettingValue::Bool(new),
+        rollback_value: crate::settings::SettingValue::Bool(prev),
+    }]
+}
+
 pub(super) fn set_combine_queued_prompts_inner(app: &mut AppView, new: bool) {
     app.current_ui.combine_queued_prompts = Some(new);
     crate::appearance::cache::set_combine_queued_prompts(new);
@@ -998,6 +1022,46 @@ pub(in crate::app::dispatch) fn set_combine_queued_prompts(
         key: "combine_queued_prompts",
         value: crate::settings::SettingValue::Bool(new),
         rollback_value: crate::settings::SettingValue::Bool(prev),
+    }]
+}
+
+pub(super) fn set_follow_up_behavior_inner(
+    app: &mut AppView,
+    new: crate::appearance::FollowUpBehavior,
+) {
+    app.current_ui.follow_up_behavior = Some(new.as_canonical().to_string());
+    crate::appearance::cache::set_follow_up_behavior(new);
+    // Same-process atomic only (tests / in-proc shell). The real agent is a
+    // separate process; it re-resolves Steer from config.toml mtime after the
+    // PersistSetting disk write lands.
+    xai_grok_shell::util::config::set_follow_up_steer_cache(new.is_steer());
+}
+
+pub(in crate::app::dispatch) fn set_follow_up_behavior(
+    app: &mut AppView,
+    new: crate::appearance::FollowUpBehavior,
+) -> Vec<Effect> {
+    let prev = crate::appearance::cache::load_follow_up_behavior();
+    if prev == new {
+        return vec![];
+    }
+    set_follow_up_behavior_inner(app, new);
+    refresh_open_settings_modals(app);
+    tracing::info!(
+        target: "settings",
+        key = "follow_up_behavior",
+        value = new.as_canonical(),
+        "setting changed",
+    );
+    let label = match new {
+        crate::appearance::FollowUpBehavior::Queue => "Queue",
+        crate::appearance::FollowUpBehavior::Steer => "Steer",
+    };
+    app.show_toast(&format!("\u{2713} Follow-up behavior: {label}"));
+    vec![Effect::PersistSetting {
+        key: "follow_up_behavior",
+        value: crate::settings::SettingValue::Enum(new.as_canonical()),
+        rollback_value: crate::settings::SettingValue::Enum(prev.as_canonical()),
     }]
 }
 
@@ -1739,7 +1803,11 @@ pub(in crate::app::dispatch) fn set_default_model(
         // No session id yet — stash for
         // `EventLoop::on_session_created` to apply once the session
         // id materialises. Mirrors `Action::SwitchModel` line 586.
-        agent.session.deferred_model_switch = Some((new_id, None));
+        agent.session.deferred_model_switch = Some(crate::app::agent::DeferredModelSwitch {
+            model_id: new_id,
+            effort: None,
+            prev_model_id: prev_id,
+        });
     }
     effects
 }

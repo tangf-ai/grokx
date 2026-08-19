@@ -248,7 +248,7 @@ fn format_cost(m: &xai_grok_shell::extensions::notification::PromptUsageModel) -
 
 /// First non-empty, trimmed line of `text` (empty string if none). Collapses a
 /// multi-line prompt/command to a single display line.
-fn first_nonempty_line(text: &str) -> &str {
+pub(crate) fn first_nonempty_line(text: &str) -> &str {
     text.lines()
         .map(str::trim)
         .find(|l| !l.is_empty())
@@ -289,6 +289,7 @@ mod tests {
             output_tokens: output,
             total_tokens: input + output,
             cached_read_tokens: 0,
+            cache_creation_tokens: 0,
             reasoning_tokens: 0,
             model_calls: 1,
             api_duration_ms: 1_000,

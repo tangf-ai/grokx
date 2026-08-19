@@ -15,20 +15,31 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::app_view::{AuthMode, AuthState, SessionPickerEntry, TrustState};
+use crate::app::consent::ConsentState;
 use crate::startup::StartupWarning;
 use crate::theme::Theme;
 use crate::views::prompt_widget::{PromptFlag, PromptInfo, PromptWidget};
+mod consent;
 mod hero_box;
 pub(crate) mod logo;
 mod menu;
 mod prompt;
+mod toast;
 mod top_bar;
+#[cfg(feature = "local-workspace")]
+pub(crate) mod workspace_mode;
 
 pub(crate) use logo::shimmer_frame;
 use logo::{logo_line_count, render_logo};
 use menu::render_menu;
+pub(crate) use toast::paint_welcome_toast;
 pub(crate) use top_bar::location_line_at;
 use top_bar::render_top_bar;
+#[cfg(feature = "local-workspace")]
+pub use workspace_mode::{
+    WelcomeWorkspaceMode, WorkspaceModeHitRects, hit_test_workspace_mode,
+    render_workspace_mode_picker,
+};
 
 /// True for VS Code and xterm.js embeds (VS Code-family IDEs and Zed) where
 /// quit is `Ctrl+D` (canonical: [`TerminalName::is_vscode_family`]).
@@ -62,6 +73,25 @@ pub(super) fn hover_style(theme: &Theme, hovered: bool, base: Style) -> Style {
     } else {
         base
     }
+}
+
+/// Takes the version badge's row on screens with no shortcuts bar.
+pub(super) fn render_pending_hint(
+    area: Rect,
+    buf: &mut Buffer,
+    theme: &Theme,
+    pending: &crate::views::shortcuts_bar::PendingHint,
+) {
+    let key_style = Style::default()
+        .fg(theme.text_primary)
+        .add_modifier(Modifier::BOLD);
+    let action_style = Style::default().fg(theme.gray);
+    let line = Line::from(vec![
+        Span::styled(format!("  {}", pending.shortcut.display()), key_style),
+        Span::styled(":", action_style),
+        Span::styled(format!("press again to {}", pending.label), action_style),
+    ]);
+    buf.set_line(area.x, area.y, &line, area.width);
 }
 
 /// Horizontal margin (left and right) in normal mode.
@@ -105,6 +135,10 @@ pub struct WelcomeRenderResult {
     pub refresh_rect: Option<Rect>,
     /// Hit-test rect for the gate URL link (click to open in browser).
     pub gate_url_rect: Option<Rect>,
+    /// Hit-test rects for the inline links, tagged with their index, one per row a link wraps to.
+    pub consent_link_rects: Vec<(usize, Rect)>,
+    /// `None` when this frame did not paint the notice.
+    pub consent_legibility: Option<crate::app::consent::ConsentLegibility>,
     /// Whether a "Changelog" menu action was rendered (above Quit), so the
     /// input handler can map the extra menu row to the release-notes action
     /// once markdown is available.
@@ -121,6 +155,9 @@ pub struct WelcomeRenderResult {
     pub privacy_banner_opt_out_rect: Option<Rect>,
     pub privacy_banner_terms_rect: Option<Rect>,
     pub privacy_banner_policy_rect: Option<Rect>,
+    /// Hit-test rects for the chat workspace-mode segmented control.
+    #[cfg(feature = "local-workspace")]
+    pub workspace_mode_rects: WorkspaceModeHitRects,
 }
 
 use hero_box::HERO_BOX_MIN_WIDTH;
@@ -175,6 +212,9 @@ struct WelcomeLayoutInput<'a> {
     expanded: bool,
     /// Whether the info slot reserves a promo upgrade CTA (spacer + button).
     has_upgrade_cta: bool,
+    /// Rows reserved for the prompt box. `None` keeps the default; the blocking screens that paint
+    /// no prompt pass 0 to give the rows back to their message.
+    prompt_height: Option<u16>,
 }
 
 impl WelcomeLayout {
@@ -184,8 +224,12 @@ impl WelcomeLayout {
     }
 
     pub(super) fn fixed_below(tip_height: u16) -> u16 {
+        Self::fixed_below_with_prompt(tip_height, PROMPT_HEIGHT)
+    }
+
+    fn fixed_below_with_prompt(tip_height: u16, prompt_height: u16) -> u16 {
         let tip_gap = if tip_height > 0 { 1u16 } else { 0 };
-        tip_height + tip_gap + PROMPT_HEIGHT + VERSION_GAP + 1
+        tip_height + tip_gap + prompt_height + VERSION_GAP + 1
     }
 
     pub(super) fn effective_changelog(
@@ -237,6 +281,7 @@ impl WelcomeLayout {
             announcement,
             expanded,
             has_upgrade_cta,
+            prompt_height,
         } = input;
         let zero = Rect::default();
         // Pick hero vs stacked first, independent of the announcement's height:
@@ -299,7 +344,8 @@ impl WelcomeLayout {
 
         let gap_after_logo = if error_height > 0 { 1 } else { 0 };
         let tip_gap = if tip_height > 0 { 1u16 } else { 0 };
-        let fixed_below = Self::fixed_below(tip_height);
+        let prompt_height = prompt_height.unwrap_or(PROMPT_HEIGHT);
+        let fixed_below = Self::fixed_below_with_prompt(tip_height, prompt_height);
         let fixed_above = logo_rows + 1 + gap_after_logo + error_height; // +1 for gap after logo
         // The stacked info slot below the menu holds whichever block is shown
         // (announcement or changelog), matching the hero box's single-slot rule.
@@ -357,7 +403,7 @@ impl WelcomeLayout {
             Constraint::Min(flex_gap),
             Constraint::Length(tip_height),
             Constraint::Length(tip_gap),
-            Constraint::Length(PROMPT_HEIGHT),
+            Constraint::Length(prompt_height),
             Constraint::Length(VERSION_GAP),
             Constraint::Length(1), // version
         ])
@@ -382,11 +428,11 @@ impl WelcomeLayout {
 
 /// Controls what the version badge renders.
 pub(super) enum VersionBadgeMode<'a> {
-    /// Full badge: team | tier | api_key | **Grok Build** VERSION+channel **Beta** (right-aligned).
+    /// Full badge: team | tier | api_key | **Grok Build** VERSION+channel (right-aligned).
     Full { subscription_tier: Option<&'a str> },
-    /// Hero footer: team | api_key | Grok Build Beta [channel] (right-aligned, gray).
+    /// Hero footer: team | api_key | channel (right-aligned, gray).
     HeroFooter,
-    /// Hero inline: **Grok Build Beta**  VERSION (left-aligned).
+    /// Hero inline: **Grok Build**  VERSION (left-aligned).
     HeroInline,
 }
 
@@ -403,8 +449,9 @@ pub(super) fn render_version_badge(
         width: version_rect.width.saturating_sub(h_margin),
         ..version_rect
     };
+    const SEP: &str = "  \u{2502}  ";
     let sep = Span::styled(
-        "  \u{2502}  ",
+        SEP,
         Style::default().fg(theme.gray).add_modifier(Modifier::DIM),
     );
     let mut spans = Vec::new();
@@ -451,27 +498,18 @@ pub(super) fn render_version_badge(
                 format!("{}{}", xai_grok_version::VERSION, channel),
                 Style::default().fg(theme.gray),
             ));
-            spans.push(Span::styled(
-                " Beta",
-                Style::default()
-                    .fg(theme.text_primary)
-                    .add_modifier(Modifier::BOLD),
-            ));
         }
         VersionBadgeMode::HeroFooter => {
-            let channel_display = if channel.is_empty() {
-                "Beta"
-            } else {
-                channel.trim()
-            };
-            spans.push(Span::styled(
-                channel_display,
-                Style::default().fg(theme.gray),
-            ));
+            if !channel.is_empty() {
+                spans.push(Span::styled(
+                    channel.trim(),
+                    Style::default().fg(theme.gray),
+                ));
+            }
         }
         VersionBadgeMode::HeroInline => {
             spans.push(Span::styled(
-                "Grok Build Beta  ",
+                "Grok Build  ",
                 Style::default()
                     .fg(theme.text_primary)
                     .add_modifier(Modifier::BOLD),
@@ -481,6 +519,11 @@ pub(super) fn render_version_badge(
                 Style::default().fg(theme.gray),
             ));
         }
+    }
+
+    // Only alpha and beta builds print a channel, so on stable the spans can end on a separator.
+    if spans.last().is_some_and(|s| s.content == SEP) {
+        spans.pop();
     }
 
     let version_line = Line::from(spans).alignment(align);
@@ -542,23 +585,7 @@ fn render_prompt_and_version(
         prompt::render_prompt(prompt_centered, buf, focus, prompt, info, 2, 2, compact);
 
     if let Some(pending) = &pending_hint {
-        let key_style = Style::default()
-            .fg(theme.text_primary)
-            .add_modifier(Modifier::BOLD);
-        let action_style = Style::default().fg(theme.gray);
-        let key_text = pending.shortcut.display();
-        let label = format!("press again to {}", pending.label);
-        let line = Line::from(vec![
-            Span::styled(format!("  {key_text}"), key_style),
-            Span::styled(":", action_style),
-            Span::styled(label, action_style),
-        ]);
-        buf.set_line(
-            layout.version.x,
-            layout.version.y,
-            &line,
-            layout.version.width,
-        );
+        render_pending_hint(layout.version, buf, theme, pending);
     } else if !skip_version {
         render_version_badge(
             layout.version,
@@ -593,6 +620,8 @@ pub struct WelcomeRenderParams<'a> {
     /// Folder-trust state. When `Pending` (auth done, access granted), the
     /// welcome screen renders the trust question instead of the normal prompt.
     pub trust_state: &'a TrustState,
+    pub consent_state: &'a crate::app::consent::ConsentState,
+    pub consent_hover_link: Option<usize>,
     pub login_label: Option<&'a str>,
     pub auth_code_input: &'a str,
     pub auth_code_cursor_byte: usize,
@@ -615,7 +644,7 @@ pub struct WelcomeRenderParams<'a> {
     pub startup_warnings: &'a [StartupWarning],
     pub pending_update_version: Option<&'a str>,
     /// Recent foreign session offered on ctrl+u, suppressed by a pending update.
-    pub foreign_resume_hint: Option<&'a xai_grok_workspace::foreign_sessions::RecentForeignSession>,
+    pub foreign_resume_hint: Option<&'a xai_grok_foreign_sessions::RecentForeignSession>,
     pub is_api_key_auth: bool,
     pub session_picker_content_results:
         Option<&'a [xai_grok_shell::extensions::session_search::SearchSessionHit]>,
@@ -629,6 +658,7 @@ pub struct WelcomeRenderParams<'a> {
     pub session_picker_grouped: bool,
     /// Source filter for the session picker.
     pub session_picker_source_filter: crate::views::session_picker::SourceFilter,
+    pub session_picker_pending_delete: bool,
     /// Process-wide `--chat`: the picker lists backend conversations only, so
     /// the source filter and local deep search are hidden.
     pub chat_mode: bool,
@@ -654,6 +684,15 @@ pub struct WelcomeRenderParams<'a> {
     pub upgrade_cta: Option<&'a str>,
     /// Non-blocking welcome privacy banner above the prompt.
     pub privacy_banner: bool,
+    /// Chat-mode workspace picker selection (`local-workspace` feature).
+    #[cfg(feature = "local-workspace")]
+    pub workspace_mode: WelcomeWorkspaceMode,
+    /// CLI/env already stamped local workspace — picker is display-only.
+    #[cfg(feature = "local-workspace")]
+    pub workspace_mode_startup_locked: bool,
+    /// In-TUI ACK confirm pending for Local.
+    #[cfg(feature = "local-workspace")]
+    pub workspace_mode_ack_pending: bool,
 }
 
 /// Render the welcome screen.
@@ -718,22 +757,7 @@ pub fn render_welcome(
                 cursor_pos: None,
                 post_flush_escapes,
                 menu_rects,
-                prompt_rect: None,
-                session_picker_hit_areas: None,
-                import_banner_rect: None,
-                auth_url_rect: None,
-                auth_fallback_rect: None,
-                refresh_rect: None,
-                gate_url_rect: None,
-                changelog_action_present: false,
-                changelog_cta_rect: None,
-                announcement_truncated: false,
-                announcement_rect: None,
-                upgrade_cta_rect: None,
-                privacy_banner_opt_in_rect: None,
-                privacy_banner_opt_out_rect: None,
-                privacy_banner_terms_rect: None,
-                privacy_banner_policy_rect: None,
+                ..Default::default()
             }
         }
         AuthState::Authenticating { auth_url, mode, .. } => {
@@ -751,25 +775,9 @@ pub fn render_welcome(
                 params.show_raw_url,
             );
             WelcomeRenderResult {
-                cursor_pos: None,
-                post_flush_escapes: None,
-                menu_rects: vec![],
-                prompt_rect: None,
-                session_picker_hit_areas: None,
-                import_banner_rect: None,
                 auth_url_rect: url_rect,
                 auth_fallback_rect: fallback_rect,
-                refresh_rect: None,
-                gate_url_rect: None,
-                changelog_action_present: false,
-                changelog_cta_rect: None,
-                announcement_truncated: false,
-                announcement_rect: None,
-                upgrade_cta_rect: None,
-                privacy_banner_opt_in_rect: None,
-                privacy_banner_opt_out_rect: None,
-                privacy_banner_terms_rect: None,
-                privacy_banner_policy_rect: None,
+                ..Default::default()
             }
         }
         AuthState::Done if params.is_zdr_blocked => {
@@ -788,25 +796,9 @@ pub fn render_welcome(
                 params.compact,
             );
             WelcomeRenderResult {
-                cursor_pos: None,
                 post_flush_escapes,
                 menu_rects,
-                prompt_rect: None,
-                session_picker_hit_areas: None,
-                import_banner_rect: None,
-                auth_url_rect: None,
-                auth_fallback_rect: None,
-                refresh_rect: None,
-                gate_url_rect: None,
-                changelog_action_present: false,
-                changelog_cta_rect: None,
-                announcement_truncated: false,
-                announcement_rect: None,
-                upgrade_cta_rect: None,
-                privacy_banner_opt_in_rect: None,
-                privacy_banner_opt_out_rect: None,
-                privacy_banner_terms_rect: None,
-                privacy_banner_policy_rect: None,
+                ..Default::default()
             }
         }
         // Folder-trust question: shown after auth, before any session is
@@ -816,7 +808,20 @@ pub fn render_welcome(
         // sessions. The `if let` destructure makes the `Pending`-only render
         // structurally exhaustive (no `unreachable!`).
         AuthState::Done if params.has_access => {
-            if let TrustState::Pending { workspace } = params.trust_state {
+            // Consent is account-level, so it resolves before the workspace-level trust question.
+            if let ConsentState::Pending { notice, .. } = params.consent_state {
+                consent::render_consent(
+                    content_area,
+                    buf,
+                    &theme,
+                    notice,
+                    params.selected,
+                    params.consent_hover_link,
+                    params.pending_hint,
+                    h_margin,
+                    params.compact,
+                )
+            } else if let TrustState::Pending { workspace } = params.trust_state {
                 render_welcome_trust(
                     content_area,
                     buf,
@@ -1790,10 +1795,25 @@ fn render_welcome_done(
         owned_menu.as_slice()
     };
 
+    #[cfg(feature = "local-workspace")]
+    // Keep the segmented control (and ACK y/N) visible when history is open
+    // if first-run Local ACK is pending — otherwise the confirm is unpainted
+    // while the ACK handler still swallows keys.
+    let show_workspace_picker =
+        p.chat_mode && p.has_access && (!show_picker || p.workspace_mode_ack_pending);
+    #[cfg(feature = "local-workspace")]
+    let workspace_picker_rows = if show_workspace_picker {
+        workspace_mode::WORKSPACE_MODE_MENU_ROWS
+    } else {
+        0
+    };
+    #[cfg(not(feature = "local-workspace"))]
+    let workspace_picker_rows = 0u16;
+
     let menu_height = if show_picker {
         0
     } else {
-        menu_items.len() as u16
+        menu_items.len() as u16 + workspace_picker_rows
     };
 
     // Session picker height: 1 row per entry (no dividers), scrollable.
@@ -1830,6 +1850,7 @@ fn render_welcome_done(
         announcement: p.announcement,
         expanded: p.welcome_announcement_expanded,
         has_upgrade_cta: p.upgrade_cta.is_some(),
+        prompt_height: None,
     });
 
     // Render startup warning in the error area (same slot as auth errors).
@@ -1841,6 +1862,8 @@ fn render_welcome_done(
     let mut announcement_rect: Option<Rect> = None;
     let mut upgrade_cta_rect: Option<Rect> = None;
 
+    #[cfg(feature = "local-workspace")]
+    let mut workspace_mode_rects = WorkspaceModeHitRects::default();
     let (menu_rects, picker_close_button) = if show_picker {
         // Use the full area since logo/menu are hidden and shortcuts
         // are now rendered inside the picker content area.
@@ -1866,6 +1889,7 @@ fn render_welcome_done(
                 tick: p.welcome_tick,
                 grouped: p.session_picker_grouped,
                 source_filter: p.session_picker_source_filter,
+                pending_delete: p.session_picker_pending_delete,
                 chat_mode: p.chat_mode,
                 cwd: p.cwd,
             },
@@ -1885,11 +1909,21 @@ fn render_welcome_done(
             p.changelog_bullets,
             p.changelog_has_full_notes,
             p.upgrade_cta,
+            #[cfg(feature = "local-workspace")]
+            show_workspace_picker.then_some((
+                p.workspace_mode,
+                p.workspace_mode_startup_locked,
+                p.workspace_mode_ack_pending,
+            )),
         );
         changelog_cta_rect = rects.changelog_cta_rect;
         announcement_truncated = rects.announcement_truncated;
         announcement_rect = rects.announcement_rect;
         upgrade_cta_rect = rects.upgrade_cta_rect;
+        #[cfg(feature = "local-workspace")]
+        {
+            workspace_mode_rects = rects.workspace_mode_rects;
+        }
         (rects.menu_rects, None)
     } else {
         // Narrow layout: stacked logo above, menu below. Inset the menu the
@@ -1897,6 +1931,28 @@ fn render_welcome_done(
         // instead of touching the window edge on narrow terminals.
         render_logo(layout.logo, buf, theme, content_area.height);
         let menu_area = inset_horizontal(layout.menu, prompt::prompt_inset(p.compact));
+        #[cfg(feature = "local-workspace")]
+        let menu_area = if show_workspace_picker {
+            let picker_rect = workspace_mode::picker_area(menu_area);
+            workspace_mode_rects = render_workspace_mode_picker(
+                picker_rect,
+                buf,
+                theme,
+                p.workspace_mode,
+                p.mouse_pos,
+                p.workspace_mode_startup_locked,
+                p.workspace_mode_ack_pending,
+            );
+            Rect {
+                y: menu_area.y + workspace_mode::WORKSPACE_MODE_MENU_ROWS,
+                height: menu_area
+                    .height
+                    .saturating_sub(workspace_mode::WORKSPACE_MODE_MENU_ROWS),
+                ..menu_area
+            }
+        } else {
+            menu_area
+        };
         (
             render_menu(
                 menu_area,
@@ -2217,6 +2273,8 @@ fn render_welcome_done(
         auth_fallback_rect: None,
         refresh_rect: refresh_hit_rect,
         gate_url_rect: gate_url_hit_rect,
+        consent_link_rects: Vec::new(),
+        consent_legibility: None,
         changelog_action_present: show_changelog_action,
         changelog_cta_rect,
         announcement_truncated,
@@ -2226,6 +2284,8 @@ fn render_welcome_done(
         privacy_banner_opt_out_rect,
         privacy_banner_terms_rect,
         privacy_banner_policy_rect,
+        #[cfg(feature = "local-workspace")]
+        workspace_mode_rects,
     }
 }
 
@@ -2250,6 +2310,7 @@ pub(crate) struct SessionPickerRenderCtx<'a> {
     pub(crate) grouped: bool,
     /// Source filter for filtering session entries.
     pub(crate) source_filter: crate::views::session_picker::SourceFilter,
+    pub(crate) pending_delete: bool,
     /// Process-wide `--chat`: hides the source-filter chip and the
     /// deep-search/filter footer hints (see `WelcomeRenderParams::chat_mode`).
     pub(crate) chat_mode: bool,
@@ -2446,11 +2507,34 @@ pub(crate) fn render_session_picker(
         description: None,
         pinned: false,
     });
-    if !ctx.chat_mode {
+    if ctx.pending_delete {
+        default_shortcuts.clear();
+        default_shortcuts.push(HintItem {
+            keys: vec![],
+            label: "confirm delete".into(),
+            custom_display: Some("y"),
+            description: None,
+            pinned: false,
+        });
+        default_shortcuts.push(HintItem {
+            keys: vec![],
+            label: "cancel".into(),
+            custom_display: Some("n"),
+            description: None,
+            pinned: false,
+        });
+    } else if !ctx.chat_mode {
         default_shortcuts.push(HintItem {
             keys: vec![],
             label: "filter".into(),
             custom_display: Some("f"),
+            description: None,
+            pinned: false,
+        });
+        default_shortcuts.push(HintItem {
+            keys: vec![],
+            label: "delete".into(),
+            custom_display: Some("d"),
             description: None,
             pinned: false,
         });
@@ -2472,7 +2556,11 @@ pub(crate) fn render_session_picker(
         filter_key_hint: (!ctx.chat_mode).then_some("f"),
         filter_active: !ctx.chat_mode && ctx.source_filter.is_active(),
         header_note: hidden_hint.as_deref(),
-        action_keys: &[],
+        action_keys: if ctx.chat_mode || ctx.pending_delete {
+            &[]
+        } else {
+            &[('d', "delete")]
+        },
         disable_search: false,
         compact_bottom_bar: false,
         search_only_on_slash: false,
@@ -2634,6 +2722,45 @@ mod tests {
     use crate::views::picker::PickerState;
     use crate::views::session_picker::{build_grouped_picker_entries, build_session_entry_data};
 
+    fn badge_text(mode: VersionBadgeMode<'_>, team: Option<&str>) -> String {
+        let area = Rect::new(0, 0, 80, 1);
+        let mut buf = Buffer::empty(area);
+        render_version_badge(area, &mut buf, &Theme::current(), team, 0, false, mode);
+        (0..area.width)
+            .map(|x| buf.cell((x, 0)).map_or(" ", |c| c.symbol()).to_string())
+            .collect::<String>()
+            .trim()
+            .to_string()
+    }
+
+    /// The badge carries the product name, the version, and the channel, and never a release label.
+    /// The hero footer prints a channel only on alpha and beta builds, so on stable it must not end on a separator.
+    #[test]
+    fn version_badge_carries_no_release_label() {
+        let full = badge_text(
+            VersionBadgeMode::Full {
+                subscription_tier: None,
+            },
+            Some("acme"),
+        );
+        let inline = badge_text(VersionBadgeMode::HeroInline, None);
+        let footer = badge_text(VersionBadgeMode::HeroFooter, Some("acme"));
+
+        for rendered in [&full, &inline, &footer] {
+            assert!(
+                !rendered.contains("Beta"),
+                "badge must not label the product: {rendered:?}"
+            );
+        }
+        assert!(full.contains("Grok Build"), "full badge: {full:?}");
+        assert!(inline.contains("Grok Build"), "inline badge: {inline:?}");
+        assert!(footer.contains("acme"), "footer keeps the team: {footer:?}");
+        assert!(
+            !footer.ends_with('\u{2502}'),
+            "footer must not end on a separator: {footer:?}"
+        );
+    }
+
     #[test]
     fn auth_copy_feedback_covers_delivery_states() {
         let theme = Theme::current();
@@ -2743,6 +2870,8 @@ mod tests {
             branch: None,
             repo_name: repo_name.into(),
             worktree_label: None,
+            last_turn_summary: None,
+            last_recap: None,
             card_detail: None,
         }
     }
@@ -2756,6 +2885,8 @@ mod tests {
             prompt_focus: WelcomePromptFocus::Unfocused,
             auth_state,
             trust_state,
+            consent_state: &ConsentState::Done,
+            consent_hover_link: None,
             login_label: None,
             auth_code_input: "",
             auth_code_cursor_byte: 0,
@@ -2787,6 +2918,7 @@ mod tests {
             subscription_tier: None,
             session_picker_grouped: false,
             session_picker_source_filter: crate::views::session_picker::SourceFilter::default(),
+            session_picker_pending_delete: false,
             chat_mode: false,
             cwd: std::path::Path::new("/repo"),
             credit_balance: None,
@@ -2797,6 +2929,12 @@ mod tests {
             welcome_announcement_expanded: false,
             upgrade_cta: None,
             privacy_banner: false,
+            #[cfg(feature = "local-workspace")]
+            workspace_mode: WelcomeWorkspaceMode::Sandbox,
+            #[cfg(feature = "local-workspace")]
+            workspace_mode_startup_locked: false,
+            #[cfg(feature = "local-workspace")]
+            workspace_mode_ack_pending: false,
         }
     }
 
@@ -2811,7 +2949,7 @@ mod tests {
 
     #[test]
     fn foreign_resume_tip_names_each_tool_and_age() {
-        use xai_grok_workspace::foreign_sessions::ForeignSessionTool;
+        use xai_grok_foreign_sessions::ForeignSessionTool;
 
         let auth = AuthState::Done;
         let trust = TrustState::Done;
@@ -2820,7 +2958,7 @@ mod tests {
             (ForeignSessionTool::Codex, "Codex"),
             (ForeignSessionTool::Cursor, "Cursor"),
         ] {
-            let hint = xai_grok_workspace::foreign_sessions::RecentForeignSession {
+            let hint = xai_grok_foreign_sessions::RecentForeignSession {
                 tool,
                 native_id: "native-id".into(),
                 age: std::time::Duration::from_secs(125),
@@ -2838,8 +2976,8 @@ mod tests {
     fn pending_update_suppresses_foreign_resume_tip() {
         let auth = AuthState::Done;
         let trust = TrustState::Done;
-        let hint = xai_grok_workspace::foreign_sessions::RecentForeignSession {
-            tool: xai_grok_workspace::foreign_sessions::ForeignSessionTool::Cursor,
+        let hint = xai_grok_foreign_sessions::RecentForeignSession {
+            tool: xai_grok_foreign_sessions::ForeignSessionTool::Cursor,
             native_id: "native-id".into(),
             age: std::time::Duration::from_secs(30),
         };
@@ -2962,6 +3100,7 @@ mod tests {
                     tick: 0,
                     grouped: false,
                     source_filter: crate::views::session_picker::SourceFilter::default(),
+                    pending_delete: false,
                     chat_mode: true,
                 },
             );
@@ -3037,6 +3176,7 @@ mod tests {
                     tick: 0,
                     grouped: false,
                     source_filter: crate::views::session_picker::SourceFilter::default(),
+                    pending_delete: false,
                     chat_mode,
                 },
             );

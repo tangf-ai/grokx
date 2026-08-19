@@ -72,6 +72,8 @@ pub(super) fn default_actions(
     let in_vscode_family = ctx.brand.is_vscode_family();
     let in_vscode = in_vscode_family;
     let in_apple_terminal = ctx.brand == TerminalName::AppleTerminal;
+    // Shared by ToggleQueue (Ctrl+4 primary) and OpenDashboard (omit Ctrl+4 alt).
+    let local_mac_vscode = in_vscode_family && !ctx.is_ssh && cfg!(target_os = "macos");
     let ctrl_dot_unreliable = ctrl_dot_unreliable();
     let send_to_background_help = if screen_mode.is_minimal() {
         "Detaches the running foreground Execute so it keeps working in the background while you read, queue prompts, or start something else.\nTrack background work with /tasks.\nOnly meaningful while a foreground Execute is actually running."
@@ -440,7 +442,7 @@ pub(super) fn default_actions(
             hint_key_display: None,
             requires_confirmation: false,
             long_help: Some(
-                "Rewinds the conversation to an earlier turn, restoring the file snapshot taken then and discarding later changes.\nPick a turn from the list and choose what to restore (everything, conversation only, or files only); a running turn is offered for cancel first, and any conflicts or errors are reported after it runs.\nDestructive: later turns are dropped.\nAlso reachable idle with an empty prompt via Esc Esc (within 800ms), same as `/rewind`.",
+                "Rewinds the conversation to an earlier turn, discarding later turns. File changes made after that turn are left as-is.\nPick a turn from the list; a running turn is offered for cancel first. When Confirm before rewind is on (default), each pick asks Yes / Yes, and don't ask again / No — don't ask again turns the setting off in /settings.\nDestructive: later turns are dropped.\nAlso reachable idle with an empty prompt via Esc Esc (within 800ms), same as `/rewind`.",
             ),
         },
         ActionDef {
@@ -555,14 +557,14 @@ pub(super) fn default_actions(
             // Local macOS VS Code family only: ; / ' often never arrive (saw
             // Ctrl+4 in input-debug). SSH and non-Mac keep ; (+ ' alt). Win/Linux
             // VS maps Ctrl+4 to focusFourthEditorGroup.
-            default_key: if in_vscode_family && !ctx.is_ssh && cfg!(target_os = "macos") {
+            default_key: if local_mac_vscode {
                 key!('4', CONTROL)
             } else {
                 key!(';', CONTROL)
             },
             // Apostrophe alt for consoles that drop Ctrl on `;`. Local Mac VS
             // also keeps ; / ' as alts alongside primary Ctrl+4.
-            alt_keys: if in_vscode_family && !ctx.is_ssh && cfg!(target_os = "macos") {
+            alt_keys: if local_mac_vscode {
                 vec![key!(';', CONTROL), key!('\'', CONTROL)]
             } else {
                 vec![key!('\'', CONTROL)]
@@ -892,7 +894,13 @@ pub(super) fn default_actions(
             label: "dashboard",
             description: "Open the Agent Dashboard",
             default_key: key!('\\', CONTROL),
-            alt_keys: vec![],
+            // Classic C0 FS (0x1c): without KKP, Ctrl+\ arrives as Char('4')+CONTROL
+            // (e.g. Apple Terminal). Omit when ToggleQueue already owns Ctrl+4.
+            alt_keys: if local_mac_vscode {
+                vec![]
+            } else {
+                vec![key!('4', CONTROL)]
+            },
             category: Category::Dashboard,
             context: When::Always,
             hint_priority: None,
@@ -963,8 +971,8 @@ pub(super) fn default_actions(
         },
         ActionDef {
             id: ActionId::DashboardStop,
-            label: "stop",
-            description: "Stop / Close agent",
+            label: "delete",
+            description: "Stop / Delete agent",
             default_key: key!('x', CONTROL),
             alt_keys: vec![],
             category: Category::Dashboard,
@@ -973,7 +981,7 @@ pub(super) fn default_actions(
             hint_key_display: None,
             requires_confirmation: false,
             long_help: Some(
-                "Stops the selected agent and removes its row from the dashboard; a running turn is interrupted first.\nUse it to clear finished or unwanted agents without attaching to them.\nThe in-overlay equivalent (Ctrl+X) confirms before stopping.",
+                "On a busy top-level row, Ctrl+X cancels the running turn. Once the row is idle, press Ctrl+X again within 2s to permanently delete the session.\nOn a subagent row, Ctrl+X kills the subagent.",
             ),
         },
         ActionDef {

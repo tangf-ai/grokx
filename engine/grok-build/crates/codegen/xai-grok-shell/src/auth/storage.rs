@@ -3,11 +3,21 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use super::model::{API_KEY_SCOPE, AuthMode, AuthStore, GrokAuth, lookup_auth};
+use super::model::{API_KEY_SCOPE, AuthMode, AuthStore, GrokAuth};
 
 /// RAII guard for an exclusive advisory lock on `auth.json.lock`.
 /// The lock is released when the inner `File` is dropped (closing the FD).
+///
+/// Field order is load-bearing: `_heartbeat` drops before `_file`, so the
+/// heartbeat thread is stopped and joined while the flock is still held — a
+/// late heartbeat can never write holder info into a lock file a sibling has
+/// already re-acquired.
 pub(crate) struct AuthFileLock {
+    /// Periodic `PID:TS` re-writer (see `manager::lock::LockHeartbeat`).
+    /// `None` for short holds — non-blocking acquires and async acquires
+    /// below the refresh-sized budget — which never span an IdP exchange
+    /// and don't warrant a thread per acquisition.
+    pub(super) _heartbeat: Option<super::manager::lock::LockHeartbeat>,
     pub(super) _file: File,
 }
 
@@ -388,18 +398,6 @@ fn restore_prior_bytes(auth_file: &Path, bytes: &[u8]) -> std::io::Result<()> {
     file.sync_all()?;
     crate::util::secure_file::ensure_owner_only_permissions(auth_file)?;
     Ok(())
-}
-
-/// Read a single auth token from `auth.json` by scope key.
-/// Falls back to the legacy `https://accounts.x.ai/sign-in` scope key
-/// when the requested scope is not found (devbox auth.json migration).
-pub fn read_token_by_scope(grok_home: &Path, scope: &str) -> anyhow::Result<String> {
-    let path = grok_home.join("auth.json");
-    let store =
-        read_auth_json(&path).map_err(|_| anyhow::anyhow!("Not logged in. Run `grok login`."))?;
-    lookup_auth(&store, scope).map(|a| a.key).ok_or_else(|| {
-        anyhow::anyhow!("Your auth token is invalid. Run `grok login` to re-authenticate.")
-    })
 }
 
 /// Read the API key from the `xai::api_key` scope in auth.json.

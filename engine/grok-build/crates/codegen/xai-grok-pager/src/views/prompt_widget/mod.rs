@@ -170,10 +170,11 @@ pub struct PromptStyle {
     /// When `Some((str, color))`, replaces the default `❯` prefix.
     /// Used for bash mode (`"! "` in yellow).
     pub prefix_override: Option<(&'static str, ratatui::style::Color)>,
-    /// Override the placeholder text shown when the textarea is empty.
+    /// Override the placeholder text shown when the textarea is empty (e.g. remember mode).
     /// When `Some(text)`, uses this instead of the default `"Build anything"`.
-    /// Used for feedback mode (`"Type your feedback..."`).
     pub placeholder_override: Option<&'static str>,
+    /// The main composer hides the empty-textarea placeholder on focus; the feedback box keeps it visible.
+    pub placeholder_when_focused: bool,
     /// Compact mode (currently unused for info_block sizing).
     pub compact: bool,
     /// Show the accent line (`┃`) on the left edge of the chrome.
@@ -234,6 +235,7 @@ impl Default for PromptStyle {
             accent_color_override: None,
             border_color_override: None,
             prefix_override: None,
+            placeholder_when_focused: false,
             placeholder_override: None,
             compact: false,
             show_accent_line: false,
@@ -268,6 +270,7 @@ impl PromptStyle {
             accent_color_override: None,
             border_color_override: None,
             prefix_override: None,
+            placeholder_when_focused: false,
             placeholder_override: None,
             compact: false,
             show_accent_line: false,
@@ -306,6 +309,9 @@ pub struct PromptFlag<'a> {
 }
 
 /// Optional info line rendered below the prompt text.
+///
+/// The default is blank: a caller that wants the bottom border without any info text passes it, and [`Self::is_blank`] then skips the text pass.
+#[derive(Default)]
 pub struct PromptInfo<'a> {
     /// Primary label to display on the info line (left side).
     pub model_name: &'a str,
@@ -318,6 +324,15 @@ pub struct PromptInfo<'a> {
     /// When true the warning uses the yellow warning color (<=5% left);
     /// when false it uses dim grey text (5-10% left).
     pub usage_warning_critical: bool,
+}
+
+impl PromptInfo<'_> {
+    pub fn is_blank(&self) -> bool {
+        self.model_name.is_empty()
+            && self.flags.is_empty()
+            && !self.multiline
+            && self.usage_warning.is_none()
+    }
 }
 
 /// Live voice-capture overlay for the prompt.
@@ -421,6 +436,32 @@ impl StashedPrompt {
         }
     }
 
+    /// Clone for freeform prefill while this stash remains the session draft.
+    /// Omits `staged_temp_path` so freeform Drop cannot delete session temps;
+    /// display/send still use `encoded_bytes` / `session_image_path`.
+    pub(crate) fn clone_for_live_prefill(&self) -> Self {
+        let strip_temp = |img: &PastedImage| {
+            let mut c = img.clone();
+            c.staged_temp_path = None;
+            c
+        };
+        Self {
+            text: self.text.clone(),
+            cursor: self.cursor,
+            images: self.images.iter().map(strip_temp).collect(),
+            chip_elements: self.chip_elements.clone(),
+            image_counter: self.image_counter,
+            image_undo_stash: self.image_undo_stash.iter().map(strip_temp).collect(),
+        }
+    }
+
+    pub(crate) fn is_effectively_empty(&self) -> bool {
+        self.text.trim().is_empty()
+            && self.images.is_empty()
+            && self.chip_elements.is_empty()
+            && self.image_undo_stash.is_empty()
+    }
+
     pub(crate) fn into_submission(
         mut self,
     ) -> (
@@ -518,9 +559,8 @@ pub struct PromptWidget {
 
     /// Predicted-next-prompt controller (tab autocomplete ghost text).
     pub(crate) prompt_suggestion: crate::views::prompt_suggestion::PromptSuggestionController,
-    /// Per-frame gate for the prompt-suggestion ghost, set by `AgentView`
-    /// before each draw/key dispatch: false while a turn is running, in
-    /// bash/remember/feedback input modes, or while editing a queued prompt.
+    /// Per-frame gate for the prompt-suggestion ghost, set by `AgentView` before each draw or key dispatch.
+    /// False while a turn is running, in bash/remember input modes, or while editing a queued prompt.
     pub(crate) prompt_suggestion_active: bool,
 
     // -- Image paste state ---------------------------------------------------
@@ -729,6 +769,8 @@ impl PromptWidget {
         let Some(rest) = self.prompt_suggestion.accept(&text) else {
             return false;
         };
+        // Accepting rewrites the token — an unrelated highlight must not survive it.
+        self.textarea.clear_selection();
         self.textarea.insert_str(&rest);
         self.update_file_search_context();
         true
@@ -802,6 +844,8 @@ impl PromptWidget {
     /// written (`Stale` is a draft-preserving no-op); cursor lands after the
     /// insert.
     pub fn apply_completion_splice(&mut self, splice: CompletionSplice) -> bool {
+        // Accepting rewrites the token — an unrelated highlight must not survive it.
+        self.textarea.clear_selection();
         match splice {
             CompletionSplice::WholeLine(line) => {
                 self.set_text(&line);
@@ -1039,9 +1083,19 @@ impl PromptWidget {
 
     // -- Slash command state sync -------------------------------------------
 
+    pub fn set_slash_current_title(&mut self, title: Option<String>) {
+        self.slash_controller.set_current_title(title);
+    }
+
+    pub fn slash_current_title(&self) -> Option<&str> {
+        self.slash_controller.current_title()
+    }
+
     /// Refresh the slash snapshot from current text + cursor.
     ///
-    /// Called by `AgentView` after every `PromptEvent::Edited`.
+    /// Called by `AgentView` after every `PromptEvent::Edited`, and when
+    /// `current_title` changes while the dropdown is already open (so the
+    /// `/rename` ghost is not left stale until the next keystroke).
     /// This is the only way to update the slash snapshot -- `AgentView`
     /// never touches `slash_controller` or `slash_state` directly.
     ///
@@ -1202,6 +1256,8 @@ impl PromptWidget {
         let Some(row) = snap.selection() else {
             return false;
         };
+        // Accepting rewrites the token — an unrelated highlight must not survive it.
+        self.textarea.clear_selection();
         let insert_text = row.insert_text.clone();
         let record_mru = snap.cursor_in_command;
         let mru_record = if record_mru {
@@ -1657,6 +1713,16 @@ impl PromptWidget {
             }
         }
 
+        // Esc/Tab: drop the highlight but decline the press so it still cancels / switches focus.
+        // Modified Esc has no structural consumer — it falls through to the
+        // textarea catch-all, which clears the highlight WITH a repaint.
+        if matches!(key.code, KeyCode::Tab | KeyCode::BackTab)
+            || (key.code == KeyCode::Esc && key.modifiers.is_empty())
+        {
+            self.textarea.clear_selection();
+            return PromptEvent::Ignored;
+        }
+
         // ── Ctrl-L / : on element → open line viewer ────────────────────
         // Ctrl-L when cursor is on or adjacent to a file ref element,
         // or ':' typed right at element boundary → open viewer.
@@ -1687,8 +1753,7 @@ impl PromptWidget {
         // Newline: Shift/Alt+Enter, or Apple Terminal bare Enter with a
         // newline modifier held (CoreGraphics rescue inside is_mod_enter).
         if crate::input::is_mod_enter(key) {
-            self.textarea.insert_str("\n");
-            self.update_file_search_context();
+            self.insert_replacing_selection("\n");
             return PromptEvent::Edited;
         }
 
@@ -1728,8 +1793,7 @@ impl PromptWidget {
                     crate::clipboard::log_paste_key_empty_host_clipboard("prompt_widget_inline");
                     return PromptEvent::Ignored;
                 }
-                self.textarea.insert_str(&text);
-                self.update_file_search_context();
+                self.insert_replacing_selection(&text);
                 return PromptEvent::Edited;
             }
             crate::clipboard::log_paste_key_empty_host_clipboard("prompt_widget_inline");
@@ -1780,24 +1844,31 @@ impl PromptWidget {
         }
 
         // Everything else: delegate to textarea.
-        // Track whether it actually changed anything.
+        // Selection is rendered state: selection-only changes must report Edited or no frame is drawn.
         let old_text = self.textarea.text().to_owned();
         let old_cursor = self.textarea.cursor();
-        let old_has_selection = self.textarea.selection_range().is_some();
+        let old_selection = self.textarea.selection_range();
         self.textarea.input(*key);
         let new_cursor = self.textarea.cursor();
-        let changed = self.textarea.text() != old_text || new_cursor != old_cursor;
+        let new_selection = self.textarea.selection_range();
+        let changed = self.textarea.text() != old_text
+            || new_cursor != old_cursor
+            || new_selection != old_selection;
         self.last_input_delta = crate::input_log::LastInputDelta {
             cursor_before: Some(old_cursor),
             cursor_after: Some(new_cursor),
             text_len_before: Some(old_text.len()),
             text_len_after: Some(self.textarea.text().len()),
-            had_selection_before: Some(old_has_selection),
-            had_selection_after: Some(self.textarea.selection_range().is_some()),
+            had_selection_before: Some(old_selection.is_some()),
+            had_selection_after: Some(new_selection.is_some()),
             textarea_changed: Some(changed),
         };
         if changed {
-            self.sync_images_with_textarea();
+            // Image chips only change with the text — skip the resync on
+            // selection/cursor-only changes (held Shift+arrow extends).
+            if self.textarea.text() != old_text {
+                self.sync_images_with_textarea();
+            }
             self.update_file_search_context();
             PromptEvent::Edited
         } else {
@@ -1818,7 +1889,7 @@ impl PromptWidget {
                     key_kind: format!("{:?}", key.kind),
                     cursor_pos: old_cursor,
                     text_len: old_text.len(),
-                    has_selection: old_has_selection,
+                    has_selection: old_selection.is_some(),
                 };
                 // Structured warn for the product telemetry pipeline.
                 tracing::warn!(
@@ -1957,6 +2028,9 @@ impl PromptWidget {
         let Some(ctx) = ctx else { return };
         let Some(res) = result else { return };
 
+        // Accepting rewrites the token — an unrelated highlight must not survive it.
+        self.textarea.clear_selection();
+
         // File results behave exactly like Tab (insert + trailing space).
         // "Drill down" only makes sense for directories — there is nothing
         // to nest into beneath a file — so for file selections Right and
@@ -2010,6 +2084,9 @@ impl PromptWidget {
 
         let Some(ctx) = ctx else { return };
         let Some(res) = result else { return };
+
+        // Accepting rewrites the token — an unrelated highlight must not survive it.
+        self.textarea.clear_selection();
 
         if ctx.is_dir_mode() && res.is_dir {
             // Descending into a selected directory while navigating (dir-mode):
@@ -2066,6 +2143,9 @@ impl PromptWidget {
 
         let Some(ctx) = ctx else { return };
         let Some(res) = result else { return };
+
+        // Accepting rewrites the token — an unrelated highlight must not survive it.
+        self.textarea.clear_selection();
 
         let path_str = res.path.to_string();
         let path = normalize_display_path(&path_str);
@@ -2128,7 +2208,7 @@ impl PromptWidget {
         // modifier state — if Shift/Option/Cmd is physically held, insert
         // a newline instead of submitting.
         if key.code == KeyCode::Enter && crate::input::is_apple_terminal_newline_modifier_held() {
-            self.textarea.insert_str("\n");
+            self.insert_replacing_selection("\n");
             return EnterOutcome::NewlineInserted;
         }
 
@@ -2376,6 +2456,16 @@ impl PromptWidget {
         self.images.push(img);
 
         Ok(())
+    }
+
+    /// Insert text replacing the selection; resyncs images (a selection can swallow chips).
+    pub(crate) fn insert_replacing_selection(&mut self, text: &str) {
+        let replaced_selection = self.textarea.selection_range().is_some();
+        self.textarea.insert_str_replacing_selection(text);
+        if replaced_selection {
+            self.sync_images_with_textarea();
+        }
+        self.update_file_search_context();
     }
 
     fn sync_images_with_textarea(&mut self) {
@@ -3180,17 +3270,20 @@ impl PromptWidget {
             false
         };
 
-        // Placeholder text when empty and unfocused
+        // Placeholder text when empty (unfocused, or opted in while focused).
         if self.textarea.text().is_empty()
             && ta_area.width > 0
-            && !style.focused
+            && (!style.focused || style.placeholder_when_focused)
             && !voice_interim_shown
         {
             let placeholder = style.placeholder_override.unwrap_or("Build anything");
+            // `set_string` clips at the buffer edge, not at the textarea, so a placeholder longer than the box would paint over its border.
+            let truncated =
+                crate::render::line_utils::truncate_str(placeholder, ta_area.width as usize);
             buf.set_string(
                 ta_area.x,
                 ta_area.y,
-                placeholder,
+                &truncated,
                 Style::default().fg(theme.gray).bg(bg),
             );
         }
@@ -3234,7 +3327,8 @@ impl PromptWidget {
                     cell.set_style(div_style);
                 }
             }
-            if let Some(info) = info {
+            // A blank info line still writes its padding spaces, which would punch holes in the divider it sits on.
+            if let Some(info) = info.filter(|i| !i.is_blank()) {
                 let info_rect = Rect {
                     x: content_area.x,
                     y: div_y,

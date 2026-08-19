@@ -106,6 +106,28 @@ fn enqueue_permission(
         .as_ref()
         .map(|h| xai_grok_workspace::permission::default_always_allow_scope(&h.highlighted_words))
         .unwrap_or(0);
+    let bash_deny_selection_count = bash_highlights
+        .as_ref()
+        .map(|h| xai_grok_workspace::permission::default_always_deny_scope(&h.highlighted_words))
+        .unwrap_or(0);
+
+    // The request arrives over ACP from a possibly older agent, so a violated
+    // enqueue invariant (allow row on a non-persisting default scope) is
+    // warned, never asserted; the agent proves the invariant crate-locally.
+    if let Some(h) = bash_highlights.as_ref() {
+        let offers_allow_row = perm.request.options.iter().any(|o| {
+            o.option_id.0.as_ref() == crate::views::permission_view::ALLOW_ALWAYS_COMMAND_OPTION_ID
+        });
+        if offers_allow_row
+            && !xai_grok_workspace::permission::always_allow_scope_persists(h, bash_selection_count)
+        {
+            tracing::warn!(
+                scope = bash_selection_count,
+                words = ?h.highlighted_words,
+                "allow-always-command row offered but default scope does not persist"
+            );
+        }
+    }
 
     // 1b. Parse MCP scope state from the `allow-always-mcp` option's meta.
     //     Mutually exclusive with the bash flow at the per-request level —
@@ -133,8 +155,17 @@ fn enqueue_permission(
     let subagent_label = resolve_subagent_label(agent, &perm.request.session_id);
 
     // 3. Build title and description from the tool call.
-    let (title, description, bash_command_raw) =
-        build_permission_display(&perm.request, bash_highlights.as_ref());
+    let (title, description, bash_command_raw) = build_permission_display(
+        &perm.request,
+        bash_highlights.as_ref(),
+        #[cfg(feature = "local-workspace")]
+        matches!(
+            agent.workspace_mode,
+            crate::views::welcome::WelcomeWorkspaceMode::LocalWorkspace
+        ),
+        #[cfg(not(feature = "local-workspace"))]
+        false,
+    );
 
     // 4. Assign a monotonic ID.
     let perm_id = agent.next_perm_req_id;
@@ -174,6 +205,7 @@ fn enqueue_permission(
         active_idx,
         bash_highlights,
         bash_selection_count,
+        bash_deny_selection_count,
         bash_command_raw,
         mcp_scope,
         title,
@@ -236,6 +268,7 @@ fn resolve_subagent_label(agent: &AgentView, session_id: &acp::SessionId) -> Opt
 fn build_permission_display(
     req: &acp::RequestPermissionRequest,
     bash_highlights: Option<&BashCommandHighlights>,
+    session_local_workspace: bool,
 ) -> (String, Vec<String>, Option<String>) {
     let is_bash = bash_highlights.is_some();
 
@@ -303,9 +336,27 @@ fn build_permission_display(
         }
     };
 
+    let title = qualify_permission_title_for_local_workspace(title, session_local_workspace);
     let description = permission_description_lines(req);
     let bash_cmd = if is_execute { raw_command } else { None };
     (title, description, bash_cmd)
+}
+
+/// Per-session HITL copy — not process-global CLI stamp.
+fn qualify_permission_title_for_local_workspace(
+    title: String,
+    session_local_workspace: bool,
+) -> String {
+    if !session_local_workspace {
+        return title;
+    }
+    if title.contains("on your machine") {
+        return title;
+    }
+    if let Some(stripped) = title.strip_suffix('?') {
+        return format!("{stripped} (on your machine)?");
+    }
+    format!("{title} (on your machine)")
 }
 
 /// Lines shown under the permission title: protected-edit note (if any), then
@@ -401,11 +452,114 @@ fn cancel_permission(perm: xai_acp_lib::AcpArgs<acp::RequestPermissionRequest>) 
         .ok();
 }
 
-/// Live auto recap arrived while the agent is busy (turn or command in
-/// flight) — drop so it cannot land under newer output. Manual `/recap` and
-/// history replay always apply.
-pub(super) fn should_drop_late_auto_recap(auto: bool, is_replay: bool, agent_idle: bool) -> bool {
-    auto && !is_replay && !agent_idle
+/// Drop live auto recap that would land between turns. Manual `/recap` and
+/// replay always apply.
+pub(super) fn should_drop_late_auto_recap(
+    auto: bool,
+    is_replay: bool,
+    agent: &crate::app::agent_view::AgentView,
+) -> bool {
+    auto && !is_replay && !cli_is_idle_for_recap(agent)
+}
+
+/// Recap must not paint in the gap before the next turn starts.
+fn cli_is_idle_for_recap(agent: &crate::app::agent_view::AgentView) -> bool {
+    use crate::app::agent::BgTaskStatus;
+
+    if !agent.session.state.is_idle() {
+        return false;
+    }
+    if agent.session.in_flight_prompt.is_some() || agent.has_held_user_queue() {
+        return false;
+    }
+    if agent.subagent_sessions.values().any(|s| !s.finished) {
+        return false;
+    }
+    if agent
+        .session
+        .bg_tasks
+        .values()
+        .any(|t| t.status == BgTaskStatus::Running && !t.is_monitor)
+    {
+        return false;
+    }
+    if scrollback_waiting_on_user_turn(&agent.scrollback) {
+        return false;
+    }
+    true
+}
+
+/// Walk past monitor/bg-task/lifecycle trailers. Settled-turn markers
+/// (including failure paths that skip `TurnFailed`) end the wait.
+fn scrollback_waiting_on_user_turn(scrollback: &crate::scrollback::state::ScrollbackState) -> bool {
+    use crate::scrollback::block::RenderBlock;
+
+    for idx in (0..scrollback.len()).rev() {
+        let Some(entry) = scrollback.get(idx) else {
+            continue;
+        };
+        if entry.block.is_user_prompt() {
+            return true;
+        }
+        if matches!(
+            &entry.block,
+            RenderBlock::AgentMessage(_) | RenderBlock::Thinking(_) | RenderBlock::ToolCall(_)
+        ) {
+            return false;
+        }
+        if let RenderBlock::SessionEvent(b) = &entry.block
+            && session_event_settles_turn(&b.event)
+        {
+            return false;
+        }
+    }
+    false
+}
+
+/// Retry/auth/overflow paths suppress `TurnFailed` and leave these markers.
+fn session_event_settles_turn(event: &crate::scrollback::blocks::SessionEvent) -> bool {
+    use crate::scrollback::blocks::SessionEvent;
+
+    event.is_turn_terminal()
+        || matches!(
+            event,
+            SessionEvent::ReAuthRequired
+                | SessionEvent::ContextTooLarge
+                | SessionEvent::DiskFull
+                | SessionEvent::CompactionFailed { .. }
+                | SessionEvent::RetryFailed { .. }
+        )
+}
+
+/// Live auto recap when scrollback already has a recap after the last user
+/// prompt. Replay still rebuilds history as stored.
+pub(super) fn should_drop_duplicate_auto_recap(
+    auto: bool,
+    is_replay: bool,
+    scrollback: &crate::scrollback::state::ScrollbackState,
+) -> bool {
+    auto && !is_replay && scrollback_has_recap_since_last_user(scrollback)
+}
+
+fn scrollback_has_recap_since_last_user(
+    scrollback: &crate::scrollback::state::ScrollbackState,
+) -> bool {
+    use crate::scrollback::block::RenderBlock;
+    use crate::scrollback::blocks::SessionEvent;
+
+    let mut recap_since_user = false;
+    for (_, entry) in scrollback.iter_entries() {
+        if entry.block.is_user_prompt() {
+            recap_since_user = false;
+            continue;
+        }
+        if let RenderBlock::SessionEvent(b) = &entry.block
+            && matches!(b.event, SessionEvent::Recap { .. })
+        {
+            recap_since_user = true;
+        }
+    }
+    recap_since_user
 }
 
 /// Land a `SessionRecap` block: fill a manual `/recap`'s in-flight loading
@@ -448,5 +602,22 @@ pub(super) fn apply_recap_block(agent: &mut AgentView, auto: bool, recap_block: 
         None => {
             agent.scrollback.push_block(recap_block);
         }
+    }
+}
+
+#[cfg(all(test, feature = "local-workspace"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn permission_title_qualifies_for_local_workspace() {
+        assert_eq!(
+            qualify_permission_title_for_local_workspace("Allow Edit?".into(), false),
+            "Allow Edit?"
+        );
+        assert_eq!(
+            qualify_permission_title_for_local_workspace("Allow Edit?".into(), true),
+            "Allow Edit (on your machine)?"
+        );
     }
 }

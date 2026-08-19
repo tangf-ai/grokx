@@ -36,6 +36,160 @@ pub use xai_grok_workspace_types::rpc::worktree::{
 
 const WORKTREE_LOG: &str = "xai_worktree";
 
+/// True when `path` is on a grove FUSE mount. Fast btrfs CoW cannot snapshot
+/// FUSE; callers must fall back to a plain git checkout ([`WorktreeType::Git`]).
+/// `fusectl` is not a guest mount (never match `/^fuse/` blindly).
+pub(crate) fn is_grove_fuse_mount(path: &Path) -> bool {
+    if path_looks_like_grove_store(path) {
+        return true;
+    }
+    let abs = dunce::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    if path_looks_like_grove_store(&abs) {
+        return true;
+    }
+    let Ok(text) = std::fs::read_to_string("/proc/self/mountinfo") else {
+        return false;
+    };
+    longest_covering_fstype(&text, &abs).is_some_and(|fstype| {
+        let f = fstype.to_ascii_lowercase();
+        (f == "fuse" || f.starts_with("fuse.")) && f != "fusectl"
+    })
+}
+
+fn path_looks_like_grove_store(path: &Path) -> bool {
+    path.to_string_lossy().contains("/var/lib/grove/")
+}
+
+/// Unescape the octal escapes the kernel writes for whitespace/backslash in
+/// `/proc/self/mountinfo` fields (space=`\040`, tab=`\011`, newline=`\012`,
+/// backslash=`\134`). Without this a mount point containing a space never
+/// matches a real path.
+fn unescape_mountinfo_field(s: &str) -> String {
+    if !s.contains('\\') {
+        return s.to_string();
+    }
+    let bytes = s.as_bytes();
+    // Accumulate raw bytes (not `as char`, which mis-maps bytes >= 0x80 to
+    // U+0080..U+00FF and splits multi-byte UTF-8): copy verbatim and reassemble
+    // once, so non-ASCII mount points survive the longest-prefix compare.
+    let mut out: Vec<u8> = Vec::with_capacity(s.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\'
+            && i + 4 <= bytes.len()
+            && bytes[i + 1].is_ascii_digit()
+            && bytes[i + 2].is_ascii_digit()
+            && bytes[i + 3].is_ascii_digit()
+            && let Ok(code) = u8::from_str_radix(&s[i + 1..i + 4], 8)
+        {
+            out.push(code);
+            i += 4;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn longest_covering_fstype<'a>(mountinfo: &'a str, path: &Path) -> Option<&'a str> {
+    let path_s = path.to_string_lossy();
+    let mut best_mp = String::new();
+    let mut best_fs: Option<&'a str> = None;
+    for line in mountinfo.lines() {
+        // Tolerate malformed/blank rows: `continue` (not `?`) so a single bad
+        // line cannot abort the whole scan and drop an earlier valid cover.
+        let mut sides = line.splitn(2, " - ");
+        let (Some(left), Some(right)) = (sides.next(), sides.next()) else {
+            continue;
+        };
+        let Some(mp_raw) = left.split_whitespace().nth(4) else {
+            continue;
+        };
+        let Some(fstype) = right.split_whitespace().next() else {
+            continue;
+        };
+        // Mount points are octal-escaped in mountinfo; unescape before comparing.
+        let mp = unescape_mountinfo_field(mp_raw);
+        let covers = path_s == mp || path_s.starts_with(&format!("{mp}/")) || mp == "/";
+        if covers && mp.len() >= best_mp.len() {
+            best_mp = mp;
+            best_fs = Some(fstype);
+        }
+    }
+    best_fs
+}
+
+#[cfg(test)]
+mod grove_fuse_tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn grove_store_path_is_detected() {
+        assert!(path_looks_like_grove_store(Path::new(
+            "/var/lib/grove/repos/app/worktree"
+        )));
+        assert!(!path_looks_like_grove_store(Path::new("/workspace/app")));
+    }
+
+    #[test]
+    fn mountinfo_prefers_longest_cover_and_skips_unrelated() {
+        let info = "\
+15 20 0:21 / / rw - ext4 /dev/sda1 rw\n\
+25 15 0:47 / /sys/fs/fuse/connections rw - fusectl fusectl rw\n\
+36 15 0:52 / /workspace/app rw - fuse.grove grove rw\n";
+        assert_eq!(
+            longest_covering_fstype(info, Path::new("/workspace/app/src")),
+            Some("fuse.grove")
+        );
+        assert_eq!(
+            longest_covering_fstype(info, Path::new("/home")),
+            Some("ext4")
+        );
+    }
+
+    #[test]
+    fn mountinfo_unescapes_octal_mount_points() {
+        // Mount point with a space is octal-escaped as `\040` in mountinfo.
+        let info = "15 20 0:21 / / rw - ext4 /dev/sda1 rw\n\
+             36 15 0:52 / /workspace/my\\040app rw - fuse.grove grove rw\n";
+        assert_eq!(
+            longest_covering_fstype(info, Path::new("/workspace/my app/src")),
+            Some("fuse.grove")
+        );
+    }
+
+    #[test]
+    fn mountinfo_skips_malformed_rows_without_aborting() {
+        // A blank line and a row with no " - " separator must not abort the scan
+        // and drop the valid grove cover that follows.
+        let info = "15 20 0:21 / / rw - ext4 /dev/sda1 rw\n\
+             \n\
+             this line has no separator and should be skipped\n\
+             36 15 0:52 / /workspace/app rw - fuse.grove grove rw\n";
+        assert_eq!(
+            longest_covering_fstype(info, Path::new("/workspace/app/src")),
+            Some("fuse.grove")
+        );
+    }
+
+    #[test]
+    fn unescape_mountinfo_field_handles_escapes_and_plain() {
+        assert_eq!(unescape_mountinfo_field("/a/b"), "/a/b");
+        assert_eq!(unescape_mountinfo_field("/a\\040b"), "/a b");
+        assert_eq!(unescape_mountinfo_field("/a\\134b"), "/a\\b");
+    }
+
+    #[test]
+    fn is_grove_fuse_mount_matches_store_layout() {
+        assert!(is_grove_fuse_mount(Path::new(
+            "/var/lib/grove/repos/app/worktree"
+        )));
+        assert!(!is_grove_fuse_mount(Path::new("/tmp/not-a-grove-path")));
+    }
+}
+
 /// Map a [`WorktreeType`] to the fast-worktree crate's `CreationMode`.
 pub(crate) fn to_creation_mode(t: WorktreeType) -> xai_fast_worktree::CreationMode {
     match t {
@@ -486,8 +640,9 @@ pub const MAX_LABEL_LEN: usize = 64;
 pub const MAX_COLLISION_SUFFIX: u32 = 100;
 
 /// Metadata key for the human-readable worktree label.
-pub const META_KEY_LABEL: &str = "label";
-/// Metadata key for whether the label was user-provided.
+pub use xai_fast_worktree::META_KEY_LABEL;
+/// Metadata key for whether the label was user-provided. Unlike
+/// META_KEY_LABEL, no record consumer below this crate reads it.
 pub const META_KEY_USER_PROVIDED: &str = "user_provided";
 
 /// Sanitize a user-provided label into a filesystem-safe directory name.
@@ -739,12 +894,7 @@ pub(crate) fn source_repo_for_cwd(cwd: &str) -> Option<std::path::PathBuf> {
 /// non-worktree paths or when the DB is unavailable.
 pub fn lookup_worktree_label(cwd: &str) -> Option<String> {
     let (_db, record) = worktree_record_for_cwd(cwd)?;
-    record
-        .metadata
-        .as_ref()
-        .and_then(|m| m.get(META_KEY_LABEL))
-        .and_then(|v| v.as_str())
-        .map(String::from)
+    record.label().map(String::from)
 }
 
 /// Record activity on the worktree containing `cwd` (best-effort, infallible).
@@ -939,6 +1089,17 @@ pub async fn create_worktree_streaming<N: WorktreeNotificationSender>(
     // Determine worktree type, preserving the .git.is_dir() guard for Standalone mode.
     // A linked worktree has a `.git` *file* pointing to the main repo; a real repo has a `.git` *directory*.
     let requested_type = req.worktree_type.unwrap_or(WorktreeType::Linked);
+    let requested_type = if is_grove_fuse_mount(Path::new(&req.source_path)) {
+        tracing::info!(
+            target: WORKTREE_LOG,
+            session_id = %session_id,
+            source = %req.source_path,
+            "grove FUSE source: disabling fast-worktree CoW, using git checkout"
+        );
+        WorktreeType::Git
+    } else {
+        requested_type
+    };
     let git_dir_is_directory = std::path::Path::new(&req.source_path).join(".git").is_dir();
     let creation_mode = if requested_type == WorktreeType::Standalone {
         if git_dir_is_directory {
@@ -2360,9 +2521,9 @@ pub struct RehydrateSessionResponse {
 // ============================================================================
 
 use xai_fast_worktree::{
-    AutoGcOptions, DbStats, GcOptions, GcReport, ListFilter, WorktreeAutoGcLayer, WorktreeDb,
-    WorktreeKind, WorktreeRecord, gc_worktrees as fw_gc_worktrees, maybe_auto_gc,
-    rebuild_worktree_db, resolve_grok_home, resolve_worktree_auto_gc_from_layers,
+    DbStats, GcOptions, GcReport, ListFilter, WorktreeAutoGcLayer, WorktreeDb, WorktreeKind,
+    WorktreeRecord, gc_worktrees as fw_gc_worktrees, rebuild_worktree_db, resolve_grok_home,
+    resolve_worktree_auto_gc_from_layers, run_auto_gc_pass,
 };
 
 pub fn open_db() -> Result<WorktreeDb> {
@@ -2427,8 +2588,21 @@ pub fn worktree_auto_gc_layer_from_settings(
     use std::collections::BTreeMap;
     use xai_grok_config_types::WorktreeKindMaxAge;
 
-    let max_age_by_kind = s
-        .max_age_by_kind
+    // Exhaustive destructure so a new settings field becomes a compile error
+    // here rather than a silently dropped knob on both the shell and workspace
+    // resolve paths.
+    let xai_grok_config_types::WorktreeAutoGcSettings {
+        enabled,
+        max_age_secs,
+        min_interval_secs,
+        dry_run,
+        include_orphan_snapshots,
+        max_age_by_kind,
+        include_rebuild,
+        rebuild_min_interval_secs,
+    } = s;
+
+    let max_age_by_kind = max_age_by_kind
         .as_ref()
         .map(|m| {
             m.iter()
@@ -2445,53 +2619,79 @@ pub fn worktree_auto_gc_layer_from_settings(
         .unwrap_or_default();
 
     WorktreeAutoGcLayer {
-        enabled: s.enabled,
-        max_age_secs: s.max_age_secs,
-        min_interval_secs: s.min_interval_secs,
-        dry_run: s.dry_run,
-        include_orphan_snapshots: s.include_orphan_snapshots,
+        enabled: *enabled,
+        max_age_secs: *max_age_secs,
+        min_interval_secs: *min_interval_secs,
+        dry_run: *dry_run,
+        include_orphan_snapshots: *include_orphan_snapshots,
         max_age_by_kind,
-        include_rebuild: s.include_rebuild,
-        rebuild_min_interval_secs: s.rebuild_min_interval_secs,
+        include_rebuild: *include_rebuild,
+        rebuild_min_interval_secs: *rebuild_min_interval_secs,
     }
 }
 
-/// Env + `$GROK_HOME/config.toml` only — **`remote=None` is intentional**.
+/// Parse `[worktree.auto_gc]` out of the workspace's `$GROK_HOME/config.toml`.
 ///
-/// Workspace handle startup has no remote-settings blob (unlike shell agent
-/// init, which resolves env > TOML > remote). Remote `worktree_auto_gc`
-/// kill-switch / staged rollout therefore does not apply on pure-workspace
-/// processes; use `GROK_WORKTREE_AUTO_GC=0` / `GROK_WORKTREE_AUTO_GC_DRY_RUN=1`
-/// or local TOML until remote is plumbed into `make_workspace_handle`.
-fn resolve_worktree_auto_gc_local() -> xai_fast_worktree::ResolvedWorktreeAutoGc {
-    use xai_grok_config_types::WorktreeAutoGcSettings;
+/// Returns `None` when the table is absent or fails to deserialize.
+fn worktree_auto_gc_settings_from_toml(
+    root: &toml::Value,
+) -> Option<xai_grok_config_types::WorktreeAutoGcSettings> {
+    root.get("worktree")
+        .and_then(|w| w.get("auto_gc"))
+        // toml::Value only deserializes by value (no &Value Deserializer).
+        .and_then(|v| xai_grok_config_types::WorktreeAutoGcSettings::deserialize(v.clone()).ok())
+}
 
+/// Env + `$GROK_HOME/config.toml` only — this process has no remote-settings
+/// blob (unlike shell agent init, which resolves env > TOML > remote). Because a
+/// server-side `worktree_auto_gc` kill-switch / staged-rollout / dry-run is
+/// invisible here, this path opts in only when local config explicitly enables
+/// it (`[worktree.auto_gc] enabled = true`); otherwise it returns `None` and the
+/// caller skips the pass entirely.
+///
+/// Skipping (rather than running a forced dry-run) is deliberate: the shell
+/// agent already runs the authoritative remote-aware pass against the same
+/// `$GROK_HOME` DB. A forced dry-run here would still spend the pass budget and,
+/// worse, stamp the shared throttle meta — blacking out the real deleting pass
+/// for a full `min_interval`. Skipping keeps the same fail-safe (never delete
+/// against an unseen remote policy) at none of that cost.
+fn resolve_worktree_auto_gc_local() -> Option<xai_fast_worktree::ResolvedWorktreeAutoGc> {
     let local = if let Ok(home) = resolve_grok_home() {
         let path = home.join("config.toml");
         if let Ok(text) = std::fs::read_to_string(&path)
             && let Ok(root) = text.parse::<toml::Value>()
         {
-            root.get("worktree")
-                .and_then(|w| w.get("auto_gc"))
-                // toml::Value only deserializes by value (no &Value Deserializer).
-                .and_then(|v| WorktreeAutoGcSettings::deserialize(v.clone()).ok())
+            worktree_auto_gc_settings_from_toml(&root)
         } else {
             None
         }
     } else {
         None
     };
-    let layer = local.as_ref().map(worktree_auto_gc_layer_from_settings);
-    // remote=None: see doc comment on this function.
-    resolve_worktree_auto_gc_from_layers(layer.as_ref(), None)
+    local_auto_gc_policy(local.as_ref())
+}
+
+/// Pure opt-in decision (no IO): `None` unless local config explicitly enables
+/// the pass. Split out of `resolve_worktree_auto_gc_local` so the fail-safe is
+/// testable without touching `$GROK_HOME`.
+fn local_auto_gc_policy(
+    local: Option<&xai_grok_config_types::WorktreeAutoGcSettings>,
+) -> Option<xai_fast_worktree::ResolvedWorktreeAutoGc> {
+    // No explicit local opt-in ⇒ let the remote-aware shell pass own GC.
+    if !local.and_then(|s| s.enabled).unwrap_or(false) {
+        return None;
+    }
+    let layer = local.map(worktree_auto_gc_layer_from_settings);
+    Some(resolve_worktree_auto_gc_from_layers(layer.as_ref(), None))
 }
 
 /// Sync auto-GC for handle startup (caller must `spawn_blocking`).
 pub fn run_auto_gc_best_effort() {
-    let opts = AutoGcOptions::from_resolved(resolve_worktree_auto_gc_local());
-    if let Err(e) = WorktreeDb::open_default().and_then(|db| maybe_auto_gc(&db, &opts)) {
-        tracing::warn!(error = %e, "auto worktree gc failed");
-    }
+    let Some(policy) = resolve_worktree_auto_gc_local() else {
+        tracing::debug!("auto worktree gc skipped at workspace startup: no local opt-in");
+        return;
+    };
+    run_auto_gc_pass(&policy, "workspace startup");
 }
 
 pub fn worktree_db_stats() -> Result<DbStats> {
@@ -2507,7 +2707,7 @@ pub fn worktree_db_rebuild() -> Result<xai_fast_worktree::RebuildReport> {
 
 pub fn worktree_db_path() -> Result<std::path::PathBuf> {
     let home = resolve_grok_home()?;
-    Ok(home.join("worktrees.db"))
+    Ok(WorktreeDb::resolve_db_path(&home))
 }
 
 /// Resolve an ID-or-path string to a worktree path via DB lookup,
@@ -2628,6 +2828,38 @@ mod tests {
         let cfg = crate::StatusConfig::default();
         assert_eq!(cfg.agent_rpc_timeout, Duration::from_secs(30));
         assert_eq!(cfg.agent_connect_timeout, Duration::from_secs(5));
+    }
+
+    /// The workspace hook is remote-blind, so it runs only on an explicit local
+    /// opt-in. Without one it must return `None` (skip) — not a forced dry-run
+    /// pass, which would stamp the shared throttle and black out the shell
+    /// agent's real deleting pass.
+    #[test]
+    fn local_auto_gc_policy_opts_in_only_when_enabled() {
+        use xai_grok_config_types::WorktreeAutoGcSettings;
+
+        assert!(local_auto_gc_policy(None).is_none(), "no config ⇒ skip");
+        assert!(
+            local_auto_gc_policy(Some(&WorktreeAutoGcSettings::default())).is_none(),
+            "enabled unset ⇒ skip"
+        );
+        assert!(
+            local_auto_gc_policy(Some(&WorktreeAutoGcSettings {
+                enabled: Some(false),
+                ..Default::default()
+            }))
+            .is_none(),
+            "enabled=false ⇒ skip"
+        );
+        let policy = local_auto_gc_policy(Some(&WorktreeAutoGcSettings {
+            enabled: Some(true),
+            ..Default::default()
+        }))
+        .expect("enabled=true ⇒ run");
+        assert!(
+            !policy.dry_run,
+            "an explicit local opt-in runs a real pass, not a forced dry-run"
+        );
     }
 
     // ── snapshot_and_remove_subagent_worktree ────────────────────────────

@@ -3,9 +3,10 @@
 use ratatui::style::Style;
 use ratatui::text::{Span, Text};
 
-use crate::diff::DiffHunk;
+use crate::appearance::AppearanceConfig;
 use crate::inline_media_ffmpeg::inline_media_reserved_rows;
 use crate::prompt_images::{InlineMediaInfo, ScrollbackImageRef, ScrollbackVideoRef};
+use xai_grok_pager_diff::DiffHunk;
 // Imported (rather than referenced as `crate::…`) so the default trait method
 // below stays free of `crate::` tokens: `#[enum_delegate::register]` captures
 // default method bodies into a generated macro, where `crate::` trips
@@ -84,8 +85,15 @@ pub trait BlockContent {
     }
 
     /// Vertical padding (blank line with accent top/bottom).
-    fn has_vpad(&self, _ctx: &BlockContext) -> bool {
+    ///
+    /// Borrows the appearance rather than taking a [`BlockContext`] so the
+    /// O(history) height passes do not build one per entry.
+    fn has_vpad_for(&self, _appearance: &AppearanceConfig) -> bool {
         true
+    }
+
+    fn has_vpad(&self, ctx: &BlockContext) -> bool {
+        self.has_vpad_for(&ctx.appearance)
     }
 
     /// Whether block supports raw mode toggle.
@@ -490,8 +498,8 @@ impl BlockContent for RenderBlock {
         delegate_block!(self, background(ctx))
     }
 
-    fn has_vpad(&self, ctx: &BlockContext) -> bool {
-        delegate_block!(self, has_vpad(ctx))
+    fn has_vpad_for(&self, appearance: &AppearanceConfig) -> bool {
+        delegate_block!(self, has_vpad_for(appearance))
     }
 
     fn has_raw_mode(&self) -> bool {

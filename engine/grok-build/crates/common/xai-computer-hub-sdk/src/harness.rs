@@ -477,6 +477,7 @@ impl ToolHarnessBuilder {
             self.on_reconnect.clone(),
             None, // on_disconnect (unused for harness connections)
             None, // on_connect (unused for harness connections)
+            None, // on_terminal_close (unused for harness connections)
             None,
             None,
             None,
@@ -553,6 +554,23 @@ pub struct SessionBindReport {
     /// Server-stated reason the toolset resolution failed closed (the bind
     /// advertises no model-facing tools by design when set).
     pub resolve_error: Option<String>,
+    /// Advisory image capability tokens from the bind reply. Empty means
+    /// unknown, as does any set lacking
+    /// [`xai_tool_protocol::IMAGE_CAPABILITIES_V1`].
+    pub image_capabilities: Vec<String>,
+}
+
+impl From<&xai_tool_protocol::SessionBindServerResult> for SessionBindReport {
+    /// Canonical projection of a bind reply onto its report fields; every
+    /// bind-contract field is copied here and nowhere else.
+    fn from(result: &xai_tool_protocol::SessionBindServerResult) -> Self {
+        Self {
+            binary_version: result.binary_version.clone(),
+            unserved_tool_ids: result.unserved_tool_ids.clone(),
+            resolve_error: result.resolve_error.clone(),
+            image_capabilities: result.image_capabilities.clone(),
+        }
+    }
 }
 
 /// Harness attached to a pooled [`HubConnection`].
@@ -1029,7 +1047,7 @@ impl ToolHarness {
     }
 
     /// [`Self::session_bind`], returning the full bind result including the
-    /// server's bind report (`binary_version`, `unserved_tool_ids`).
+    /// server's bind report.
     pub async fn session_bind_with_report(
         &self,
         server_id: &str,
@@ -1064,11 +1082,7 @@ impl ToolHarness {
                     self.inner.remote_tools.store(arc);
                     self.inner
                         .last_bind_report
-                        .store(Some(Arc::new(SessionBindReport {
-                            binary_version: bind_result.binary_version.clone(),
-                            unserved_tool_ids: bind_result.unserved_tool_ids.clone(),
-                            resolve_error: bind_result.resolve_error.clone(),
-                        })));
+                        .store(Some(Arc::new(SessionBindReport::from(&bind_result))));
                     Ok(bind_result)
                 }
                 ResponseOutcome::Error(err) => Err(ClientError::from_jsonrpc_error(err)),
@@ -3076,7 +3090,9 @@ mod tests {
             "supported_protocol_versions": ["1.0.0"],
         });
         let _ = socket.send(Message::Text(ack.to_string().into())).await;
-        while let Some(Ok(Message::Text(text))) = socket.recv().await {
+        // Ignore WS Ping/Pong/Close: keepalive fires immediately after hello.
+        while let Some(Ok(msg)) = socket.recv().await {
+            let Message::Text(text) = msg else { continue };
             let Ok(value) = serde_json::from_str::<Value>(text.as_ref()) else {
                 continue;
             };

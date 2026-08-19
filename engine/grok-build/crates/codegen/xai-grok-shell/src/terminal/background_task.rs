@@ -236,15 +236,6 @@ impl BackgroundTaskRegistry {
         Some(entry.snapshot.read().await.clone())
     }
 
-    /// Get a cloneable notification handle for a specific task.
-    ///
-    /// Used by multi-wait to select across multiple task exit notifications.
-    /// Returns `None` if the task is not registered.
-    pub async fn get_exit_notify(&self, task_id: &str) -> Option<Arc<Notify>> {
-        let tasks = self.tasks.lock().await;
-        tasks.get(task_id).map(|e| Arc::clone(&e.exit_notify))
-    }
-
     /// List all tasks in the registry.
     pub async fn list(&self) -> Vec<TaskSnapshot> {
         let tasks = self.tasks.lock().await;
@@ -266,19 +257,6 @@ impl BackgroundTaskRegistry {
         }
         count
     }
-}
-
-/// Get output file path for a background task.
-///
-/// Creates the directory structure if it doesn't exist.
-/// Path format: `~/.grok/sessions/{session_id}/tasks/{task_id}.log`
-pub fn get_task_output_path(session_id: &str, task_id: &str) -> PathBuf {
-    use crate::util::grok_home::grok_home;
-
-    let tasks_dir = grok_home().join("sessions").join(session_id).join("tasks");
-    // Create directory (ignore errors - will fail on write if dir creation fails)
-    std::fs::create_dir_all(&tasks_dir).ok();
-    tasks_dir.join(format!("{}.log", task_id))
 }
 
 // ── Background task manifest for session resume ──

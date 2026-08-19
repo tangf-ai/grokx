@@ -414,7 +414,7 @@ pub fn init_tracing() -> TracingHandle {
     let (make_writer, rx) = TracingChannelMakeWriter::new();
     let payload_level = "off";
     let directives = format!(
-        "xai_grok_shell=info,xai_grok_pager=trace,xai_grok_tools=info,xai_acp_lib=info,{RMCP_SSE_NOISE_TARGET}=error,sampling_log=off,{ACP_UPDATE_TARGET}=debug,{ACP_UPDATE_PAYLOAD_TARGET}={payload_level}"
+        "xai_grok_shell=info,xai_grok_pager=trace,xai_grok_tools=info,xai_grok_session_search=info,xai_acp_lib=info,{RMCP_SSE_NOISE_TARGET}=error,sampling_log=off,{ACP_UPDATE_TARGET}=debug,{ACP_UPDATE_PAYLOAD_TARGET}={payload_level}"
     );
     let env_filter = EnvFilter::builder()
         .with_default_directive(LevelFilter::WARN.into())
@@ -427,7 +427,7 @@ pub fn init_tracing() -> TracingHandle {
         xai_grok_telemetry::otel_layer::OtelClientInfo {
             client_name: "grok-pager",
             client_version: xai_grok_version::VERSION,
-            service_version: env!("VERSION_WITH_COMMIT"),
+            service_version: xai_grok_version::full_version(),
             app_entrypoint: "tui",
         },
         xai_grok_shell::auth::credential_provider::build_default_otel_layer_config(),
@@ -445,7 +445,7 @@ pub fn init_tracing() -> TracingHandle {
     xai_grok_telemetry::external::init(
         xai_grok_shell::agent::config::resolve_external_otel_config(
             xai_grok_telemetry::external::config::ExternalClientInfo {
-                service_version: env!("VERSION_WITH_COMMIT").to_owned(),
+                service_version: xai_grok_version::full_version().to_owned(),
                 client_version: xai_grok_version::VERSION.to_owned(),
                 app_entrypoint: "tui".to_owned(),
             },

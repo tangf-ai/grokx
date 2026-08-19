@@ -1,10 +1,24 @@
+// A panic on a teardown path leaks whatever it was about to free; tests panic freely.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented
+    )
+)]
+
+use std::borrow::Cow;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::io::AsyncWriteExt;
 use xai_grok_tools::util::ProcessGroup;
 
-use crate::config::HookSpec;
+use crate::config::{HookSpec, RUNNER_ALWAYS_SET_ENV};
 use crate::event::HookEventEnvelope;
 use crate::result::{HookDecision, StopHookOutcome};
 
@@ -119,7 +133,9 @@ pub async fn run_command_hook(
         }
         #[cfg(not(unix))]
         {
-            let inv = xai_grok_config::shell::shell_command_argv(&command_str);
+            // PowerShell `$VAR` is not `$env:VAR`.
+            let command_str = rewrite_hook_command_for_windows_shell(&command_str, &spec.extra_env);
+            let inv = xai_grok_config::shell::shell_command_argv(command_str.as_ref());
             let mut c = tokio::process::Command::new(&inv.program);
             c.args(&inv.args).envs(inv.env);
             c
@@ -156,6 +172,20 @@ pub async fn run_command_hook(
     // See the `runner_injected_vars_override_extra_env_at_spawn`
     // regression test in `tests/integration.rs` and the rustdoc on
     // `HookSpec::extra_env`.
+    // Git Bash: `C:/...` so unquoted `$VAR` does not treat `\` as an escape.
+    #[cfg(not(unix))]
+    let env_root = {
+        use xai_grok_config::shell::{WindowsShell, detect_windows_shell};
+        if is_shell_command && matches!(detect_windows_shell(), WindowsShell::GitBash(_)) {
+            Cow::Owned(ctx.workspace_root.replace('\\', "/"))
+        } else {
+            Cow::Borrowed(ctx.workspace_root)
+        }
+    };
+    #[cfg(unix)]
+    let env_root = Cow::Borrowed(ctx.workspace_root);
+
+    #[allow(clippy::disallowed_methods)] // enrolled in the session scope below
     let mut child = match cmd
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -167,11 +197,11 @@ pub async fn run_command_hook(
         .env("GROK_HOOK_EVENT", envelope.hook_event_name.to_string())
         .env("GROK_HOOK_NAME", &spec.name)
         .env("GROK_SESSION_ID", ctx.session_id)
-        .env("GROK_WORKSPACE_ROOT", ctx.workspace_root)
+        .env("GROK_WORKSPACE_ROOT", env_root.as_ref())
         // Compatibility alias for external hooks that read this env name.
         // Same value as `GROK_WORKSPACE_ROOT`; native `.grok` hooks should use
         // `GROK_WORKSPACE_ROOT`.
-        .env("CLAUDE_PROJECT_DIR", ctx.workspace_root)
+        .env("CLAUDE_PROJECT_DIR", env_root.as_ref())
         .kill_on_drop(true)
         .spawn()
     {
@@ -241,11 +271,23 @@ pub async fn run_command_hook(
             let stderr = truncate_output(&output.stderr);
 
             if !stderr.is_empty() {
-                tracing::debug!(
-                    hook_name = %spec.name,
-                    stderr_bytes = stderr.len(),
-                    "hook stderr output captured"
-                );
+                // Byte counts always; the actual first line only for failing
+                // runs (diagnosable from the log record alone) so successful
+                // hooks don't write hook-authored text on every run.
+                if exit_code != 0 {
+                    tracing::debug!(
+                        hook_name = %spec.name,
+                        stderr_bytes = stderr.len(),
+                        stderr_first_line = stderr_first_line(&stderr).unwrap_or_default(),
+                        "hook stderr output captured"
+                    );
+                } else {
+                    tracing::debug!(
+                        hook_name = %spec.name,
+                        stderr_bytes = stderr.len(),
+                        "hook stderr output captured"
+                    );
+                }
             }
 
             if debug_payloads {
@@ -271,11 +313,16 @@ pub async fn run_command_hook(
                         return (HookRunnerResult::Success, elapsed);
                     }
                     (
-                        HookRunnerResult::Failed(format!("exit code {exit_code}")),
+                        HookRunnerResult::Failed(append_stderr_line(
+                            &format!("exit code {exit_code}"),
+                            &stderr,
+                        )),
                         elapsed,
                     )
                 }
-                GateKind::Tool => parse_blocking_result(&stdout, exit_code, &spec.name, elapsed),
+                GateKind::Tool => {
+                    parse_blocking_result(&stdout, &stderr, exit_code, &spec.name, elapsed)
+                }
                 GateKind::Stop => {
                     parse_stop_result(&stdout, &stderr, exit_code, &spec.name, elapsed)
                 }
@@ -284,24 +331,171 @@ pub async fn run_command_hook(
     }
 }
 
-/// Env vars the runner sets unconditionally on every spawned hook.
-///
-/// Used by:
-///
-/// * [`find_unresolved_env_vars`] to avoid flagging vars that *are* set
-///   by the runner itself,
-/// * [`crate::config::parse_hook_file`] and the plugin adapter to strip
-///   user-supplied attempts to override these keys via the JSON `env`
-///   map (those attempts would be silently ignored by the spawn-time
-///   precedence ordering anyway, but stripping them at load time gives
-///   users a clear "ignored, reserved key" warning).
-pub(crate) const RUNNER_ALWAYS_SET_ENV: &[&str] = &[
-    "GROK_HOOK_EVENT",
-    "GROK_HOOK_NAME",
-    "GROK_SESSION_ID",
-    "GROK_WORKSPACE_ROOT",
-    "CLAUDE_PROJECT_DIR",
-];
+#[cfg(any(test, not(unix)))]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PsQuote {
+    Bare,
+    Single,
+    Double,
+}
+
+#[cfg(any(test, not(unix)))]
+fn rewrite_posix_env_refs_for_powershell<'a>(
+    command: &'a str,
+    extra_env: &std::collections::HashMap<String, String>,
+) -> Cow<'a, str> {
+    let mut out: Option<String> = None;
+    let mut cursor = 0;
+    let mut first_rewrite_at: Option<usize> = None;
+    for r in crate::env_expand::iter_env_var_references(command) {
+        if r.start < cursor {
+            continue;
+        }
+        if r.name.is_empty() || r.has_modifier {
+            continue;
+        }
+        if !RUNNER_ALWAYS_SET_ENV.contains(&r.name) && !extra_env.contains_key(r.name) {
+            continue;
+        }
+        let (quote, escaped) = powershell_ctx_at(command, r.start);
+        if quote == PsQuote::Single || escaped {
+            continue;
+        }
+        let buf = out.get_or_insert_with(|| String::with_capacity(command.len() + 24));
+        if quote == PsQuote::Bare {
+            let token_end = command[r.start..]
+                .find(|c: char| {
+                    c.is_whitespace()
+                        || matches!(c, ';' | '|' | '&' | '<' | '>' | '(' | ')' | '[' | ']' | ',')
+                })
+                .map_or(command.len(), |i| r.start + i);
+            buf.push_str(&command[cursor..r.start]);
+            buf.push('"');
+            rewrite_ps_env_refs_in_span(buf, &command[r.start..token_end], extra_env);
+            buf.push('"');
+            cursor = token_end;
+        } else {
+            buf.push_str(&command[cursor..r.start]);
+            push_ps_env_ref(buf, r.braced, r.name);
+            cursor = r.end;
+        }
+        if first_rewrite_at.is_none() {
+            first_rewrite_at = Some(r.start);
+        }
+    }
+    match out {
+        None => Cow::Borrowed(command),
+        Some(mut buf) => {
+            buf.push_str(&command[cursor..]);
+            if first_rewrite_at.is_some_and(|at| {
+                let pad = command.len() - command.trim_start().len();
+                at == pad || (command.as_bytes().get(pad) == Some(&b'"') && at == pad + 1)
+            }) && !buf.starts_with("& ")
+            {
+                buf.insert_str(0, "& ");
+            }
+            Cow::Owned(buf)
+        }
+    }
+}
+
+#[cfg(any(test, not(unix)))]
+fn rewrite_ps_env_refs_in_span(
+    buf: &mut String,
+    span: &str,
+    extra_env: &std::collections::HashMap<String, String>,
+) {
+    let mut cur = 0;
+    for r in crate::env_expand::iter_env_var_references(span) {
+        if r.name.is_empty() || r.has_modifier {
+            continue;
+        }
+        if !RUNNER_ALWAYS_SET_ENV.contains(&r.name) && !extra_env.contains_key(r.name) {
+            continue;
+        }
+        buf.push_str(&span[cur..r.start]);
+        push_ps_env_ref(buf, r.braced, r.name);
+        cur = r.end;
+    }
+    buf.push_str(&span[cur..]);
+}
+
+#[cfg(any(test, not(unix)))]
+fn push_ps_env_ref(buf: &mut String, braced: bool, name: &str) {
+    if braced {
+        buf.push_str("${env:");
+        buf.push_str(name);
+        buf.push('}');
+    } else {
+        buf.push_str("$env:");
+        buf.push_str(name);
+    }
+}
+
+#[cfg(any(test, not(unix)))]
+fn powershell_ctx_at(command: &str, at: usize) -> (PsQuote, bool) {
+    let bytes = command.as_bytes();
+    let mut i = 0;
+    let mut quote = PsQuote::Bare;
+    while i < at {
+        let c = bytes[i];
+        match quote {
+            PsQuote::Single => {
+                if c == b'\'' {
+                    quote = PsQuote::Bare;
+                }
+                i += 1;
+            }
+            PsQuote::Double => {
+                if c == b'`' {
+                    i = i.saturating_add(2);
+                } else if c == b'"' {
+                    quote = PsQuote::Bare;
+                    i += 1;
+                } else {
+                    i += 1;
+                }
+            }
+            PsQuote::Bare => {
+                if c == b'`' {
+                    i = i.saturating_add(2);
+                } else if c == b'\'' {
+                    quote = PsQuote::Single;
+                    i += 1;
+                } else if c == b'"' {
+                    quote = PsQuote::Double;
+                    i += 1;
+                } else {
+                    i += 1;
+                }
+            }
+        }
+    }
+    let escaped = quote != PsQuote::Single && at > 0 && bytes[at - 1] == b'`';
+    (quote, escaped)
+}
+
+#[cfg(not(unix))]
+fn rewrite_hook_command_for_windows_shell<'a>(
+    command: &'a str,
+    extra_env: &std::collections::HashMap<String, String>,
+) -> Cow<'a, str> {
+    use xai_grok_config::shell::{WindowsShell, detect_windows_shell};
+    match detect_windows_shell() {
+        WindowsShell::Pwsh | WindowsShell::PowerShell => {
+            rewrite_posix_env_refs_for_powershell(command, extra_env)
+        }
+        WindowsShell::GitBash(_) => Cow::Borrowed(command),
+        WindowsShell::Cmd => {
+            if command.contains('$') {
+                tracing::warn!(
+                    "hook command uses $VAR but the Windows shell is cmd, which expands %VAR%"
+                );
+            }
+            Cow::Borrowed(command)
+        }
+    }
+}
 
 /// Parse `command_str` for `${VAR}` and `$VAR` references and return the
 /// names that aren't resolvable from any of:
@@ -444,21 +638,62 @@ fn find_local_shell_assignments(command_str: &str) -> std::collections::HashSet<
     names
 }
 
-/// Parse the result of a blocking hook from stdout and exit code.
+/// Cap for the stderr excerpt reused as deny reasons and failure detail:
+/// long enough for a real policy message, short enough that one huge line
+/// (capture allows up to 64 KB with no newline) cannot flood the model
+/// message, scrollback, or exported logs. Cut on a char boundary with an
+/// ellipsis, like the HTTP runner's response preview.
+const MAX_STDERR_LINE_CHARS: usize = 256;
+
+/// First non-empty stderr line, trimmed and capped at
+/// [`MAX_STDERR_LINE_CHARS`]. A hook's stderr is its human feedback channel,
+/// so failure results and exit-2 deny reasons surface this line instead of
+/// only an exit code.
+///
+/// Deliberate shape difference vs `Stop` gates: deny reasons and failure
+/// detail are one-line audit/UI strings, while a stop block's feedback is
+/// model-facing instruction text and keeps the FULL trimmed stderr (see
+/// [`parse_stop_result`]).
+fn stderr_first_line(stderr: &str) -> Option<String> {
+    let line = stderr.lines().map(str::trim).find(|l| !l.is_empty())?;
+    if line.chars().count() <= MAX_STDERR_LINE_CHARS {
+        return Some(line.to_string());
+    }
+    let mut capped: String = line.chars().take(MAX_STDERR_LINE_CHARS).collect();
+    capped.push('\u{2026}');
+    Some(capped)
+}
+
+/// Append the first (capped) stderr line to a failure message
+/// (`"exit code 1: <line>"`), or return the message unchanged when stderr
+/// is empty.
+fn append_stderr_line(message: &str, stderr: &str) -> String {
+    match stderr_first_line(stderr) {
+        Some(line) => format!("{message}: {line}"),
+        None => message.to_string(),
+    }
+}
+
+/// Parse the result of a blocking hook from stdout, stderr, and exit code.
+/// On exit 2 with no JSON reason, the first stderr line is the deny feedback;
+/// non-gate exit codes carry it in the failure detail.
 fn parse_blocking_result(
     stdout: &str,
+    stderr: &str,
     exit_code: i32,
     hook_name: &str,
     elapsed: Duration,
 ) -> (HookRunnerResult, Duration) {
     let json_decision = if !stdout.trim().is_empty() {
-        serde_json::from_str::<GateHookJson>(stdout.trim()).ok()
+        serde_json::from_str::<GateHookJson>(stdout.trim())
+            .ok()
+            .filter(GateHookJson::is_gate_document)
     } else {
         None
     };
 
     if let Some(output) = json_decision {
-        match gate_json_to_decision(output, hook_name) {
+        match gate_json_to_decision(&output, hook_name, stderr_first_line(stderr).as_deref()) {
             Ok(HookDecision::Deny { reason, hook_name }) => {
                 // A JSON deny is honored on any exit code (fail-safe).
                 if exit_code != GATE_EXIT_CODE && exit_code != 0 {
@@ -468,10 +703,7 @@ fn parse_blocking_result(
                         "JSON decision is 'deny' but exit code is not 0 or 2 — using JSON decision"
                     );
                 }
-                return (
-                    HookRunnerResult::Decision(HookDecision::Deny { reason, hook_name }),
-                    elapsed,
-                );
+                return (HookRunnerResult::Deny { reason, hook_name }, elapsed);
             }
             Ok(HookDecision::Allow) => {
                 if exit_code == GATE_EXIT_CODE {
@@ -483,26 +715,48 @@ fn parse_blocking_result(
                         "JSON decision is 'allow' but exit code is 2 — denying (stdout is ignored on exit 2)"
                     );
                 } else {
-                    return (HookRunnerResult::Decision(HookDecision::Allow), elapsed);
+                    return (
+                        HookRunnerResult::Allow {
+                            updated_input: output.updated_input(hook_name),
+                        },
+                        elapsed,
+                    );
                 }
             }
-            // Unknown decision value: failure so typos surface.
-            Err(err) => return (HookRunnerResult::Failed(err), elapsed),
+            // Unknown decision value: failure so typos surface, carrying the
+            // stderr line like every other failure on this path.
+            Err(err) => {
+                return (
+                    HookRunnerResult::Failed(append_stderr_line(&err, stderr)),
+                    elapsed,
+                );
+            }
         }
     }
 
     match exit_code {
-        0 => (HookRunnerResult::Decision(HookDecision::Allow), elapsed),
+        0 => (
+            HookRunnerResult::Allow {
+                updated_input: None,
+            },
+            elapsed,
+        ),
         GATE_EXIT_CODE => (
-            HookRunnerResult::Decision(HookDecision::Deny {
-                reason: format!("denied by hook '{hook_name}' (exit code {GATE_EXIT_CODE})"),
+            HookRunnerResult::Deny {
+                // On exit 2 stderr is the deny feedback channel. First line
+                // only: a deny reason is a one-line audit/UI string (stop
+                // blocks keep full stderr — see `parse_stop_result`).
+                reason: stderr_first_line(stderr).unwrap_or_else(|| {
+                    format!("denied by hook '{hook_name}' (exit code {GATE_EXIT_CODE})")
+                }),
                 hook_name: hook_name.to_string(),
-            }),
+            },
             elapsed,
         ),
         _ => (
-            HookRunnerResult::Failed(format!(
-                "hook '{hook_name}' failed with exit code {exit_code}"
+            HookRunnerResult::Failed(append_stderr_line(
+                &format!("hook '{hook_name}' failed with exit code {exit_code}"),
+                stderr,
             )),
             elapsed,
         ),
@@ -554,6 +808,9 @@ fn parse_stop_result(
     match exit_code {
         0 => (HookRunnerResult::Stop(StopHookOutcome::default()), elapsed),
         GATE_EXIT_CODE => {
+            // Full trimmed stderr on purpose: a stop block's feedback is
+            // model-facing instruction text, often multi-line (deny reasons
+            // keep one capped line — see `stderr_first_line`).
             let feedback = stderr.trim();
             let block_reason = if feedback.is_empty() {
                 format!("Blocked by stop hook '{hook_name}' (exit code {GATE_EXIT_CODE})")
@@ -569,8 +826,9 @@ fn parse_stop_result(
             )
         }
         _ => (
-            HookRunnerResult::Failed(format!(
-                "hook '{hook_name}' failed with exit code {exit_code}"
+            HookRunnerResult::Failed(append_stderr_line(
+                &format!("hook '{hook_name}' failed with exit code {exit_code}"),
+                stderr,
             )),
             elapsed,
         ),
@@ -612,37 +870,75 @@ mod tests {
     #[test]
     fn parse_json_decision() {
         let (allow, _) =
-            parse_blocking_result(r#"{"decision":"allow"}"#, 0, "test", Duration::ZERO);
-        assert!(matches!(
-            allow,
-            HookRunnerResult::Decision(HookDecision::Allow)
-        ));
+            parse_blocking_result(r#"{"decision":"allow"}"#, "", 0, "test", Duration::ZERO);
+        assert!(matches!(allow, HookRunnerResult::Allow { .. }));
 
         let (deny, _) = parse_blocking_result(
             r#"{"decision":"deny","reason":"bad command"}"#,
+            "",
             2,
             "test",
             Duration::ZERO,
         );
         match deny {
-            HookRunnerResult::Decision(HookDecision::Deny { reason, .. }) => {
+            HookRunnerResult::Deny { reason, .. } => {
                 assert_eq!(reason, "bad command");
             }
             other => panic!("expected Deny, got {other:?}"),
         }
 
         let (deny_no_reason, _) =
-            parse_blocking_result(r#"{"decision":"deny"}"#, 2, "my-hook", Duration::ZERO);
+            parse_blocking_result(r#"{"decision":"deny"}"#, "", 2, "my-hook", Duration::ZERO);
         match deny_no_reason {
-            HookRunnerResult::Decision(HookDecision::Deny { reason, .. }) => {
+            HookRunnerResult::Deny { reason, .. } => {
                 assert!(reason.contains("my-hook"));
             }
             other => panic!("expected Deny, got {other:?}"),
         }
 
         let (unknown, _) =
-            parse_blocking_result(r#"{"decision":"maybe"}"#, 0, "test", Duration::ZERO);
+            parse_blocking_result(r#"{"decision":"maybe"}"#, "", 0, "test", Duration::ZERO);
         assert!(matches!(unknown, HookRunnerResult::Failed(_)));
+    }
+
+    #[test]
+    fn parse_updated_input() {
+        let (allow, _) = parse_blocking_result(
+            r#"{"hookSpecificOutput":{"updatedInput":{"command":"echo hi"}}}"#,
+            "",
+            0,
+            "test",
+            Duration::ZERO,
+        );
+        match allow {
+            HookRunnerResult::Allow {
+                updated_input: Some(input),
+            } => assert_eq!(input["command"], "echo hi"),
+            other => panic!("expected Allow with updatedInput, got {other:?}"),
+        }
+
+        let (deny, _) = parse_blocking_result(
+            r#"{"decision":"deny","hookSpecificOutput":{"updatedInput":{"command":"x"}}}"#,
+            "",
+            0,
+            "test",
+            Duration::ZERO,
+        );
+        assert!(matches!(deny, HookRunnerResult::Deny { .. }));
+
+        let (allow_no_rewrite, _) = parse_blocking_result(
+            r#"{"hookSpecificOutput":{"updatedInput":"nope"}}"#,
+            "",
+            0,
+            "test",
+            Duration::ZERO,
+        );
+        assert!(matches!(
+            allow_no_rewrite,
+            HookRunnerResult::Allow {
+                updated_input: None
+            }
+        ));
     }
 
     #[test]
@@ -650,42 +946,161 @@ mod tests {
         for (stdout, code, expect_allow) in
             [("", 0, true), ("not json at all", 0, true), ("", 2, false)]
         {
-            let (result, _) = parse_blocking_result(stdout, code, "test", Duration::ZERO);
+            let (result, _) = parse_blocking_result(stdout, "", code, "test", Duration::ZERO);
             if expect_allow {
-                assert!(matches!(
-                    result,
-                    HookRunnerResult::Decision(HookDecision::Allow)
-                ));
+                assert!(matches!(result, HookRunnerResult::Allow { .. }));
             } else {
-                assert!(matches!(
-                    result,
-                    HookRunnerResult::Decision(HookDecision::Deny { .. })
-                ));
+                assert!(matches!(result, HookRunnerResult::Deny { .. }));
             }
         }
-        let (fail, _) = parse_blocking_result("", 1, "test", Duration::ZERO);
+        let (fail, _) = parse_blocking_result("", "", 1, "test", Duration::ZERO);
         assert!(matches!(fail, HookRunnerResult::Failed(_)));
+    }
+
+    #[test]
+    fn non_gate_json_falls_through_to_exit_code() {
+        let (fail, _) =
+            parse_blocking_result(r#"{"detail":"not found"}"#, "", 1, "test", Duration::ZERO);
+        assert!(matches!(fail, HookRunnerResult::Failed(_)));
+
+        let (allow, _) = parse_blocking_result(r#"{"detail":"ok"}"#, "", 0, "test", Duration::ZERO);
+        assert!(matches!(allow, HookRunnerResult::Allow { .. }));
+    }
+
+    /// Failure results and exit-2 deny reasons carry the hook's first stderr
+    /// line (stderr is the hook's feedback channel), instead of only an
+    /// exit code.
+    #[test]
+    fn blocking_result_surfaces_stderr() {
+        let deny_reason = |result: HookRunnerResult| match result {
+            HookRunnerResult::Deny { reason, .. } => reason,
+            other => panic!("expected Deny, got {other:?}"),
+        };
+
+        let (deny, _) = parse_blocking_result(
+            "",
+            "  \nrejected by policy\nmore\n",
+            2,
+            "test",
+            Duration::ZERO,
+        );
+        assert_eq!(deny_reason(deny), "rejected by policy");
+
+        let (fail, _) = parse_blocking_result("", "config missing\n", 1, "test", Duration::ZERO);
+        match fail {
+            HookRunnerResult::Failed(error) => assert!(
+                error.contains("exit code 1") && error.contains("config missing"),
+                "failure must carry exit code AND stderr text, got: {error}"
+            ),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+
+        // A JSON deny without a usable reason also falls back to stderr.
+        let (json_deny, _) = parse_blocking_result(
+            r#"{"decision":"deny","reason":"  "}"#,
+            "quota exceeded\n",
+            0,
+            "test",
+            Duration::ZERO,
+        );
+        assert_eq!(deny_reason(json_deny), "quota exceeded");
+    }
+
+    /// One huge stderr line (capture allows 64 KB with no newline) must not
+    /// become the whole deny reason: the excerpt is capped on a char boundary
+    /// with an ellipsis, and multibyte chars survive the cut.
+    #[test]
+    fn stderr_line_is_capped() {
+        let long = "é".repeat(MAX_STDERR_LINE_CHARS + 50);
+        let capped = stderr_first_line(&long).expect("non-empty line");
+        assert_eq!(capped.chars().count(), MAX_STDERR_LINE_CHARS + 1);
+        assert!(capped.ends_with('\u{2026}'));
+
+        let (deny, _) = parse_blocking_result("", &long, 2, "test", Duration::ZERO);
+        match deny {
+            HookRunnerResult::Deny { reason, .. } => {
+                assert!(reason.chars().count() <= MAX_STDERR_LINE_CHARS + 1);
+            }
+            other => panic!("expected Deny, got {other:?}"),
+        }
+
+        // At the cap: no ellipsis, nothing lost.
+        let exact = "x".repeat(MAX_STDERR_LINE_CHARS);
+        assert_eq!(stderr_first_line(&exact).as_deref(), Some(exact.as_str()));
+    }
+
+    /// A blank JSON `reason` is not a reason: command hooks fall back to the
+    /// stderr line, and with no fallback (the HTTP handler has no stderr
+    /// channel) the generic deny message is used — never the blank string.
+    #[test]
+    fn blank_json_reason_falls_back() {
+        let blank = || GateHookJson {
+            decision: Some("deny".to_string()),
+            reason: Some("  ".to_string()),
+            hook_specific_output: None,
+        };
+        let with_fallback =
+            gate_json_to_decision(&blank(), "h", Some("quota exceeded")).expect("valid decision");
+        assert!(
+            matches!(with_fallback, HookDecision::Deny { ref reason, .. } if reason == "quota exceeded")
+        );
+
+        let without_fallback = gate_json_to_decision(&blank(), "h", None).expect("valid decision");
+        assert!(
+            matches!(without_fallback, HookDecision::Deny { ref reason, .. } if reason == "denied by hook 'h'")
+        );
+    }
+
+    /// Unknown JSON decision values fail with the stderr line attached, like
+    /// every other failure on the gate path.
+    #[test]
+    fn unknown_decision_failure_carries_stderr() {
+        let (result, _) = parse_blocking_result(
+            r#"{"decision":"maybe"}"#,
+            "config missing\n",
+            1,
+            "test",
+            Duration::ZERO,
+        );
+        match result {
+            HookRunnerResult::Failed(error) => assert!(
+                error.contains("maybe") && error.contains("config missing"),
+                "got: {error}"
+            ),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    /// The observe path reports `exit code N: <first stderr line>` so the
+    /// scrollback and log record are diagnosable without hunting for output.
+    /// Unix-only like the sibling real-process tests: the script relies on
+    /// POSIX `sh` semantics (`>&2`).
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn observe_failure_carries_stderr_line() {
+        let spec = make_shell_spec("echo 'disk full' >&2; exit 1");
+        let (result, _) =
+            run_command_hook(&spec, &make_envelope(), &make_ctx(), GateKind::Observe).await;
+        match result {
+            HookRunnerResult::Failed(error) => assert_eq!(error, "exit code 1: disk full"),
+            other => panic!("expected Failed, got {other:?}"),
+        }
     }
 
     #[test]
     fn json_decision_vs_exit_code() {
         let (deny, _) = parse_blocking_result(
             r#"{"decision":"deny","reason":"nope"}"#,
+            "",
             0,
             "test",
             Duration::ZERO,
         );
-        assert!(matches!(
-            deny,
-            HookRunnerResult::Decision(HookDecision::Deny { .. })
-        ));
+        assert!(matches!(deny, HookRunnerResult::Deny { .. }));
 
         let (blocked, _) =
-            parse_blocking_result(r#"{"decision":"allow"}"#, 2, "test", Duration::ZERO);
-        assert!(matches!(
-            blocked,
-            HookRunnerResult::Decision(HookDecision::Deny { .. })
-        ));
+            parse_blocking_result(r#"{"decision":"allow"}"#, "", 2, "test", Duration::ZERO);
+        assert!(matches!(blocked, HookRunnerResult::Deny { .. }));
     }
 
     fn stop_outcome(result: HookRunnerResult) -> StopHookOutcome {
@@ -814,7 +1229,13 @@ mod tests {
         assert!(stop_outcome(result).is_empty());
 
         let (result, _) = parse_stop_result("", "boom", 1, "s", Duration::ZERO);
-        assert!(matches!(result, HookRunnerResult::Failed(_)));
+        match result {
+            HookRunnerResult::Failed(error) => assert!(
+                error.contains("exit code 1") && error.contains("boom"),
+                "stop failure must carry exit code AND stderr text, got: {error}"
+            ),
+            other => panic!("expected Failed, got {other:?}"),
+        }
 
         let (result, _) = parse_stop_result(r#"{"decision":"deny"}"#, "", 0, "s", Duration::ZERO);
         assert!(matches!(result, HookRunnerResult::Failed(_)));
@@ -1039,7 +1460,7 @@ mod tests {
         let (result, _duration) = run_command_hook(&spec, &envelope, &ctx, GateKind::Tool).await;
 
         assert!(
-            matches!(result, HookRunnerResult::Decision(HookDecision::Allow)),
+            matches!(result, HookRunnerResult::Allow { .. }),
             "blocking hook should return Allow, got {:?}",
             result
         );
@@ -1161,6 +1582,57 @@ mod tests {
             "hook should see CLAUDE_PROJECT_DIR set to the workspace root, got {:?}",
             result
         );
+    }
+
+    #[test]
+    fn powershell_rewrite_cases() {
+        let mut extra = std::collections::HashMap::new();
+        extra.insert("PLUGIN_ROOT".to_string(), "/unused".to_string());
+        let cases = [
+            (
+                r#"powershell -File "$CLAUDE_PROJECT_DIR/.claude/hooks/foo.ps1" ${PLUGIN_ROOT}"#,
+                r#"powershell -File "$env:CLAUDE_PROJECT_DIR/.claude/hooks/foo.ps1" "${env:PLUGIN_ROOT}""#,
+            ),
+            (
+                r#"$UNKNOWN ${CLAUDE_PROJECT_DIR:-.}/x bash -c '$CLAUDE_PROJECT_DIR/x.sh' `$CLAUDE_PROJECT_DIR"#,
+                r#"$UNKNOWN ${CLAUDE_PROJECT_DIR:-.}/x bash -c '$CLAUDE_PROJECT_DIR/x.sh' `$CLAUDE_PROJECT_DIR"#,
+            ),
+            (
+                "$CLAUDE_PROJECT_DIR/.claude/hooks/foo.ps1",
+                r#"& "$env:CLAUDE_PROJECT_DIR/.claude/hooks/foo.ps1""#,
+            ),
+            (
+                "$CLAUDE_PROJECT_DIR/.claude/hooks/foo.ps1; echo done",
+                r#"& "$env:CLAUDE_PROJECT_DIR/.claude/hooks/foo.ps1"; echo done"#,
+            ),
+            (
+                r#""$CLAUDE_PROJECT_DIR/.claude/hooks/foo.ps1""#,
+                r#"& "$env:CLAUDE_PROJECT_DIR/.claude/hooks/foo.ps1""#,
+            ),
+            (
+                r#"powershell -File $CLAUDE_PROJECT_DIR/.claude/hooks/foo.ps1"#,
+                r#"powershell -File "$env:CLAUDE_PROJECT_DIR/.claude/hooks/foo.ps1""#,
+            ),
+            (
+                "$CLAUDE_PROJECT_DIR/$GROK_HOOK_NAME.ps1",
+                r#"& "$env:CLAUDE_PROJECT_DIR/$env:GROK_HOOK_NAME.ps1""#,
+            ),
+            (
+                "Join-Path ($CLAUDE_PROJECT_DIR) hooks",
+                r#"Join-Path ("$env:CLAUDE_PROJECT_DIR") hooks"#,
+            ),
+            (
+                r#"Write-Host "don't skip $CLAUDE_PROJECT_DIR""#,
+                r#"Write-Host "don't skip $env:CLAUDE_PROJECT_DIR""#,
+            ),
+        ];
+        for (input, want) in cases {
+            assert_eq!(
+                rewrite_posix_env_refs_for_powershell(input, &extra).as_ref(),
+                want,
+                "{input}"
+            );
+        }
     }
 
     /// `extra_env` seeds what's "set" so the test does not depend on the
@@ -1366,7 +1838,8 @@ mod tests {
             .await
             .0;
         for _ in 0..8 {
-            if !matches!(&result, HookRunnerResult::Failed(msg) if msg == "exit code 126") {
+            if !matches!(&result, HookRunnerResult::Failed(msg) if msg.starts_with("exit code 126"))
+            {
                 break;
             }
             result = run_command_hook(&spec, &envelope, &ctx, GateKind::Observe)

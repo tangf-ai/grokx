@@ -42,7 +42,7 @@ impl TaskOutputTokenBudget {
         let state = self.inner.lock();
         state.total.map(|total| total.saturating_sub(state.spent))
     }
-    pub fn clamp_request(&self, configured: Option<u32>) -> Option<u32> {
+    pub(crate) fn clamp_request(&self, configured: Option<u32>) -> Option<u32> {
         let remaining = self.remaining()?;
         if remaining == 0 {
             return Some(0);
@@ -50,7 +50,7 @@ impl TaskOutputTokenBudget {
         let remaining = u32::try_from(remaining).unwrap_or(u32::MAX);
         Some(configured.map_or(remaining, |configured| configured.min(remaining)))
     }
-    pub fn record_reported_output(&self, output_tokens: u64) {
+    pub(crate) fn record_reported_output(&self, output_tokens: u64) {
         let mut state = self.inner.lock();
         state.spent = state.spent.saturating_add(output_tokens);
         if let Some(total) = state.total
@@ -60,7 +60,7 @@ impl TaskOutputTokenBudget {
             state.incomplete = true;
         }
     }
-    pub fn mark_incomplete_and_exhaust(&self) {
+    pub(crate) fn mark_incomplete_and_exhaust(&self) {
         let mut state = self.inner.lock();
         state.incomplete = true;
         if let Some(total) = state.total {
@@ -70,9 +70,6 @@ impl TaskOutputTokenBudget {
     pub fn usage(&self) -> (u64, bool) {
         let state = self.inner.lock();
         (state.spent, state.incomplete)
-    }
-    pub fn is_limited(&self) -> bool {
-        self.inner.lock().total.is_some()
     }
 }
 pub struct BlockingWaitState(std::sync::Mutex<BlockingWaitInner>);
@@ -221,6 +218,9 @@ pub struct ToolContext {
     /// contexts without one (subagents, defaults). Spawn sites enroll children
     /// into it; enrolled children are killed when the session closes.
     pub process_scope: Option<ProcessScope>,
+    /// Same Arc as `SessionRegistry`'s retained heal lock so the actor tick
+    /// and tray `list_running` cannot double-emit `SubagentFinished`.
+    pub(crate) live_orphan_heal_lock: Arc<tokio::sync::Mutex<()>>,
 }
 impl ToolContext {
     pub(crate) fn clamp_task_model_request(
@@ -245,7 +245,10 @@ impl ToolContext {
             budget.mark_incomplete_and_exhaust();
         }
     }
-    pub fn new(
+    /// Test-only: empty session env. Production goes through
+    /// [`Self::with_preloaded_env`].
+    #[cfg(test)]
+    pub(crate) fn new(
         cwd: AbsPathBuf,
         gateway: Option<GatewaySender>,
         session_id: Option<acp::SessionId>,
@@ -253,43 +256,17 @@ impl ToolContext {
         terminal: Arc<dyn AsyncTerminalRunner>,
         hunk_tracker_handle: HunkTrackerHandle,
     ) -> Self {
-        let session_env = xai_grok_workspace::envrc::load_envrc_or_empty_when_trusted(
-            cwd.as_path(),
-            crate::agent::folder_trust::project_scope_allowed(cwd.as_path()),
-        );
-        Self {
+        Self::with_preloaded_env(
+            cwd,
             gateway,
             session_id,
-            fs: AsyncFsWrapper::new(fs),
+            fs,
             terminal,
-            cwd,
-            file_state_handle: None,
-            session_env: Arc::new(session_env),
             hunk_tracker_handle,
-            hunk_tracking_enabled: true,
-            prompt_index: Arc::new(tokio::sync::Mutex::new(0)),
-            subagent_depth: 0,
-            subagent_event_tx: None,
-            lsp: None,
-            lsp_server_names: Vec::new(),
-            is_turn_active: None,
-            unattributed_background_usage: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            monitor_event_buffer: None,
-            task_completion_reservations: None,
-            task_wake_suppressed: None,
-            synthetic_trace_tx: None,
-            synthetic_trace_tx_shared: None,
-            task_output_tool_name:
-                xai_grok_tools::reminders::task_completion::DEFAULT_TASK_OUTPUT_TOOL.to_string(),
-            auto_wake_enabled: true,
-            goal_loop_active_gate: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            blocking_wait_depth: Arc::new(BlockingWaitState::new()),
-            task_output_token_budget: None,
-            sampler_retry_only_before_output: false,
-            process_scope: None,
-        }
+            HashMap::new(),
+        )
     }
-    pub fn with_preloaded_env(
+    pub(crate) fn with_preloaded_env(
         cwd: AbsPathBuf,
         gateway: Option<GatewaySender>,
         session_id: Option<acp::SessionId>,
@@ -328,19 +305,16 @@ impl ToolContext {
             task_output_token_budget: None,
             sampler_retry_only_before_output: false,
             process_scope: None,
+            live_orphan_heal_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
-    pub fn with_file_state_handle(mut self, handle: FileStateHandle) -> Self {
+    pub(crate) fn with_file_state_handle(mut self, handle: FileStateHandle) -> Self {
         self.file_state_handle = Some(handle);
-        self
-    }
-    pub fn with_prompt_index(mut self, prompt_index: Arc<tokio::sync::Mutex<usize>>) -> Self {
-        self.prompt_index = prompt_index;
         self
     }
     /// Set whether hunk tracking is active. `false` pairs with a `noop()`
     /// `hunk_tracker_handle` so the fs-notify loop skips the per-event forward.
-    pub fn with_hunk_tracking_enabled(mut self, enabled: bool) -> Self {
+    pub(crate) fn with_hunk_tracking_enabled(mut self, enabled: bool) -> Self {
         self.hunk_tracking_enabled = enabled;
         self
     }
@@ -387,7 +361,7 @@ mod tests {
     use xai_grok_workspace::file_system::{AsyncFileSystem, AsyncFsWrapper};
     use xai_hunk_tracker::HunkTrackerHandle;
     impl ToolContext {
-        pub fn new_local_context(
+        pub(crate) fn new_local_context(
             cwd: AbsPathBuf,
             fs: Arc<dyn AsyncFileSystem>,
             terminal: Arc<dyn AsyncTerminalRunner>,
@@ -422,6 +396,7 @@ mod tests {
                 task_output_token_budget: None,
                 sampler_retry_only_before_output: false,
                 process_scope: None,
+                live_orphan_heal_lock: Arc::new(tokio::sync::Mutex::new(())),
             }
         }
     }

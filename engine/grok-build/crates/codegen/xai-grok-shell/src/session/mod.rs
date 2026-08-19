@@ -1,9 +1,9 @@
 pub mod acp_types;
 pub mod announcement_state;
 pub mod commands;
-pub mod compaction_config;
+pub(crate) mod compaction_config;
 pub mod handle;
-pub mod memory_state;
+pub(crate) mod memory_state;
 pub mod merge;
 pub mod notifications;
 pub mod pending_interaction;
@@ -52,8 +52,11 @@ pub(crate) fn image_blocks(
         })
         .collect()
 }
-/// Describes who originated a prompt: the user, or the shell's auto-wake
-/// system reacting to a completed background task / subagent.
+pub use xai_agent_lifecycle::{
+    AnalyticsClass, CompactionClass, InputAuthority, InputPolicy, QueuePolicy, ShutdownPolicy,
+    TurnBoundary,
+};
+/// Describes who originated a prompt.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PromptOrigin {
     /// A normal user-initiated prompt.
@@ -122,6 +125,40 @@ impl PromptOrigin {
             Self::User
         }
     }
+    pub fn policy(&self) -> InputPolicy {
+        match self {
+            Self::User => InputPolicy {
+                authority: InputAuthority::HumanIntent,
+                turn_boundary: TurnBoundary::Conversational,
+                analytics: AnalyticsClass::HumanPrompt,
+                compaction: CompactionClass::HumanAnchor,
+                queue: QueuePolicy::VisibleEditable,
+                shutdown: ShutdownPolicy::Drain,
+            },
+            Self::TaskCompleted { .. }
+            | Self::SubagentCompleted { .. }
+            | Self::WorkflowCompleted { .. }
+            | Self::SchedulerFired => InputPolicy {
+                authority: InputAuthority::RuntimeControl,
+                turn_boundary: TurnBoundary::Conversational,
+                analytics: AnalyticsClass::RuntimeWake,
+                compaction: CompactionClass::RuntimeEphemera,
+                queue: QueuePolicy::Hidden,
+                shutdown: ShutdownPolicy::CancelWithProducer,
+            },
+            Self::NotificationDrain
+            | Self::GoalSummary
+            | Self::GoalClassifierNudge
+            | Self::PlanResume => InputPolicy {
+                authority: InputAuthority::RuntimeControl,
+                turn_boundary: TurnBoundary::Conversational,
+                analytics: AnalyticsClass::RuntimeWake,
+                compaction: CompactionClass::RuntimeEphemera,
+                queue: QueuePolicy::Hidden,
+                shutdown: ShutdownPolicy::DropEphemeral,
+            },
+        }
+    }
     /// Returns `true` for auto-wake (synthetic) prompts.
     pub fn is_synthetic(&self) -> bool {
         !matches!(self, Self::User)
@@ -159,7 +196,7 @@ impl PromptOrigin {
 }
 #[cfg(test)]
 mod tests {
-    use super::PromptOrigin;
+    use super::{PromptOrigin, QueuePolicy};
     #[test]
     fn from_prompt_id_user() {
         assert_eq!(
@@ -241,6 +278,38 @@ mod tests {
         assert!(PromptOrigin::from_prompt_id(prompt_id).is_synthetic());
     }
     #[test]
+    fn current_origin_queue_policies_are_preserved() {
+        let cases = [
+            (PromptOrigin::User, QueuePolicy::VisibleEditable),
+            (
+                PromptOrigin::TaskCompleted {
+                    task_id: "t".into(),
+                },
+                QueuePolicy::Hidden,
+            ),
+            (
+                PromptOrigin::SubagentCompleted {
+                    subagent_id: "s".into(),
+                },
+                QueuePolicy::Hidden,
+            ),
+            (
+                PromptOrigin::WorkflowCompleted {
+                    completion_id: "w".into(),
+                },
+                QueuePolicy::Hidden,
+            ),
+            (PromptOrigin::NotificationDrain, QueuePolicy::Hidden),
+            (PromptOrigin::GoalSummary, QueuePolicy::Hidden),
+            (PromptOrigin::GoalClassifierNudge, QueuePolicy::Hidden),
+            (PromptOrigin::SchedulerFired, QueuePolicy::Hidden),
+            (PromptOrigin::PlanResume, QueuePolicy::Hidden),
+        ];
+        for (origin, queue) in cases {
+            assert_eq!(origin.policy().queue, queue, "{origin:?}");
+        }
+    }
+    #[test]
     fn hide_user_echo_from_scrollback_by_origin() {
         assert!(!PromptOrigin::User.hide_user_echo_from_scrollback());
         assert!(
@@ -269,14 +338,14 @@ mod tests {
 /// Determines whether the session sends an initial file index to the client
 /// or just streams raw file events.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
-pub enum ClientFsMode {
+pub(crate) enum ClientFsMode {
     #[default]
     Events,
     Index,
 }
 /// Client-side fs notification config: fs source settings + mode.
 #[derive(Debug, Clone, Default)]
-pub struct ClientFsConfig {
+pub(crate) struct ClientFsConfig {
     pub fs: FsConfig,
     pub mode: ClientFsMode,
 }
@@ -303,10 +372,10 @@ pub(crate) struct RegistryConfig {
     pub alpha_test_key: Option<String>,
 }
 pub mod acp_conversion;
-pub mod acp_mcp;
+pub(crate) mod acp_mcp;
 pub(crate) mod acp_session;
 pub(crate) mod agent_rebuild;
-pub mod chat_persistence;
+pub(crate) mod chat_persistence;
 pub(crate) mod events;
 pub mod export;
 pub mod feedback;
@@ -327,16 +396,17 @@ pub mod goal_tracker;
 pub mod helpers;
 pub(crate) mod image_describe;
 pub(crate) mod image_normalize;
-pub mod inference_metrics;
+pub(crate) mod inference_metrics;
 pub use xai_grok_shared::session::info;
 pub mod managed_mcp;
 pub(crate) mod mcp_descriptors;
-pub mod mcp_dispatcher;
+pub(crate) mod mcp_dispatcher;
 #[cfg(test)]
 mod mcp_dispatcher_e2e_tests;
-pub mod mcp_restart;
+pub(crate) mod mcp_restart;
 pub mod mcp_servers;
 pub mod memory;
+pub(crate) mod memory_observation;
 pub(crate) mod normalize_cache;
 pub mod persistence;
 pub use xai_grok_shared::placeholder_images;
@@ -351,6 +421,7 @@ pub mod restore;
 pub mod result;
 pub mod signals;
 pub(crate) mod slash_commands;
+pub use slash_commands::PAGER_COMMAND_KEYS;
 pub mod storage;
 pub(crate) mod streaming_capture;
 pub(crate) mod summary;

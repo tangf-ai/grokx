@@ -46,7 +46,7 @@ fn coerce_remote_auto_mode(
 /// Coerce a `RemoteSettings`' raw `auto_mode` JSON down to just the gate
 /// `enabled` bool, for the shell→pager `SettingsUpdateNotification` (the pager
 /// only needs the kill-switch, not the full config).
-pub fn remote_auto_mode_enabled(remote: Option<&RemoteSettings>) -> Option<bool> {
+pub(crate) fn remote_auto_mode_enabled(remote: Option<&RemoteSettings>) -> Option<bool> {
     coerce_remote_auto_mode(remote).and_then(|c| c.enabled)
 }
 
@@ -139,22 +139,53 @@ fn auto_mode_config_from_toml(
         .ok()
 }
 
-/// Free-function form of [`resolve_auto_permission_mode_enabled`] for call
-/// sites without a `RemoteSettings` handle (the launch decision in
-/// `effective_auto_for_launch`, the agent's `session_auto_mode` guard, and the
-/// pager mode cycle / settings). Reads env + requirements + the effective
-/// `config.toml` (user overlaid on managed) from disk plus the cached
-/// remote tier. Defaults `true` so Auto is available unless pinned off.
-pub fn auto_permission_mode_enabled_from_disk() -> bool {
-    let requirements = crate::config::load_merged_requirements();
-    let effective = crate::config::load_effective_config().ok();
+fn auto_permission_mode_enabled_from_layers(
+    layers: &crate::config::ConfigLayers,
+    requirements: Option<&TomlValue>,
+    remote: Option<bool>,
+) -> bool {
+    let crate::config::ConfigLayers {
+        system_managed,
+        managed,
+        user,
+        env_overlay: _,
+        user_requirements: _,
+        system_requirements: _,
+        mdm_requirements: _,
+        campaigns: _,
+    } = layers;
     resolve_auto_permission_mode_layers(
-        auto_permission_mode_from_toml(requirements.as_ref()),
-        auto_permission_mode_from_toml(effective.as_ref()),
-        None,
-        cached_remote_auto_permission_mode_enabled(),
+        auto_permission_mode_from_toml(requirements),
+        auto_permission_mode_from_toml(Some(user)),
+        auto_permission_mode_from_toml(Some(managed))
+            .or_else(|| auto_permission_mode_from_toml(Some(system_managed))),
+        remote,
     )
     .value
+}
+
+fn auto_mode_config_overlay_free(
+    layers: &crate::config::ConfigLayers,
+) -> crate::agent::config::AutoModeConfig {
+    auto_mode_config_from_toml(Some(&layers.effective_config_base_without_overlay()))
+        .unwrap_or_default()
+}
+
+/// Disk form of the gate (overlay-free). Defaults `true`.
+pub fn auto_permission_mode_enabled_from_disk() -> bool {
+    let requirements = crate::config::load_merged_requirements();
+    let layers = match crate::config::ConfigLayers::load() {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::warn!(error = %e, "auto_permission_mode: failed to load config layers");
+            crate::config::ConfigLayers::default()
+        }
+    };
+    auto_permission_mode_enabled_from_layers(
+        &layers,
+        requirements.as_ref(),
+        cached_remote_auto_permission_mode_enabled(),
+    )
 }
 
 /// Field-wise merge of the two Auto-mode config tiers (config wins, remote fills
@@ -172,15 +203,12 @@ fn merge_auto_mode_config(
     }
 }
 
-/// Resolve the full Auto-mode config for the rare classifier-wiring read. Loads
-/// the effective `config.toml` ONCE and reads the remote cache ONCE, then merges
-/// field-wise: `[auto_mode]` config > cached remote settings `auto_mode` > `None`
-/// (unset fields stay `None`; the wire fn applies the built-in defaults). No env
-/// layer (mirrors goal's model resolvers); the gate's own env layer is handled by
-/// the disk gate reader.
-pub fn resolve_auto_mode_config_from_disk() -> crate::agent::config::AutoModeConfig {
-    let effective = crate::config::load_effective_config().ok();
-    let config = auto_mode_config_from_toml(effective.as_ref()).unwrap_or_default();
+/// Full Auto-mode config for the classifier-wiring read (overlay-free).
+pub(crate) fn resolve_auto_mode_config_from_disk() -> crate::agent::config::AutoModeConfig {
+    let config = match crate::config::ConfigLayers::load() {
+        Ok(layers) => auto_mode_config_overlay_free(&layers),
+        Err(_) => crate::agent::config::AutoModeConfig::default(),
+    };
     let remote = REMOTE_AUTO_MODE_CONFIG
         .read()
         .ok()
@@ -189,7 +217,7 @@ pub fn resolve_auto_mode_config_from_disk() -> crate::agent::config::AutoModeCon
     merge_auto_mode_config(config, remote)
 }
 
-pub fn auto_mode_classify_timeout(
+pub(crate) fn auto_mode_classify_timeout(
     cfg: &crate::agent::config::AutoModeConfig,
 ) -> std::time::Duration {
     let configured = cfg
@@ -219,7 +247,7 @@ pub fn auto_mode_classify_timeout(
 /// when the effective model supports reasoning effort (else stays `None` —
 /// provider default). Explicit config/remote values always win. Returns the
 /// `(prompt_type, reasoning_effort)` the classifier wiring should use.
-pub fn auto_mode_classifier_defaults(
+pub(crate) fn auto_mode_classifier_defaults(
     cfg: &crate::agent::config::AutoModeConfig,
     effective_supports_reasoning_effort: bool,
 ) -> (
@@ -418,6 +446,42 @@ mod auto_permission_mode_gate_tests {
         );
         unsafe { std::env::remove_var(ENV_AUTO_PERMISSION_MODE) };
         cache_remote_auto_mode(None);
+    }
+
+    #[test]
+    fn auto_mode_config_is_overlay_free() {
+        use xai_grok_workspace::permission::ClassifierPromptType;
+
+        let user = crate::config::ConfigLayers {
+            user: toml::from_str(
+                "[auto_mode]\nenabled = false\nclassifier_model = \"trusted\"\nprompt_type = \"full\"\n",
+            )
+            .unwrap(),
+            env_overlay: Some(
+                toml::from_str(
+                    "[auto_mode]\nenabled = true\nclassifier_model = \"rubber-stamp\"\nprompt_type = \"just_command\"\n",
+                )
+                .unwrap(),
+            ),
+            ..Default::default()
+        };
+        let cfg = auto_mode_config_overlay_free(&user);
+        assert_eq!(cfg.enabled, Some(false));
+        assert_eq!(cfg.classifier_model.as_deref(), Some("trusted"));
+        assert_eq!(cfg.prompt_type, Some(ClassifierPromptType::Full));
+
+        let overlay_only = crate::config::ConfigLayers {
+            env_overlay: Some(
+                toml::from_str(
+                    "[auto_mode]\nenabled = true\nclassifier_model = \"rubber-stamp\"\n",
+                )
+                .unwrap(),
+            ),
+            ..Default::default()
+        };
+        let cfg = auto_mode_config_overlay_free(&overlay_only);
+        assert_eq!(cfg.enabled, None);
+        assert_eq!(cfg.classifier_model, None);
     }
 
     #[test]

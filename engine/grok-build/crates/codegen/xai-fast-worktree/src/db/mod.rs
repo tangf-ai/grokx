@@ -7,12 +7,11 @@ mod queries;
 mod schema;
 
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
-use xai_sqlite_journal::JournalMode;
+use xai_sqlite_journal::{BUSY_RETRY_BUDGET, JournalMode};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -93,6 +92,8 @@ impl WorktreeStatus {
     }
 }
 
+pub const META_KEY_LABEL: &str = "label";
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WorktreeRecord {
     pub id: String,
@@ -109,6 +110,17 @@ pub struct WorktreeRecord {
     pub last_accessed_at: Option<i64>,
     pub status: WorktreeStatus,
     pub metadata: Option<serde_json::Value>,
+}
+
+impl WorktreeRecord {
+    /// The user-facing label from `metadata.label`; empty labels are `None`.
+    pub fn label(&self) -> Option<&str> {
+        self.metadata
+            .as_ref()
+            .and_then(|m| m.get(META_KEY_LABEL))
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+    }
 }
 
 #[derive(Default)]
@@ -132,10 +144,59 @@ pub struct WorktreeDb {
     conn: Connection,
 }
 
+/// Outcome of a read-only open. A corrupt file still reaches `Opened`, since
+/// SQLite reads lazily and fails at the first query.
+pub enum RegistryOpen {
+    Opened { path: PathBuf, db: WorktreeDb },
+    Absent { path: PathBuf },
+    Busy { path: PathBuf, error: anyhow::Error },
+    Failed { path: PathBuf, error: anyhow::Error },
+}
+
+#[derive(Debug)]
+enum OpenFailure {
+    Busy(anyhow::Error),
+    Other(anyhow::Error),
+}
+
+const WORKTREES_DB_FILE: &str = "worktrees.db";
+
+fn is_sqlite_busy(e: &rusqlite::Error) -> bool {
+    matches!(e, rusqlite::Error::SqliteFailure(f, _) if is_busy_code(f.code))
+}
+
+fn is_busy_code(code: rusqlite::ErrorCode) -> bool {
+    use rusqlite::ErrorCode;
+    matches!(code, ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SqliteFailureKind {
+    Busy,
+    Corrupt,
+    Other,
+}
+
+/// What a SQLite failure says about the file. Only the damage codes justify
+/// telling a user to delete their registry.
+pub fn classify_sqlite_error(error: &anyhow::Error) -> SqliteFailureKind {
+    use rusqlite::ErrorCode;
+    let Some(rusqlite::Error::SqliteFailure(f, _)) = error.downcast_ref::<rusqlite::Error>() else {
+        return SqliteFailureKind::Other;
+    };
+    if is_busy_code(f.code) {
+        return SqliteFailureKind::Busy;
+    }
+    match f.code {
+        ErrorCode::NotADatabase | ErrorCode::DatabaseCorrupt => SqliteFailureKind::Corrupt,
+        _ => SqliteFailureKind::Other,
+    }
+}
+
 impl WorktreeDb {
     /// Open (or create) the DB at `grok_home/worktrees.db`.
     pub fn open(grok_home: &Path) -> Result<Self> {
-        Self::open_at(&grok_home.join("worktrees.db"))
+        Self::open_at(&grok_home.join(WORKTREES_DB_FILE))
     }
 
     /// Open with an explicit path.
@@ -157,78 +218,97 @@ impl WorktreeDb {
             .with_context(|| format!("failed to open worktree DB: {}", path.display()))?;
         let db = Self { conn };
         db.set_journal_mode(journal_mode)?;
-        // Normal statement timeout, now that the conversion budget is done.
-        db.conn
-            .busy_timeout(std::time::Duration::from_millis(5000))?;
         db.init_schema()?;
         Ok(db)
     }
 
-    /// Put the database in `mode`'s journal mode, retrying on `SQLITE_BUSY`
-    /// under one absolute deadline (~10s total).
-    ///
-    /// Conversion-lock acquisition only partially honors `busy_timeout` (see
-    /// `JournalMode::apply`, the single source of truth): a second process
-    /// opening the same file at the same instant can still get `SQLITE_BUSY`
-    /// immediately. Without a retry that opener's `open_at` fails, and callers
-    /// like `register_worktree`/`unregister_worktree` swallow the error
-    /// (best-effort) — silently dropping worktree tracking, exactly what this DB
-    /// exists to prevent. A bounded retry rides out the concurrent converter
-    /// (which finishes in microseconds), while the deadline plus a per-attempt
-    /// `busy_timeout` cap keeps a held legacy lock from stalling startup by
-    /// `attempts x busy_timeout`. Once converted the setting persists (WAL) or
-    /// re-applies as a no-op (TRUNCATE), so later opens are cheap.
     fn set_journal_mode(&self, mode: JournalMode) -> Result<()> {
-        use rusqlite::ErrorCode;
-        use std::time::{Duration, Instant};
-        // Total conversion budget; each attempt waits at most 1s for locks.
-        const DEADLINE: Duration = Duration::from_secs(10);
-        let start = Instant::now();
-        let mut last_err = None;
-        loop {
-            let remaining = DEADLINE.saturating_sub(start.elapsed());
-            if remaining.is_zero() {
-                break;
-            }
-            self.conn
-                .busy_timeout(remaining.min(Duration::from_millis(1000)))?;
-            match mode.apply(&self.conn) {
-                Ok(()) => return Ok(()),
-                Err(e) => {
-                    let busy = matches!(
-                        &e,
-                        rusqlite::Error::SqliteFailure(f, _)
-                            if matches!(f.code, ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked)
-                    );
-                    if !busy {
-                        return Err(e).with_context(|| {
-                            format!("failed to set journal mode {}", mode.as_str())
-                        });
-                    }
-                    last_err = Some(e);
-                    // Brief pause so fail-fast busy errors don't spin hot.
-                    std::thread::sleep(Duration::from_millis(20));
-                }
-            }
-        }
-        Err(last_err.expect("deadline allows at least one attempt")).with_context(|| {
-            format!(
-                "failed to set journal mode {} (database busy after {:?})",
-                mode.as_str(),
-                start.elapsed()
-            )
-        })
+        mode.apply_with_retry(&self.conn)
+            .with_context(|| format!("failed to set journal mode {}", mode.as_str()))
     }
 
     /// Open the default DB at `~/.grok/worktrees.db`.
     ///
-    /// Discovers grok home via `$GROK_HOME`, falling back to the canonicalized
-    /// `$HOME/.grok` (matching `xai_grok_config::grok_home`).
-    /// Path is resolved fresh each call (~1µs env var read) to support
-    /// test overrides. Each call opens its own connection — callers in hot
-    /// paths should cache the `WorktreeDb` instance.
+    /// Discovers grok home via `xai_grok_home::resolve_grok_home` (`$GROK_HOME`,
+    /// else the canonicalized `<home>/.grok`).
+    /// Path is resolved fresh each call (env read plus a canonicalize) to
+    /// support test overrides. Each call opens its own connection — callers in
+    /// hot paths should cache the `WorktreeDb` instance.
     pub fn open_default() -> Result<Self> {
         Self::open(&resolve_grok_home()?)
+    }
+
+    fn journal_mode_and_base_path(grok_home: &Path) -> (JournalMode, PathBuf) {
+        let base_path = grok_home.join(WORKTREES_DB_FILE);
+        let mode = JournalMode::for_db_path(&base_path);
+        (mode, base_path)
+    }
+
+    /// The path a read-write open would use (per-host on network mounts).
+    /// Runs statfs and a hostname lookup, so resolve once and carry it.
+    pub fn resolve_db_path(grok_home: &Path) -> PathBuf {
+        let (mode, base_path) = Self::journal_mode_and_base_path(grok_home);
+        mode.effective_db_path(&base_path)
+    }
+
+    /// Read-only open: creates no directory, database file, or schema. Not
+    /// side-effect free, though: reading a WAL database leaves `-shm` and
+    /// `-wal` sidecars, and a network-mount open still converts the journal.
+    pub fn open_read_only(grok_home: &Path) -> RegistryOpen {
+        let (mode, base_path) = Self::journal_mode_and_base_path(grok_home);
+        let path = mode.effective_db_path(&base_path);
+        match Self::open_read_only_at(mode, &path) {
+            Ok(Some(db)) => RegistryOpen::Opened { path, db },
+            Ok(None) => RegistryOpen::Absent { path },
+            Err(OpenFailure::Busy(error)) => RegistryOpen::Busy { path, error },
+            Err(OpenFailure::Other(error)) => RegistryOpen::Failed { path, error },
+        }
+    }
+
+    fn open_read_only_at(mode: JournalMode, effective: &Path) -> Result<Option<Self>, OpenFailure> {
+        let present = effective.try_exists().map_err(|e| {
+            OpenFailure::Other(
+                anyhow::Error::new(e)
+                    .context(format!("cannot stat worktree DB: {}", effective.display())),
+            )
+        })?;
+        if !present {
+            return Ok(None);
+        }
+        let deadline = std::time::Instant::now() + BUSY_RETRY_BUDGET;
+        let conn = Self::open_readonly_with_busy_retry(mode, effective, deadline)?;
+        Ok(Some(Self { conn }))
+    }
+
+    /// Retry busy failures until `deadline`, which also bounds the network
+    /// arm's journal conversion, so the wait cannot come to twice what the
+    /// caller allowed.
+    fn open_readonly_with_busy_retry(
+        mode: JournalMode,
+        path: &Path,
+        deadline: std::time::Instant,
+    ) -> Result<Connection, OpenFailure> {
+        use std::time::{Duration, Instant};
+        let start = Instant::now();
+        let context = || format!("failed to open worktree DB read-only: {}", path.display());
+        loop {
+            match mode.open_readonly_until(path, deadline) {
+                Ok(conn) => return Ok(conn),
+                Err(e) if !is_sqlite_busy(&e) => {
+                    return Err(OpenFailure::Other(anyhow::Error::new(e).context(context())));
+                }
+                Err(e) => {
+                    if Instant::now() >= deadline {
+                        let elapsed = start.elapsed();
+                        return Err(OpenFailure::Busy(anyhow::Error::new(e).context(format!(
+                            "{} (database busy after {elapsed:?})",
+                            context()
+                        ))));
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            }
+        }
     }
 
     /// Open an in-memory DB (for tests).
@@ -361,7 +441,7 @@ impl WorktreeDb {
 ///
 /// The basename alone collides across repos, and `INSERT OR REPLACE` would then evict
 /// the other repo's record; hashing the full path keeps distinct worktrees distinct.
-pub fn id_from_path(path: &Path) -> String {
+pub(crate) fn id_from_path(path: &Path) -> String {
     let name = path
         .file_name()
         .map(|n| n.to_string_lossy())
@@ -371,7 +451,7 @@ pub fn id_from_path(path: &Path) -> String {
 }
 
 /// Extract the repo name (last component) from a source repo path.
-pub fn repo_name_from_path(source: &Path) -> String {
+pub(crate) fn repo_name_from_path(source: &Path) -> String {
     source
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -379,22 +459,13 @@ pub fn repo_name_from_path(source: &Path) -> String {
 }
 
 pub fn now_epoch_secs() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64
+    crate::time::epoch_secs()
 }
 
+/// Resolve the grok home: `$GROK_HOME`, else `<home>/.grok`.
 pub fn resolve_grok_home() -> Result<PathBuf> {
-    if let Ok(v) = std::env::var("GROK_HOME") {
-        return Ok(PathBuf::from(v));
-    }
-    let home = PathBuf::from(std::env::var("HOME").context("neither $GROK_HOME nor $HOME is set")?);
-    // Canonicalize the home dir so worktree paths share the same physical .grok
-    // tree as trust/hooks even when it is symlinked. The dunce canonicalization
-    // must stay in sync with xai_grok_config::default_grok_home();
-    // home resolution deliberately differs ($HOME here vs std::env::home_dir()).
-    Ok(dunce::canonicalize(&home).unwrap_or(home).join(".grok"))
+    xai_grok_home::resolve_grok_home()
+        .context("neither $GROK_HOME nor a home directory could be resolved")
 }
 
 /// Serializes tests that mutate the process-global `GROK_HOME` env var so they
@@ -435,6 +506,8 @@ impl GrokHomeFixture {
         // race fix.
         let _ = WorktreeDb::open(&home);
         let prev = std::env::var_os("GROK_HOME");
+        // SAFETY: the fixture holds the GROK_HOME env lock for its whole
+        // lifetime, so no other test thread reads or writes the environment.
         unsafe { std::env::set_var("GROK_HOME", &home) };
         Self {
             _lock: lock,
@@ -448,6 +521,8 @@ impl GrokHomeFixture {
 #[cfg(test)]
 impl Drop for GrokHomeFixture {
     fn drop(&mut self) {
+        // SAFETY: the fixture still holds the GROK_HOME env lock here, so no
+        // other test thread reads or writes the environment during restore.
         unsafe {
             match self.prev.take() {
                 Some(p) => std::env::set_var("GROK_HOME", p),

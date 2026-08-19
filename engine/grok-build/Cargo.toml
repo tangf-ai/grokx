@@ -13,17 +13,25 @@ members = [
     "crates/codegen/xai-agent-lifecycle",
     "crates/codegen/xai-chat-state",
     "crates/codegen/xai-codebase-graph",
+    "crates/codegen/xai-compaction-transcript",
     "crates/codegen/xai-crash-handler",
     "crates/codegen/xai-fast-worktree",
     "crates/codegen/xai-file-utils",
     "crates/codegen/xai-fsnotify",
+    "crates/codegen/xai-fuzzy-file-search",
     "crates/codegen/xai-gix-status",
+    "crates/codegen/xai-grok-active-sessions",
     "crates/codegen/xai-grok-agent",
     "crates/codegen/xai-grok-announcements",
     "crates/codegen/xai-grok-auth",
+    "crates/codegen/xai-grok-bundle",
     "crates/codegen/xai-grok-config",
     "crates/codegen/xai-grok-config-types",
+    "crates/codegen/xai-grok-diag-server",
     "crates/codegen/xai-grok-env",
+    "crates/codegen/xai-grok-extra-ca",
+    "crates/codegen/xai-grok-foreign-sessions",
+    "crates/codegen/xai-grok-home",
     "crates/codegen/xai-grok-hooks",
     "crates/codegen/xai-grok-http",
     "crates/codegen/xai-grok-markdown",
@@ -34,6 +42,7 @@ members = [
     "crates/codegen/xai-grok-models",
     "crates/codegen/xai-grok-pager",
     "crates/codegen/xai-grok-pager-bin",
+    "crates/codegen/xai-grok-pager-diff",
     "crates/codegen/xai-grok-pager-minimal",
     "crates/codegen/xai-grok-pager-pty-harness",
     "crates/codegen/xai-grok-pager-render",
@@ -43,6 +52,8 @@ members = [
     "crates/codegen/xai-grok-sampling-types",
     "crates/codegen/xai-grok-sandbox",
     "crates/codegen/xai-grok-secrets",
+    "crates/codegen/xai-grok-session-events",
+    "crates/codegen/xai-grok-session-search",
     "crates/codegen/xai-grok-shared",
     "crates/codegen/xai-grok-shell",
     "crates/codegen/xai-grok-shell-base",
@@ -57,6 +68,7 @@ members = [
     "crates/codegen/xai-grok-voice",
     "crates/codegen/xai-grok-workspace",
     "crates/codegen/xai-grok-workspace-client",
+    "crates/codegen/xai-grok-workspace-daemon",
     "crates/codegen/xai-grok-workspace-types",
     "crates/codegen/xai-hooks-plugins-types",
     "crates/codegen/xai-hunk-tracker",
@@ -111,6 +123,7 @@ async-openai = { version = "0.33.0", features = ["responses"] }
 async-stream = "0.3"
 async-trait = "0.1"
 axum = { version = "0.8", features = ["macros", "ws"] }
+axum-server = "0.8"
 backon = { version = "1.6" }
 backtrace = "0.3"
 base64 = "0.22"
@@ -127,6 +140,7 @@ criterion = "0.6"
 crossbeam = "0.8"
 crossterm = "0.28"
 cryptify = "3.2"
+ctor = "0.4"
 dashmap = "6"
 derive_more = { version = "2", features = ["add", "add_assign", "debug", "deref", "deref_mut", "display", "from", "from_str", "into", "into_iterator", "try_into"] }
 dhat = "0.3"
@@ -134,6 +148,7 @@ dirs = "5.0"
 documented = "0.9"
 dunce = "1"
 educe = "0.6.0"
+encoding_rs = "0.8.35"
 enum_delegate = "0.2"
 env_logger = "0.11"
 eventsource-stream = "0.2"
@@ -167,6 +182,7 @@ infer = "0.19.0"
 insta = "1"
 itertools = "0.14"
 jsonschema = "0.30.0"
+kamadak-exif = "0.5"
 libc = "0.2"
 linkify = "0.10"
 lipsum = "0.9"
@@ -199,12 +215,14 @@ pretty_assertions = "1"
 prometheus = { version = "0.14", features = ["process"] }
 prost = "0.14"
 prost-build = "0.14"
+prost-reflect = "0.16"
 pulldown-cmark = "0.13"
 quick-xml = "0.38"
 rand = "0.9"
 ratatui = { version = "0.29" }
 ratatui-core = "0.1"
 rayon = "1"
+rcgen = { version = "0.13", features = ["pem"] }
 reflink-copy = "0.1"
 regex = "1"
 reqwest = { version = "0.12", features = ["rustls-tls", "stream", "json", "multipart", "http2", "blocking", "socks"], default-features = false }
@@ -215,6 +233,7 @@ ring = "0.17"
 rsa = "0.9"
 runfiles = "0.1"
 rustc-hash = "2"
+rustls = { version = "0.23", features = ["aws-lc-rs"] }
 schemars = "1"
 scraper = "0.23"
 semver = "1"
@@ -223,6 +242,7 @@ serde_json = "1"
 serde_path_to_error = "0.1"
 serde_yaml = "0.9"
 serial_test = "3"
+sha1 = "0.10"
 sha2 = { version = "0.10", features = ["force-soft"] }
 shlex = "1"
 signal-hook = "0.3"
@@ -262,6 +282,9 @@ tracing-subscriber = { version = "0.3.23", default-features = false, features = 
 ts-rs = "12.0"
 tui-scrollbar = "0.2"
 two-face = { version = "0.4", default-features = false, features = ["syntect-fancy"] }
+unicode-bidi = "0.3"
+unicode-bidi-mirroring = "0.4"
+unicode-normalization = "0.1"
 unicode-segmentation = "1.12.0"
 unicode-width = "0.2"
 url = "2"
@@ -271,6 +294,7 @@ vte = "0.15.0"
 wait-timeout = "0.2"
 walkdir = "2"
 webbrowser = { version = "1.0.4" }
+webpki-roots = "0.26"
 which = "8"
 whoami = "1.4"
 wildmatch = "2"
@@ -280,15 +304,23 @@ wl-clipboard-rs = "0.9"
 xai-acp-lib = { path = "crates/codegen/xai-acp-lib" }
 xai-agent-lifecycle = { path = "crates/codegen/xai-agent-lifecycle" }
 xai-circuit-breaker = { path = "crates/common/xai-circuit-breaker" }
+xai-compaction-transcript = { path = "crates/codegen/xai-compaction-transcript" }
 xai-computer-hub-core = { path = "crates/common/xai-computer-hub-core" }
 xai-computer-hub-sdk = { path = "crates/common/xai-computer-hub-sdk" }
+xai-fuzzy-file-search = { path = "crates/codegen/xai-fuzzy-file-search" }
 xai-gix-status = { path = "crates/codegen/xai-gix-status" }
+xai-grok-active-sessions = { path = "crates/codegen/xai-grok-active-sessions" }
 xai-grok-agent = { path = "crates/codegen/xai-grok-agent" }
 xai-grok-announcements = { path = "crates/codegen/xai-grok-announcements" }
 xai-grok-auth = { path = "crates/codegen/xai-grok-auth" }
+xai-grok-bundle = { path = "crates/codegen/xai-grok-bundle" }
 xai-grok-config = { path = "crates/codegen/xai-grok-config" }
 xai-grok-config-types = { path = "crates/codegen/xai-grok-config-types" }
+xai-grok-diag-server = { path = "crates/codegen/xai-grok-diag-server" }
 xai-grok-env = { path = "crates/codegen/xai-grok-env" }
+xai-grok-extra-ca = { path = "crates/codegen/xai-grok-extra-ca" }
+xai-grok-foreign-sessions = { path = "crates/codegen/xai-grok-foreign-sessions" }
+xai-grok-home = { path = "crates/codegen/xai-grok-home" }
 xai-grok-http = { path = "crates/codegen/xai-grok-http" }
 xai-grok-markdown = { path = "crates/codegen/xai-grok-markdown" }
 xai-grok-markdown-core = { path = "crates/codegen/xai-grok-markdown-core" }
@@ -298,6 +330,8 @@ xai-grok-mermaid = { path = "crates/codegen/xai-grok-mermaid" }
 xai-grok-models = { path = "crates/codegen/xai-grok-models" }
 xai-grok-sampler = { path = "crates/codegen/xai-grok-sampler" }
 xai-grok-secrets = { path = "crates/codegen/xai-grok-secrets" }
+xai-grok-session-events = { path = "crates/codegen/xai-grok-session-events" }
+xai-grok-session-search = { path = "crates/codegen/xai-grok-session-search" }
 xai-grok-shared = { path = "crates/codegen/xai-grok-shared" }
 xai-grok-shell = { path = "crates/codegen/xai-grok-shell" }
 xai-grok-shell-base = { path = "crates/codegen/xai-grok-shell-base" }
@@ -326,6 +360,7 @@ xai-tool-types = { path = "crates/common/xai-tool-types" }
 xai-tracing = { path = "crates/common/xai-tracing" }
 xai-tty-utils = { path = "crates/codegen/xai-tty-utils" }
 zbus = { version = "5" }
+zip = "3"
 zstd = "0.13"
 
 [profile.release]
