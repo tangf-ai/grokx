@@ -26,11 +26,12 @@ that appear only as silence during capture.
 When Doctor finds an explicit unhealthy tmux setting, `/doctor fix` lists the
 available automatic fixes. Apply one named fix at a time, for example
 `/doctor fix tmux-clipboard` or `grok doctor fix dcs-passthrough --yes`.
-Doctor can persist these three tmux options:
+Doctor can persist these four tmux options:
 
 - `terminal.tmux-clipboard` — `set -g set-clipboard on`
 - `terminal.dcs-passthrough` — `set -wg allow-passthrough on`
 - `terminal.tmux-extended-keys` — `set -g extended-keys on`
+- `terminal.tmux-truecolor` — `set -as terminal-features ",*:RGB"`
 
 A tmux fix edits only the persistent config on the computer hosting the affected
 tmux server, including remote sessions. Plain tmux uses the real
@@ -81,6 +82,16 @@ Detection has these limitations:
 
 Run `/doctor`. A fully supported setup shows `color truecolor` and `themes all`.
 If it does not, Doctor shows the detected limitation and the relevant fix.
+
+Inside tmux there are two separate questions: what color Grok emits, and what
+color survives the multiplexer. The `color` line answers the first. For the
+second, when the attached client is not marked `RGB`, tmux rewrites every
+24-bit color to the nearest color the outer terminal's terminfo advertises,
+which can be as few as eight. Themes then look washed out even though `color`
+reads `truecolor`. Doctor reports this as `terminal.tmux-truecolor`. Reload
+your tmux config and then detach and reattach: the server reads the new option
+only on reload, and a client fixes its color depth only at attach, so neither
+step alone changes anything.
 
 ### Clipboard problems
 
@@ -231,6 +242,40 @@ comparison.
 
 Byobu on GNU screen has limited support. `/doctor` reports
 `terminal.byobu-screen` and explains how to switch to Byobu's tmux backend.
+
+### Arabic and Persian (RTL) text
+
+Many terminals already reorder right-to-left text themselves (VTE-based
+terminals, Terminal.app, Konsole, mlterm, and others). Grok Build therefore
+**does not** reorder RTL by default.
+
+If Arabic or Persian in **scrollback** (or list content) reads backwards,
+enable app-side reordering in `~/.grok/pager.toml` (or project config):
+
+```toml
+[scrollback.display]
+rtl_bidi = true
+```
+
+The setting reloads with appearance config (no full restart required). If text
+looks correct with the default and becomes wrong after enabling this, turn it
+back off — your terminal is already handling bidi.
+
+When enabled:
+
+- Reorders full content lines in scrollback, list content, and the fullscreen
+  block viewer (plus the dashboard peek preview and hook popup, which mirror
+  scrollback). Chrome, dropdowns, and modals stay logical so their hit-testing
+  stays consistent.
+- Leaves markdown table columns unchanged.
+- Search highlights, selection/drag-copy, double-click word/URL selection, and
+  link hit targets all map between the painted (visual) cells and the logical
+  text of the same row, so on-screen highlights land on the right glyphs while
+  clipboard paste stays in logical order.
+- Base direction is resolved per painted row. A soft-wrapped continuation that
+  starts with English can take a different base than the paragraph's first row.
+
+This is not a full mirrored RTL UI.
 
 ---
 

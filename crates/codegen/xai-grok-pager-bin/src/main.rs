@@ -514,9 +514,7 @@ async fn workspace_control(
     json: bool,
     command: ControlCommand,
 ) -> Result<()> {
-    let raw_config = xai_grok_shell::config::load_effective_config_disk_only()
-        .map_err(|e| anyhow::anyhow!("Failed to load config: {e}"))?;
-    let agent_config = AgentConfig::new_from_toml_cfg(&raw_config)
+    let agent_config = xai_grok_shell::config::load_agent_config_disk_only()
         .map_err(|e| anyhow::anyhow!("Failed to create agent config: {e}"))?;
     let client = connect_workspace_control(&agent_config, target).await?;
     ensure_workspace_caps(client.registration())?;
@@ -688,8 +686,54 @@ impl StdioReplayState {
             self.last_session_id = None;
         }
     }
+    /// A resume names a session the client is already attached to, so an entry
+    /// from its original `session/load` is the better one to replay: it carries
+    /// the client's `_meta`, which a synthesized load cannot reproduce.
+    fn insert_session_if_new(&mut self, sid: &str, cached: CachedSession) {
+        if !self.sessions.iter().any(|(id, _)| id == sid) {
+            self.sessions.push((sid.to_string(), cached));
+        }
+    }
 }
+/// `sessionId`, `cwd`, and `mcpServers` off a session request's params.
+fn cached_session_from_params(
+    params: &serde_json::Value,
+    verbatim: Option<&str>,
+) -> Option<(String, CachedSession)> {
+    let sid = params
+        .get("sessionId")
+        .or_else(|| params.get("session_id"))
+        .and_then(|v| v.as_str())?;
+    Some((
+        sid.to_string(),
+        CachedSession {
+            load_request_json: verbatim.map(str::to_string),
+            cwd: params
+                .get("cwd")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            mcp_servers_json: params
+                .get("mcpServers")
+                .and_then(|m| serde_json::to_string(m).ok()),
+        },
+    ))
+}
+/// Methods whose requests the replay cache reads. One list shared by the
+/// prefilter and the match below so the two cannot drift apart; quoted JSON
+/// spellings so prose mentioning a method does not trigger a parse.
+const CACHED_METHODS: &[&str] = &[
+    "\"initialize\"",
+    "\"session/new\"",
+    "\"session/load\"",
+    "\"session/resume\"",
+    "\"session/close\"",
+    "\"x.ai/session/close\"",
+    "\"_x.ai/session/close\"",
+];
 fn cache_outgoing_acp_state(msg: &str, state: &std::sync::Mutex<StdioReplayState>) {
+    if !CACHED_METHODS.iter().any(|m| msg.contains(m)) {
+        return;
+    }
     let Ok(json) = serde_json::from_str::<serde_json::Value>(msg) else {
         return;
     };
@@ -703,27 +747,26 @@ fn cache_outgoing_acp_state(msg: &str, state: &std::sync::Mutex<StdioReplayState
             s.initialize_json = Some(msg.to_string());
         }
         "session/load" => {
+            let Some(params) = json.get("params") else {
+                return;
+            };
+            let Some((sid, cached)) = cached_session_from_params(params, Some(msg)) else {
+                return;
+            };
             let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(params) = json.get("params") {
-                let sid = params
-                    .get("sessionId")
-                    .or_else(|| params.get("session_id"))
-                    .and_then(|v| v.as_str());
-                if let Some(sid) = sid {
-                    let cached = CachedSession {
-                        load_request_json: Some(msg.to_string()),
-                        cwd: params
-                            .get("cwd")
-                            .and_then(|v| v.as_str())
-                            .map(str::to_string),
-                        mcp_servers_json: params
-                            .get("mcpServers")
-                            .and_then(|m| serde_json::to_string(m).ok()),
-                    };
-                    s.upsert_session(sid, cached);
-                    s.last_session_id = Some(sid.to_string());
-                }
-            }
+            s.upsert_session(&sid, cached);
+            s.last_session_id = Some(sid);
+        }
+        "session/resume" => {
+            let Some(params) = json.get("params") else {
+                return;
+            };
+            let Some((sid, cached)) = cached_session_from_params(params, None) else {
+                return;
+            };
+            let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
+            s.insert_session_if_new(&sid, cached);
+            s.last_session_id = Some(sid);
         }
         "session/new" => {
             let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
@@ -739,7 +782,7 @@ fn cache_outgoing_acp_state(msg: &str, state: &std::sync::Mutex<StdioReplayState
                     .and_then(|m| serde_json::to_string(m).ok()),
             });
         }
-        "x.ai/session/close" | "_x.ai/session/close" => {
+        "session/close" | "x.ai/session/close" | "_x.ai/session/close" => {
             if let Some(sid) = json
                 .get("params")
                 .and_then(|p| p.get("sessionId").or_else(|| p.get("session_id")))
@@ -989,12 +1032,7 @@ async fn forward_stdio_line_to_leader(
     if trimmed.is_empty() {
         return;
     }
-    if trimmed.contains("\"initialize\"")
-        || trimmed.contains("\"session/load\"")
-        || trimmed.contains("\"session/new\"")
-    {
-        cache_outgoing_acp_state(&trimmed, replay_state);
-    }
+    cache_outgoing_acp_state(&trimmed, replay_state);
     let send_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(300);
     loop {
         {
@@ -1062,7 +1100,6 @@ async fn run_agent_command(
     }
     let early_prefetch = xai_grok_shell::agent::models::start_early_prefetch(None);
     xai_grok_shell::agent::mvp_agent::warm_async_http_client();
-    tokio::task::spawn_blocking(|| {});
     let is_stdio = matches!(agent_args.mode, Some(AgentCmd::Stdio));
     let is_leader = matches!(agent_args.mode, Some(AgentCmd::Leader(_)));
     if !is_stdio && !is_leader {
@@ -1077,6 +1114,7 @@ async fn run_agent_command(
             auto_update::run_update_if_available(
                 auto_update::UpdateRunMode::NonBlocking,
                 false,
+                auto_update::CliUpdateTrigger::AutoBackground,
                 update_config,
             )
             .await
@@ -1127,8 +1165,7 @@ async fn run_agent_command(
         cli_subagents: None,
         cli_web_search_model: None,
         cli_session_summary_model: None,
-        cli_experimental_memory: false,
-        cli_no_memory: false,
+        memory_enabled_override: None,
         disable_web_search,
         todo_gate: false,
         laziness_debug_log: None,
@@ -1177,6 +1214,7 @@ async fn run_agent_command(
             auto_update::run_update_if_available(
                 auto_update::UpdateRunMode::NonBlocking,
                 false,
+                auto_update::CliUpdateTrigger::AutoBackground,
                 &update_config,
             )
             .await
@@ -1750,7 +1788,10 @@ fn install_heap_profile_hooks() {
 fn version_text(channel_label: &str) -> String {
     format!(
         "grok {}\n",
-        xai_grok_version::display_version_with_commit(env!("VERSION_WITH_COMMIT"), channel_label,)
+        xai_grok_version::display_version_with_commit(
+            xai_grok_version::full_version(),
+            channel_label,
+        )
     )
 }
 fn write_version(writer: &mut impl std::io::Write, channel_label: &str) -> std::io::Result<()> {
@@ -1780,6 +1821,8 @@ fn dispatch_doctor_if_requested(args: &PagerArgs) -> bool {
     true
 }
 fn main() {
+    xai_grok_version::set_full_version(env!("VERSION_WITH_COMMIT"));
+    xai_grok_telemetry::startup::mark_process_start();
     if let Some(code) = xai_grok_pager::app::mermaid_worker::maybe_run_render_subprocess() {
         std::process::exit(code);
     }
@@ -1800,9 +1843,7 @@ fn main() {
     }
     #[cfg(all(feature = "jemalloc", unix))]
     install_heap_profile_hooks();
-    xai_grok_pager::memory_trace::start(
-        xai_grok_shell::util::grok_home::grok_home().join("memtrace"),
-    );
+    xai_grok_pager::memory_trace::start(xai_grok_pager::memory_trace::default_dir());
     raise_fd_limit();
     if let Err(e) = xai_grok_config::validate_requirements() {
         eprintln!("Couldn't start Grok: {e}");
@@ -1840,7 +1881,7 @@ fn main() {
             );
         }
     }
-    let crashed = xai_grok_shell::active_sessions::collect_crashed().unwrap_or_default();
+    let crashed = xai_grok_active_sessions::collect_crashed().unwrap_or_default();
     if !crashed.is_empty() {
         tracing::info!(
             count = crashed.len(),
@@ -1848,19 +1889,21 @@ fn main() {
         );
     }
     let workers = cli_worker_threads();
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(workers.get())
-        .enable_all()
-        .build()
-        .unwrap_or_else(|e| {
-            eprintln!("grok: failed to start tokio runtime with {workers} workers: {e}");
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    builder.worker_threads(workers.get()).enable_all();
+    let runtime =
+        xai_tty_utils::runtime::build_with_blocking_pool(&mut builder).unwrap_or_else(|e| {
+            eprintln!("grok: failed to start tokio runtime: {e}");
             shutdown_and_flush_telemetry(1);
         });
     let result = run_and_shutdown(runtime, async_main(args), RUNTIME_SHUTDOWN_GRACE);
     xai_grok_telemetry::debug_log::flush();
     if let Err(e) = result {
         xai_tty_utils::restore_native_stderr();
-        eprintln!("Error: {e:#}");
+        match e.downcast_ref::<xai_grok_pager::app::StartupFailure>() {
+            Some(startup) => eprintln!("{}", startup.user_report()),
+            None => eprintln!("Error: {e:#}"),
+        }
         drop(_sentry_guard);
         std::process::exit(1);
     }
@@ -1999,9 +2042,7 @@ async fn async_main(args: PagerArgs) -> Result<()> {
             Command::Models => {
                 init_tracing_simple("cli");
                 let _otel_guard = xai_grok_telemetry::otel_layer::otel_guard();
-                let config = xai_grok_shell::config::load_effective_config_disk_only()
-                    .map_err(|e| anyhow::anyhow!("Failed to load config: {e}"))?;
-                let agent_config = AgentConfig::new_from_toml_cfg(&config)
+                let agent_config = xai_grok_shell::config::load_agent_config_disk_only()
                     .map_err(|e| anyhow::anyhow!("Failed to create agent config: {e}"))?;
                 return xai_grok_pager::models::list_available_models(&agent_config).await;
             }
@@ -2013,11 +2054,14 @@ async fn async_main(args: PagerArgs) -> Result<()> {
             Command::Worktree(worktree_args) => {
                 init_tracing_simple("cli");
                 let _otel_guard = xai_grok_telemetry::otel_layer::otel_guard();
-                let config = xai_grok_shell::config::load_effective_config_disk_only()
-                    .map_err(|e| anyhow::anyhow!("Failed to load config: {e}"))?;
-                let agent_config = AgentConfig::new_from_toml_cfg(&config)
+                let agent_config = xai_grok_shell::config::load_agent_config_disk_only()
                     .map_err(|e| anyhow::anyhow!("Failed to create agent config: {e}"))?;
                 return xai_grok_pager::worktree_cmd::run(worktree_args, &agent_config).await;
+            }
+            Command::DiskUsage(disk_usage_args) => {
+                init_tracing_simple("cli");
+                let _otel_guard = xai_grok_telemetry::otel_layer::otel_guard();
+                return xai_grok_pager::disk_usage_cmd::run(disk_usage_args);
             }
             Command::Workspace(workspace_args) => {
                 init_tracing_simple("cli");
@@ -2027,18 +2071,14 @@ async fn async_main(args: PagerArgs) -> Result<()> {
             Command::Sessions(sessions_args) => {
                 init_tracing_simple("cli");
                 let _otel_guard = xai_grok_telemetry::otel_layer::otel_guard();
-                let config = xai_grok_shell::config::load_effective_config_disk_only()
-                    .map_err(|e| anyhow::anyhow!("Failed to load config: {e}"))?;
-                let agent_config = AgentConfig::new_from_toml_cfg(&config)
+                let agent_config = xai_grok_shell::config::load_agent_config_disk_only()
                     .map_err(|e| anyhow::anyhow!("Failed to create agent config: {e}"))?;
                 return xai_grok_pager::sessions_cmd::run(sessions_args, &agent_config).await;
             }
             Command::Share(ref share_args) => {
                 init_tracing_simple("cli");
                 let _otel_guard = xai_grok_telemetry::otel_layer::otel_guard();
-                let config = xai_grok_shell::config::load_effective_config_disk_only()
-                    .map_err(|e| anyhow::anyhow!("Failed to load config: {e}"))?;
-                let agent_config = AgentConfig::new_from_toml_cfg(&config)
+                let agent_config = xai_grok_shell::config::load_agent_config_disk_only()
                     .map_err(|e| anyhow::anyhow!("Failed to create agent config: {e}"))?;
                 return xai_grok_pager::share_cmd::run(share_args, &agent_config).await;
             }
@@ -2049,9 +2089,7 @@ async fn async_main(args: PagerArgs) -> Result<()> {
             Command::Trace(trace_args) => {
                 init_tracing_simple("cli");
                 let _otel_guard = xai_grok_telemetry::otel_layer::otel_guard();
-                let config = xai_grok_shell::config::load_effective_config_disk_only()
-                    .map_err(|e| anyhow::anyhow!("Failed to load config: {e}"))?;
-                let agent_config = AgentConfig::new_from_toml_cfg(&config)
+                let agent_config = xai_grok_shell::config::load_agent_config_disk_only()
                     .map_err(|e| anyhow::anyhow!("Failed to create agent config: {e}"))?;
                 return xai_grok_pager::trace_cmd::run(trace_args, &agent_config).await;
             }
@@ -2066,16 +2104,20 @@ async fn async_main(args: PagerArgs) -> Result<()> {
                 alpha,
                 stable,
                 enterprise,
+                trigger,
+                auto,
             } => {
                 init_tracing_simple("cli");
                 let _otel_guard = xai_grok_telemetry::otel_layer::otel_guard();
                 let channel_switch = get_channel_switch(alpha, stable, enterprise);
+                let trigger = resolve_update_trigger(trigger.as_deref(), auto);
                 return run_update_command(
                     check,
                     json,
                     force_reinstall,
                     version,
                     channel_switch,
+                    trigger,
                     &update_config,
                 )
                 .await;
@@ -2088,9 +2130,7 @@ async fn async_main(args: PagerArgs) -> Result<()> {
             } => {
                 init_tracing_simple("cli");
                 let _otel_guard = xai_grok_telemetry::otel_layer::otel_guard();
-                let config = xai_grok_shell::config::load_effective_config_disk_only()
-                    .map_err(|e| anyhow::anyhow!("Failed to load config: {e}"))?;
-                let config = AgentConfig::new_from_toml_cfg(&config)
+                let config = xai_grok_shell::config::load_agent_config_disk_only()
                     .map_err(|e| anyhow::anyhow!("Failed to create agent config: {e}"))?;
                 xai_grok_shell::auth::run_cli_login(&config, oauth, device_auth, devbox).await?;
                 println!();
@@ -2098,9 +2138,7 @@ async fn async_main(args: PagerArgs) -> Result<()> {
             }
             Command::Logout => {
                 init_tracing_simple("cli");
-                let config = xai_grok_shell::config::load_effective_config_disk_only()
-                    .map_err(|e| anyhow::anyhow!("Failed to load config: {e}"))?;
-                let config = AgentConfig::new_from_toml_cfg(&config)
+                let config = xai_grok_shell::config::load_agent_config_disk_only()
                     .map_err(|e| anyhow::anyhow!("Failed to create agent config: {e}"))?;
                 xai_grok_shell::auth::run_cli_logout(&config)?;
                 xai_grok_shell::instrumentation::finalize_and_exit(0);
@@ -2156,6 +2194,7 @@ async fn async_main(args: PagerArgs) -> Result<()> {
                 yolo: launch_yolo.yolo,
                 trust: args.trust,
                 output_format: args.output_format,
+                include_partial_messages: args.include_partial_messages,
                 json_schema,
                 model: args.model,
                 rules: args.rules,
@@ -2239,6 +2278,7 @@ async fn finish_update_on_exit(
         auto_update::run_update_if_available(
             auto_update::UpdateRunMode::Blocking,
             false,
+            auto_update::CliUpdateTrigger::UserCommand,
             update_config,
         )
         .await
@@ -2345,12 +2385,29 @@ fn get_channel_switch(alpha: bool, stable: bool, enterprise: bool) -> Option<&'s
     }
 }
 /// Handle `grok-pager update [--check] [--json] [--force-reinstall] [--version X] [--alpha|--stable|--enterprise]`.
+/// --trigger is the one representation; --auto is the compat alias from
+/// older parents. Unknown values fall back to user_command (a human is the
+/// only caller that can produce them).
+fn resolve_update_trigger(flag: Option<&str>, auto: bool) -> auto_update::CliUpdateTrigger {
+    if let Some(flag) = flag {
+        match flag.parse() {
+            Ok(t) => return t,
+            Err(e) => tracing::warn!("{e}; recording user_command"),
+        }
+    }
+    if auto {
+        auto_update::CliUpdateTrigger::AutoBackground
+    } else {
+        auto_update::CliUpdateTrigger::UserCommand
+    }
+}
 async fn run_update_command(
     check: bool,
     json: bool,
     force_reinstall: bool,
     version: Option<String>,
     channel_switch: Option<&str>,
+    trigger: auto_update::CliUpdateTrigger,
     base_update_config: &UpdateConfig,
 ) -> Result<()> {
     if json && !check {
@@ -2374,16 +2431,30 @@ async fn run_update_command(
             v
         );
     }
-    let installed = auto_update::run_update(
+    let telemetry_cfg = xai_grok_shell::config::load_agent_config_disk_only()
+        .map_err(|e| tracing::warn!("grok update: telemetry init skipped (agent config: {e})"))
+        .ok();
+    if let Some(agent_cfg) = telemetry_cfg {
+        let auth_manager = std::sync::Arc::new(xai_grok_shell::auth::AuthManager::new(
+            &xai_grok_shell::util::grok_home::grok_home(),
+            agent_cfg.grok_com_config.clone(),
+        ));
+        xai_grok_shell::agent::init::update_telemetry_config(&agent_cfg, &auth_manager);
+    }
+    let result = auto_update::run_update(
         force_reinstall,
         version.as_deref(),
         channel_switch,
         &mut update_config,
+        trigger,
     )
-    .await?;
-    if let Some(installed_version) = installed {
-        signal_leaders_to_relaunch(&installed_version).await;
+    .await;
+    if let Ok(Some(installed_version)) = &result {
+        signal_leaders_to_relaunch(installed_version).await;
     }
+    xai_grok_telemetry::session_ctx::drain_pending(xai_grok_telemetry::session_ctx::CLI_DRAIN)
+        .await;
+    result?;
     Ok(())
 }
 /// After a successful `grok update`, ask any running leader on this machine that
@@ -2536,6 +2607,7 @@ mod tests {
     }
     #[test]
     fn version_output_writer_preserves_channel_aware_contract() {
+        xai_grok_version::set_full_version(env!("VERSION_WITH_COMMIT"));
         for (label, expected_suffix) in [
             (" [alpha]", " [alpha]\n"),
             (" [stable]", " [stable]\n"),
@@ -2931,6 +3003,62 @@ mod tests {
         let s = state.lock().unwrap();
         assert!(s.sessions.is_empty(), "closed session must not be replayed");
         assert!(s.last_session_id.is_none());
+    }
+    /// The standard close spelling must stop the replay exactly like the ext
+    /// spelling: adopting `session/close` without teaching the cache would
+    /// resurrect closed sessions on every leader reconnect.
+    #[test]
+    fn cache_standard_session_close_stops_replaying_it() {
+        let state = make_state();
+        cache_outgoing_acp_state(
+            r#"{"jsonrpc":"2.0","id":2,"method":"session/load","params":{"sessionId":"s1","cwd":"/tmp"}}"#,
+            &state,
+        );
+        cache_outgoing_acp_state(
+            r#"{"jsonrpc":"2.0","id":3,"method":"session/close","params":{"sessionId":"s1"}}"#,
+            &state,
+        );
+        let s = state.lock().unwrap();
+        assert!(s.sessions.is_empty(), "closed session must not be replayed");
+        assert!(s.last_session_id.is_none());
+    }
+    /// A resume-only session must survive a leader restart: the cache
+    /// synthesizes a load entry, since a new leader has no turn to reattach to.
+    #[test]
+    fn cache_session_resume_registers_unknown_sessions_for_replay() {
+        let state = make_state();
+        cache_outgoing_acp_state(
+            r#"{"jsonrpc":"2.0","id":2,"method":"session/resume","params":{"sessionId":"s1","cwd":"/proj"}}"#,
+            &state,
+        );
+        let s = state.lock().unwrap();
+        let (sid, cached) = &s.sessions[0];
+        assert_eq!(sid, "s1");
+        assert_eq!(
+            cached.load_request_json, None,
+            "a resume must not be replayed verbatim; the replay synthesizes a load"
+        );
+        assert_eq!(cached.cwd.as_deref(), Some("/proj"));
+        assert_eq!(s.last_session_id.as_deref(), Some("s1"));
+    }
+    /// A resume must not displace the original load's entry: that entry
+    /// carries the client's `_meta`, which a synthesized load cannot reproduce.
+    #[test]
+    fn cache_session_resume_does_not_displace_the_original_load() {
+        let state = make_state();
+        let load = r#"{"jsonrpc":"2.0","id":2,"method":"session/load","params":{"sessionId":"s1","cwd":"/tmp","_meta":{"noReplay":true}}}"#;
+        cache_outgoing_acp_state(load, &state);
+        cache_outgoing_acp_state(
+            r#"{"jsonrpc":"2.0","id":3,"method":"session/resume","params":{"sessionId":"s1","cwd":"/tmp"}}"#,
+            &state,
+        );
+        let s = state.lock().unwrap();
+        assert_eq!(s.sessions.len(), 1, "one session, one replay entry");
+        assert_eq!(
+            s.sessions[0].1.load_request_json.as_deref(),
+            Some(load),
+            "the original load, with its _meta, must survive the resume"
+        );
     }
     /// An UNCONFIRMED `session/new` (leader died before its response) must not
     /// be replayed — its id was never assigned — but previously loaded

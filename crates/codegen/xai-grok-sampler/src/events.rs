@@ -3,7 +3,8 @@
 use serde::{Deserialize, Serialize};
 
 use xai_grok_sampling_types::{
-    ConversationResponse, EmptyResponseContext, ResponseModelMetadata, SamplingError,
+    ApiErrorCode, ConversationResponse, EmptyResponseContext, ResponseModelMetadata, SamplingError,
+    SentCredential,
 };
 
 use crate::metrics::InferenceLatencyStats;
@@ -18,6 +19,29 @@ use crate::types::RequestId;
 pub enum SamplingChannel {
     Text,
     Reasoning,
+}
+
+/// Why the in-flight request was stripped. What to do about it (e.g. persist
+/// the strip to stored history) is the consumer's decision, not the sampler's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StripReason {
+    /// A 400 stamped with the invalid-image code: the server's
+    /// deterministic verdict on this exact payload.
+    ServerRejected,
+    /// A size/transport heuristic (413, connection reset on upload) or a
+    /// non-deterministic rejection (proxy-wrapped 500, legacy phrase match,
+    /// mid-stream error): may be transient, blames no particular image.
+    PayloadHeuristic,
+}
+
+impl StripReason {
+    /// snake_case label for telemetry.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            StripReason::ServerRejected => "server_rejected",
+            StripReason::PayloadHeuristic => "payload_heuristic",
+        }
+    }
 }
 
 /// Events emitted by the sampler for a single in-flight request.
@@ -56,11 +80,48 @@ pub enum SamplingEvent {
         arguments_delta: Option<String>,
     },
 
+    /// The provider opened a response (Messages `message_start`). Carries the
+    /// real message id, model, and input-side token counts exactly as they
+    /// arrive on the wire, before any content. Surfaced in order so partial-mode
+    /// consumers can emit the real `message_start` id/usage instead of a
+    /// synthesized placeholder. Emitted by the Messages L2 transform only; the
+    /// Responses/Chat transforms lack these fields at stream open and emit
+    /// nothing here.
+    ///
+    /// `input_tokens` is the uncached prompt portion; the Anthropic Messages API
+    /// reports cache hits and writes in the separate `cache_read_input_tokens`
+    /// and `cache_creation_input_tokens` buckets, both known at `message_start`.
+    ResponseStarted {
+        request_id: RequestId,
+        message_id: String,
+        model: String,
+        input_tokens: u64,
+        cache_read_input_tokens: u64,
+        cache_creation_input_tokens: u64,
+    },
+
+    /// The reasoning (thinking) block finished and its encrypted signature is
+    /// known (Messages thinking `content_block_stop`). Surfaced in order so
+    /// partial-mode consumers can emit `signature_delta` before the thinking
+    /// block's `content_block_stop`. Emitted by the Messages L2 transform only.
+    ReasoningCompleted {
+        request_id: RequestId,
+        signature: String,
+    },
+
     /// Streaming completed successfully.
     Completed {
         request_id: RequestId,
         response: Box<ConversationResponse>,
         metrics: InferenceLatencyStats,
+    },
+
+    /// In-flight strip before retry. Persist on `ServerRejected`.
+    ImagesStripped {
+        request_id: RequestId,
+        /// URLs actually stripped from this request.
+        stripped_urls: Vec<std::sync::Arc<str>>,
+        reason: StripReason,
     },
 
     /// Request is being retried.
@@ -124,6 +185,16 @@ pub struct SamplingErrorInfo {
     pub message: String,
     pub is_retryable: bool,
     pub retry_after_secs: Option<u64>,
+    /// Parsed `x-should-retry` response header. `Some(false)` = the server
+    /// says the failure is request-content-caused; never retry. `None` =
+    /// header absent, or payload from an older peer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub should_retry: Option<bool>,
+    /// The server error envelope's `code` slot (e.g. `invalid_image`).
+    /// Serializes as the plain wire string; `None` when absent or from an
+    /// older peer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<ApiErrorCode>,
     pub model_metadata: Option<ResponseModelMetadata>,
     /// Present only when `kind == EmptyResponse`. Carries the structured
     /// context from the L2 stream so downstream consumers can distinguish
@@ -139,6 +210,11 @@ pub struct SamplingErrorInfo {
     /// Telemetry only; `None` for terminal-response detections.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub doom_loop_aborted_at_chunk: Option<u64>,
+    /// Meaningful only when `kind == Auth`: whether the rejected request
+    /// actually carried a credential on the wire. Defaults to `Unknown`
+    /// (charge-the-budget behavior) for payloads from older peers.
+    #[serde(default, skip_serializing_if = "SentCredential::is_unknown")]
+    pub credential: SentCredential,
 }
 
 /// Coarse-grained classification of a sampling failure.
@@ -188,7 +264,7 @@ impl From<&SamplingError> for SamplingErrorInfo {
         let message = err.to_string();
 
         let (kind, status_code, retry_after_secs, model_metadata) = match err {
-            SamplingError::Auth(_) => (SamplingErrorKind::Auth, None, None, None),
+            SamplingError::Auth { .. } => (SamplingErrorKind::Auth, None, None, None),
             SamplingError::InvalidConfiguration(_) => (SamplingErrorKind::Api, None, None, None),
             SamplingError::Http(_) => (SamplingErrorKind::Http, None, None, None),
             SamplingError::Serialization(_) => (SamplingErrorKind::Serialization, None, None, None),
@@ -235,17 +311,29 @@ impl From<&SamplingError> for SamplingErrorInfo {
             } => (Some(triggers.clone()), *aborted_at_chunk),
             _ => (None, None),
         };
+        let credential = match err {
+            SamplingError::Auth { credential, .. } => *credential,
+            _ => SentCredential::Unknown,
+        };
+        let error_code = match err {
+            SamplingError::Api { error_code, .. } => error_code.clone(),
+            SamplingError::StreamError { code, .. } => code.clone(),
+            _ => None,
+        };
 
         Self {
             kind,
             status_code,
             message,
+            should_retry: err.should_retry_header(),
+            error_code,
             is_retryable,
             retry_after_secs,
             model_metadata,
             empty_response_context,
             doom_loop_triggers,
             doom_loop_aborted_at_chunk,
+            credential,
         }
     }
 }
@@ -254,10 +342,65 @@ impl From<&SamplingError> for SamplingErrorInfo {
 mod tests {
     use super::*;
     use reqwest::StatusCode;
+    use xai_grok_sampling_types::ApiErrorCode;
+
+    #[test]
+    fn from_sampling_error_carries_should_retry_header() {
+        let err = SamplingError::Api {
+            status: StatusCode::from_u16(529).expect("valid status"),
+            message: "Overloaded".into(),
+            model_metadata: None,
+            retry_after_secs: None,
+            should_retry: Some(false),
+            error_code: None,
+        };
+        let info = SamplingErrorInfo::from(&err);
+        assert_eq!(info.should_retry, Some(false));
+
+        // Non-Api variants have no header — stays None.
+        let stream_err = SamplingError::StreamError {
+            error_type: "overloaded_error".into(),
+            message: "Overloaded".into(),
+            code: None,
+        };
+        assert_eq!(SamplingErrorInfo::from(&stream_err).should_retry, None);
+    }
+
+    #[test]
+    fn from_sampling_error_carries_error_code() {
+        let api = SamplingError::Api {
+            status: StatusCode::BAD_REQUEST,
+            message: "bad image".into(),
+            model_metadata: None,
+            retry_after_secs: None,
+            should_retry: None,
+            error_code: Some(ApiErrorCode::InvalidImage),
+        };
+        assert_eq!(
+            SamplingErrorInfo::from(&api).error_code,
+            Some(ApiErrorCode::InvalidImage)
+        );
+
+        let stream = SamplingError::StreamError {
+            error_type: "invalid_request_error".into(),
+            message: "bad image".into(),
+            code: Some(ApiErrorCode::InvalidImage),
+        };
+        assert_eq!(
+            SamplingErrorInfo::from(&stream).error_code,
+            Some(ApiErrorCode::InvalidImage)
+        );
+
+        // Non-wire variants carry none.
+        assert_eq!(
+            SamplingErrorInfo::from(&SamplingError::auth_unknown("x")).error_code,
+            None
+        );
+    }
 
     #[test]
     fn auth_variant_classified_as_auth() {
-        let err = SamplingError::Auth("bad token".into());
+        let err = SamplingError::auth_unknown("bad token");
         let info = SamplingErrorInfo::from(&err);
         assert_eq!(info.kind, SamplingErrorKind::Auth);
         assert_eq!(info.status_code, None);
@@ -265,6 +408,18 @@ mod tests {
         assert_eq!(info.retry_after_secs, None);
         assert!(info.model_metadata.is_none());
         assert!(info.message.contains("bad token"));
+    }
+
+    /// A payload from a peer that predates `credential` must still parse,
+    /// defaulting to `Unknown` (charge-the-budget behavior).
+    #[test]
+    fn info_without_credential_field_deserializes_to_unknown() {
+        let info: SamplingErrorInfo = serde_json::from_str(
+            r#"{"kind":"Auth","status_code":401,"message":"x","is_retryable":false,
+                "retry_after_secs":null,"model_metadata":null}"#,
+        )
+        .unwrap();
+        assert_eq!(info.credential, SentCredential::Unknown);
     }
 
     #[test]
@@ -293,6 +448,7 @@ mod tests {
             model_metadata: None,
             retry_after_secs: None,
             should_retry: None,
+            error_code: None,
         };
         let info = SamplingErrorInfo::from(&err);
         assert_eq!(info.kind, SamplingErrorKind::Api);
@@ -308,6 +464,7 @@ mod tests {
             model_metadata: None,
             retry_after_secs: Some(15),
             should_retry: None,
+            error_code: None,
         };
         let info = SamplingErrorInfo::from(&err);
         assert_eq!(info.kind, SamplingErrorKind::RateLimited);
@@ -327,6 +484,7 @@ mod tests {
             }),
             retry_after_secs: None,
             should_retry: None,
+            error_code: None,
         };
         let info = SamplingErrorInfo::from(&err);
         assert_eq!(info.kind, SamplingErrorKind::Api);
@@ -349,6 +507,7 @@ mod tests {
         let err = SamplingError::StreamError {
             error_type: "server_error".into(),
             message: "transient".into(),
+            code: None,
         };
         let info = SamplingErrorInfo::from(&err);
         assert_eq!(info.kind, SamplingErrorKind::Api);

@@ -11,7 +11,7 @@ use toml::Value as TomlValue;
 ///
 /// This is a lightweight duplicate of `xai_grok_update::channel_name()` for
 /// use in `xai-grok-shell` which cannot depend on `xai-grok-update`.
-pub fn channel_name_from_cache() -> Option<&'static str> {
+pub(crate) fn channel_name_from_cache() -> Option<&'static str> {
     use std::sync::OnceLock;
     static NAME: OnceLock<Option<&'static str>> = OnceLock::new();
     *NAME.get_or_init(|| {
@@ -85,22 +85,29 @@ fn version_candidates(
     key: &str,
     managed_only: bool,
 ) -> Vec<String> {
+    let crate::config::ConfigLayers {
+        system_managed,
+        managed,
+        user,
+        env_overlay: _,
+        user_requirements,
+        system_requirements,
+        mdm_requirements,
+        campaigns: _,
+    } = layers;
     [
-        cli_version_from_toml(&layers.system_managed, key),
-        cli_version_from_toml(&layers.managed, key),
+        cli_version_from_toml(system_managed, key),
+        cli_version_from_toml(managed, key),
         (!managed_only)
-            .then(|| cli_version_from_toml(&layers.user, key))
+            .then(|| cli_version_from_toml(user, key))
             .flatten(),
-        layers
-            .user_requirements
+        user_requirements
             .as_ref()
             .and_then(|l| cli_version_from_toml(l, key)),
-        layers
-            .system_requirements
+        system_requirements
             .as_ref()
             .and_then(|l| cli_version_from_toml(l, key)),
-        layers
-            .mdm_requirements
+        mdm_requirements
             .as_ref()
             .and_then(|l| cli_version_from_toml(l, key)),
     ]

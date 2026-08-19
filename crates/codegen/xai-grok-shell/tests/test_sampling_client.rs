@@ -896,7 +896,7 @@ async fn test_chat_completions_401_unauthorized() {
     let result = client.conversation_stream(request).await;
     assert!(result.is_err());
 
-    if let Err(SamplingError::Auth(_)) = result {
+    if let Err(SamplingError::Auth { .. }) = result {
         // Expected
     } else {
         panic!("Expected Auth error");
@@ -939,7 +939,7 @@ async fn test_responses_api_401_unauthorized() {
     let result = client.conversation_stream_responses(request).await;
     assert!(result.is_err());
 
-    if let Err(SamplingError::Auth(_)) = result {
+    if let Err(SamplingError::Auth { .. }) = result {
         // Expected
     } else {
         panic!("Expected Auth error");
@@ -1216,7 +1216,7 @@ async fn test_doom_loop_check_enabled_sends_header_and_absorbs_check_event() {
 
     let logged = server.requests().pop().unwrap();
     assert!(logged.path.contains("/responses"));
-    assert_eq!(logged.header("x-grok-doom-loop-check"), Some("true"));
+    assert_eq!(logged.header("x-grok-doom-loop-check"), Some("1024"));
 }
 
 /// With the check disabled no header goes on the wire, and check frames from

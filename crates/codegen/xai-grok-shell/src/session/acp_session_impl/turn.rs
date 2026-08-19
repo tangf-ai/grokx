@@ -1,6 +1,7 @@
 //! Turn-execution concern for `SessionActor` (`handle_prompt`, turn-end,
 //! sampling loop).
 use super::*;
+use crate::util::dual_clock::DualClock;
 use xai_grok_tools::implementations::grok_build::LoopFireMode;
 /// Synthetic tool the model calls to return its schema-constrained final answer
 /// on backends that can't constrain output natively (Messages API). Intercepted
@@ -113,7 +114,7 @@ impl TurnSpanTotals {
 /// `updates.jsonl`.
 ///
 /// Every turn consumes a `prompt_index`, and rewind / fork truncation
-/// (`replay_to_prompt`, `updates_truncate_for_prompt`) recover turn
+/// (`replay_to_prompt`, `truncate_for_prompt_by`) recover turn
 /// boundaries by counting persisted `UserMessageChunk` runs — so every mode
 /// persists the echo. Turns whose content must not render as a user prompt
 /// (notification drain) are hidden by the *pager* via the
@@ -128,16 +129,33 @@ enum UserEchoMode {
     /// monitor gutter, task pane) that no pane should render live.
     PersistOnly,
 }
-fn user_echo_mode(prompt_id: &str) -> UserEchoMode {
-    if prompt_id.starts_with(super::interjection::INTERJECT_FALLBACK_PROMPT_PREFIX) {
-        return UserEchoMode::PersistOnly;
-    }
-    match super::super::PromptOrigin::from_prompt_id(prompt_id) {
-        super::super::PromptOrigin::NotificationDrain => UserEchoMode::PersistOnly,
-        _ => UserEchoMode::Broadcast,
+fn user_echo_mode(prompt_id: &str, input_origin: &InputOrigin) -> UserEchoMode {
+    if super::interjection::is_interject_fallback(prompt_id)
+        || matches!(
+            input_origin.as_prompt_origin(),
+            PromptOrigin::NotificationDrain
+        )
+    {
+        UserEchoMode::PersistOnly
+    } else {
+        UserEchoMode::Broadcast
     }
 }
 impl SessionActor {
+    /// Exactly once per turn: the cancel path and the turn's own post-loop both announce.
+    pub(super) async fn notify_turn_abort(
+        &self,
+        epoch: TurnEpoch,
+        reason: xai_agent_lifecycle::TurnAbortReason,
+    ) {
+        if !self.turn_abort.try_mark_announced(epoch) {
+            return;
+        }
+        let input = xai_agent_lifecycle::TurnAbortInput::new(reason);
+        for contributor in self.extension_registry.turn_lifecycle_contributors() {
+            contributor.on_turn_abort(&input).await;
+        }
+    }
     /// Run the image-normalization pipeline (re-encode caps, min-side and
     /// integrity checks) and surface its outcomes: compression / re-encode
     /// fallback / dropped notices are appended to `text_out` (TEXT only —
@@ -226,17 +244,7 @@ impl SessionActor {
                 crate::session::storage::SessionUpdate::Acp(Box::new(notification)),
             ));
     }
-    #[tracing::instrument(
-        name = "session.handle_prompt",
-        skip_all,
-        fields(
-            session_id = %self.session_info.id.0,
-            prompt_id = %prompt_id,
-            prompt_length = tracing::field::Empty,
-            command_name = tracing::field::Empty,
-            command_source = tracing::field::Empty,
-        )
-    )]
+    #[cfg(test)]
     pub(super) async fn handle_prompt(
         self: &Arc<Self>,
         prompt_id: &str,
@@ -247,10 +255,59 @@ impl SessionActor {
         prompt_client_identifier: Option<String>,
         prompt_screen_mode: Option<String>,
         verbatim: bool,
+        send_now: bool,
         json_schema: Option<serde_json::Value>,
         persist_ack: Option<oneshot::Sender<()>>,
         parsed_prompt_tx: Option<oneshot::Sender<ParsedPromptInfo>>,
     ) -> PromptTurnResult {
+        self.handle_turn_input(TurnInputRequest {
+            prompt_id: prompt_id.to_string(),
+            input_origin: InputOrigin::from_prompt_id(prompt_id),
+            prompt_blocks,
+            prompt_mode,
+            trace_gcs_config,
+            artifact_tracker,
+            client_identifier: prompt_client_identifier,
+            screen_mode: prompt_screen_mode,
+            verbatim,
+            send_now,
+            json_schema,
+            persist_ack,
+            parsed_prompt_tx,
+        })
+        .await
+    }
+    #[tracing::instrument(
+        name = "session.handle_prompt",
+        skip_all,
+        fields(
+            session_id = %self.session_info.id.0,
+            prompt_id = %request.prompt_id,
+            prompt_length = tracing::field::Empty,
+            command_name = tracing::field::Empty,
+            command_source = tracing::field::Empty,
+        )
+    )]
+    pub(super) async fn handle_turn_input(
+        self: &Arc<Self>,
+        request: TurnInputRequest,
+    ) -> PromptTurnResult {
+        let TurnInputRequest {
+            prompt_id,
+            input_origin,
+            prompt_blocks,
+            prompt_mode,
+            trace_gcs_config,
+            artifact_tracker,
+            client_identifier: prompt_client_identifier,
+            screen_mode: prompt_screen_mode,
+            verbatim,
+            send_now,
+            json_schema,
+            persist_ack,
+            parsed_prompt_tx,
+        } = request;
+        let prompt_id = prompt_id.as_str();
         let handle_prompt_start = std::time::Instant::now();
         let prompt_length: usize = prompt_blocks
             .iter()
@@ -269,28 +326,31 @@ impl SessionActor {
                 "block_count": prompt_blocks.len(),
             })),
         );
-        let origin = super::super::PromptOrigin::from_prompt_id(prompt_id);
-        if let Some(completion_id) = origin.completion_id() {
+        let policy = input_origin.policy();
+        if let Some(completion_id) = input_origin.completion_id() {
             self.mark_completions_reported(&[completion_id]).await;
             if let Some(reservations) = &self.tool_context.task_completion_reservations {
                 reservations.release(completion_id);
             }
         }
-        if !origin.is_synthetic() {
-            self.cancel_pending_recap_for_new_prompt();
+        if policy.authority.is_human_intent() {
+            self.invalidate_side_calls_for_new_prompt();
         }
+        self.ensure_session_disk_writable().await?;
+        self.signals_handle().increment_turn();
+        let prompt_mode =
+            self.resolve_turn_prompt_mode(input_origin.as_prompt_origin(), prompt_mode);
         *self.turn_start_prompt_mode.lock() = prompt_mode;
         *self.turn_prompt_mode.lock() = prompt_mode;
-        self.signals_handle().increment_turn();
-        self.reconcile_plan_mode_with_prompt(prompt_mode);
         let _turn_active_guard =
             TurnActiveGuard::activate(self.tool_context.is_turn_active.as_ref());
         let _session_turn_active_guard = TurnActiveGuard::activate(Some(&self.session_turn_active));
-        let turn_start_input = xai_agent_lifecycle::TurnStartInput::new(
-            super::super::PromptOrigin::from_prompt_id(prompt_id).is_synthetic(),
-        );
+        let turn_start_input =
+            xai_agent_lifecycle::TurnStartInput::new(input_origin.is_synthetic());
         for contributor in self.extension_registry.turn_lifecycle_contributors() {
-            contributor.on_turn_start(&turn_start_input).await;
+            contributor
+                .on_turn_start_with_policy(&turn_start_input, policy)
+                .await;
         }
         if let Ok(mut pending) = self.rewind_pending_prompt.lock()
             && let Some(prev_text) = pending.take()
@@ -312,13 +372,7 @@ impl SessionActor {
                 .handle_direct_bash_command(prompt_id, bash_command, &prompt_blocks)
                 .await;
         }
-        let slash_skills = self
-            .agent
-            .borrow()
-            .tool_bridge()
-            .clone()
-            .slash_skills()
-            .await;
+        let slash_skills = self.slash_skills_for_resolve().await;
         let skill_rewrite = if crate::session::is_cursor_user_template(
             &self.agent.borrow().definition().user_message_template,
         ) {
@@ -340,14 +394,15 @@ impl SessionActor {
         } else {
             LoopFireMode::InSession
         };
-        let prompt_blocks = match slash_commands::resolve(
+        let resolved = slash_commands::resolve(
             prompt_blocks,
             &slash_skills,
             availability,
             skill_rewrite,
             &named_workflows,
             loop_fire_mode,
-        ) {
+        );
+        let prompt_blocks = match resolved {
             Ok(blocks) => blocks,
             Err(SlashCommandOutcome::Builtin(action)) => {
                 let text_block =
@@ -379,6 +434,7 @@ impl SessionActor {
                             }
                             GoalResumeOutcome::Message(msg) => {
                                 self.persist_host_turn_user_echo(&original_prompt_text, prompt_id);
+                                self.mark_front_message_committed().await;
                                 self.send_host_turn_slash_command_output(&msg).await;
                                 return ok_end_turn(0, None);
                             }
@@ -386,6 +442,7 @@ impl SessionActor {
                     }
                     BuiltinAction::WorkflowLaunch { name, input } => {
                         self.persist_host_turn_user_echo(&original_prompt_text, prompt_id);
+                        self.mark_front_message_committed().await;
                         let msg = self
                             .launch_named_workflow(&workflow_registry, &name, &input)
                             .await;
@@ -426,6 +483,7 @@ impl SessionActor {
                         xai_grok_telemetry::events::SkillDispatched {
                             skill_name: sk.name.clone(),
                             plugin_source: sk.plugin_name.clone(),
+                            trigger: xai_grok_telemetry::events::SkillTrigger::SlashCommand,
                         },
                     );
                     let skill_source = if sk.plugin_name.is_some() {
@@ -476,10 +534,7 @@ impl SessionActor {
         self.current_turn_number.set(turn_number);
         let yolo_mode = self.permissions.is_yolo_mode();
         let msg_count = self.chat_state_handle.get_conversation_len().await;
-        let redirect_kind = if matches!(
-            super::super::PromptOrigin::from_prompt_id(prompt_id),
-            super::super::PromptOrigin::User
-        ) {
+        let redirect_kind = if policy.authority.is_human_intent() {
             self.events.take_prior_redirect_kind()
         } else {
             None
@@ -520,14 +575,16 @@ impl SessionActor {
         });
         let current_prompt_index = self.chat_state_handle.get_prompt_index().await;
         xai_grok_telemetry::session_ctx::begin_prompt_id();
-        let origin = super::super::PromptOrigin::from_prompt_id(prompt_id);
         let mut chunk_meta = serde_json::Map::new();
         chunk_meta.insert("modelId".into(), serde_json::json!(model_id));
         chunk_meta.insert(
             "promptIndex".into(),
             serde_json::json!(current_prompt_index),
         );
-        if origin.hide_user_echo_from_scrollback() {
+        if input_origin
+            .as_prompt_origin()
+            .hide_user_echo_from_scrollback()
+        {
             chunk_meta.insert("hideFromScrollback".into(), serde_json::json!(true));
         }
         let user_chunk_meta = Some(chunk_meta);
@@ -546,7 +603,7 @@ impl SessionActor {
         self.file_state_tracker
             .begin_prompt(current_prompt_index)
             .await;
-        let echo_mode = user_echo_mode(prompt_id);
+        let echo_mode = user_echo_mode(prompt_id, &input_origin);
         for block in prompt_blocks.iter() {
             let update = acp::SessionUpdate::UserMessageChunk(
                 acp::ContentChunk::new(block.clone()).meta(user_chunk_meta.clone()),
@@ -600,6 +657,11 @@ impl SessionActor {
             );
         }
         let query = crate::session::placeholder_images::strip_paths_from_image_placeholders(query);
+        let query = if send_now && !verbatim {
+            xai_interjection_core::frame_user_turn(xai_interjection_core::INTERJECTION_NOTE, &query)
+        } else {
+            query
+        };
         let user_images = self
             .normalize_images_with_notices(&mut context, raw_images, is_cursor)
             .await;
@@ -693,7 +755,7 @@ impl SessionActor {
         self.maybe_inject_date_rollover_reminder().await;
         self.inject_plan_mode_reminders().await;
         self.inject_resumed_tasks_reminder();
-        if matches!(&origin, super::super::PromptOrigin::User) {
+        if policy.authority.is_human_intent() {
             if let Some(gate) = &self.tool_context.task_wake_suppressed {
                 gate.set(false);
             }
@@ -712,11 +774,15 @@ impl SessionActor {
             self.transcribe_user_images(user_message, &user_images)
                 .await?
         } else {
-            let session_dir =
-                crate::session::persistence::session_dir(&crate::session::info::Info {
+            let session_dir = crate::session::persistence::ensure_owner_only_session_dir(
+                &crate::session::info::Info {
                     id: self.session_info.id.clone(),
                     cwd: self.session_info.cwd.clone(),
-                });
+                },
+            )
+            .map_err(|e| {
+                acp::Error::internal_error().data(format!("failed to create session dir: {e}"))
+            })?;
             crate::session::image_describe::persist_and_prepend_image_files(
                 &session_dir,
                 &user_images,
@@ -737,16 +803,12 @@ impl SessionActor {
                 attached_image_refs,
             ))
             .await;
-        let prompt_text_for_hook = user_message.clone();
+        let prompt_text_for_hook = Some(user_message.clone());
         {
             if trace_gcs_config.is_some() {
                 self.chat_state_handle.begin_turn_capture();
             }
-            let origin = super::super::PromptOrigin::from_prompt_id(prompt_id);
-            if matches!(origin, super::super::PromptOrigin::User) {
-                self.maybe_inject_interrupt_reminder().await;
-            }
-            let mut user_chat = match &origin {
+            let mut user_chat = match input_origin.as_prompt_origin() {
                 super::super::PromptOrigin::TaskCompleted { .. } => {
                     ConversationItem::task_completed(user_message)
                 }
@@ -770,7 +832,9 @@ impl SessionActor {
                 }
                 super::super::PromptOrigin::PlanResume => ConversationItem::user(user_message),
                 super::super::PromptOrigin::User => {
-                    let mut item = ConversationItem::user(user_message);
+                    let mut item = ConversationItem::user(
+                        self.maybe_apply_interrupt_envelope(user_message, verbatim),
+                    );
                     if let Some(interrupt) = self
                         .events
                         .take_prior_interrupt_category()
@@ -797,6 +861,7 @@ impl SessionActor {
                     .await
                     .is_some()
                 {
+                    self.mark_front_message_committed().await;
                     let (flush_tx, flush_rx) = oneshot::channel();
                     if self
                         .notifications
@@ -805,7 +870,7 @@ impl SessionActor {
                             respond_to: flush_tx,
                         })
                         .is_ok()
-                        && flush_rx.await.is_ok()
+                        && matches!(flush_rx.await, Ok(Ok(())))
                     {
                         let _ = ack.send(());
                     } else {
@@ -824,12 +889,14 @@ impl SessionActor {
                 }
             } else {
                 self.chat_state_handle.push_user_message(user_chat);
+                self.mark_front_message_committed().await;
             }
         }
         self.dispatch_hook(
             xai_grok_hooks::event::HookEventName::UserPromptSubmit,
             xai_grok_hooks::event::HookPayload::UserPromptSubmit {
-                prompt: Some(prompt_text_for_hook),
+                prompt: prompt_text_for_hook,
+                subagent_type: self.subagent_type_label(),
             },
             Some(prompt_id),
             None,
@@ -837,10 +904,11 @@ impl SessionActor {
         .await;
         let turn_scope_guard =
             TurnSubagentScopeGuard::new(self.current_prompt_id.clone(), prompt_id.to_string());
+        self.open_subagent_spawn_admission();
         let turn_model_id = self.current_model_id().await;
         let doom_event_model = turn_model_id.clone();
         let turn_timer = std::time::Instant::now();
-        let result = {
+        let mut result = {
             let mut round_trace = trace_gcs_config;
             let mut round_artifact = artifact_tracker;
             let mut stop_continuations_this_turn: u32 = 0;
@@ -881,14 +949,35 @@ impl SessionActor {
                     self.goal_tracker.lock().status(),
                 );
                 if goal_active {
-                    let decision = if self.goal_runs_on_workflow_engine() {
-                        self.run_goal_round_end().await
+                    if self.has_runnable_queued_user_row().await {
+                        xai_grok_telemetry::unified_log::info(
+                            "shell.goal.yielded_to_queued_input",
+                            Some(self.session_info.id.0.as_ref()),
+                            Some(serde_json::json!({ "prompt_id": prompt_id })),
+                        );
+                        tracing::info!(
+                            "goal turn: yielding to queued user prompts; continuation re-arms \
+                             at turn end"
+                        );
+                        break round;
+                    }
+                    if crate::session::PromptOrigin::from_prompt_id(prompt_id).is_synthetic()
+                        || !self.has_pending_goal_continuation().await
+                    {
+                        let decision = if self.goal_runs_on_workflow_engine() {
+                            self.run_goal_round_end().await
+                        } else {
+                            self.run_goal_round_end_legacy().await
+                        };
+                        if let GoalRoundDecision::Continue(directive) = decision {
+                            self.inject_goal_continuation_message(directive).await;
+                            continue;
+                        }
                     } else {
-                        self.run_goal_round_end_legacy().await
-                    };
-                    if let GoalRoundDecision::Continue(directive) = decision {
-                        self.inject_goal_continuation_message(directive).await;
-                        continue;
+                        tracing::info!(
+                            "goal turn: user prompt runs standalone; a queued continuation \
+                             resumes the goal"
+                        );
                     }
                 }
                 match self
@@ -904,6 +993,37 @@ impl SessionActor {
                 }
             }
         };
+        if matches!(
+            result,
+            Ok(TurnOutcome::Cancelled { .. }) | Ok(TurnOutcome::MaxTurnsReached { .. })
+        ) {
+            self.cancel_running_turn_subagents(prompt_id);
+        }
+        let mut flush_error = self.flush_to_disk().await.err();
+        self.file_state_tracker
+            .end_prompt(&self.tool_context.fs, current_prompt_index)
+            .await;
+        if let Some(mut rewind_point) = self
+            .file_state_tracker
+            .get_rewind_point(current_prompt_index)
+            .await
+        {
+            rewind_point.normalize_to_relative(self.tool_context.cwd.as_ref());
+            let _ = self
+                .notifications
+                .persistence_tx
+                .send(PersistenceMsg::RewindPoint(rewind_point));
+            if flush_error.is_none() {
+                flush_error = self.flush_to_disk().await.err();
+            }
+        }
+        if matches!(
+            &result,
+            Ok(TurnOutcome::Completed { .. }) | Ok(TurnOutcome::StationarityEnded { .. })
+        ) && let Err(error) = self.disk_full_acp_error(flush_error.as_ref())
+        {
+            result = Err(error);
+        }
         let turn_duration_ms = turn_timer.elapsed().as_millis() as u64;
         let handle_prompt_elapsed_ms = handle_prompt_start.elapsed().as_millis() as u64;
         xai_grok_telemetry::unified_log::info(
@@ -936,18 +1056,15 @@ impl SessionActor {
                     None,
                 );
                 if let Some(explanation) = refusal {
-                    let details = (!explanation.is_empty()).then(|| explanation.clone());
-                    self.dispatch_hook(
-                        xai_grok_hooks::event::HookEventName::StopFailure,
-                        xai_grok_hooks::event::HookPayload::StopFailure {
+                    self.report_turn_end(
+                        prompt_id,
+                        TurnEnd::Failed {
                             error: xai_grok_hooks::event::StopFailureKind::InvalidRequest,
-                            error_details: details.clone(),
-                            last_assistant_message: details,
+                            error_details: None,
+                            last_assistant_message: (!explanation.is_empty())
+                                .then(|| explanation.clone()),
                         },
-                        Some(prompt_id),
-                        None,
-                    )
-                    .await;
+                    );
                 }
                 self.send_after_turn_event(xai_tool_protocol::turn_hook::AfterTurnPayload {
                     turn_number: current_prompt_index as u64,
@@ -984,7 +1101,9 @@ impl SessionActor {
                     tool_call_count: turn_tool_count,
                     model_id: turn_model_id.clone(),
                     written_repo_paths: Vec::new(),
-                    cancellation_category: Some("action_stationarity".to_string()),
+                    cancellation_category: Some(
+                        crate::session::commands::ACTION_STATIONARITY_CATEGORY.to_string(),
+                    ),
                     cancellation_context: None,
                 })
                 .await;
@@ -994,7 +1113,9 @@ impl SessionActor {
                         duration_ms: turn_duration_ms,
                         tool_call_count: turn_tool_count,
                         model_id: turn_model_id,
-                        cancellation_category: Some("action_stationarity".to_string()),
+                        cancellation_category: Some(
+                            crate::session::commands::ACTION_STATIONARITY_CATEGORY.to_string(),
+                        ),
                         error_category: None,
                     },
                 );
@@ -1025,7 +1146,8 @@ impl SessionActor {
                         duration_ms: turn_duration_ms,
                         tool_call_count: turn_tool_count,
                         model_id: turn_model_id,
-                        cancellation_category: category.map(|c| format!("{c:?}")),
+                        cancellation_category: category
+                            .map(|c| crate::session::commands::meta_category_str(c).to_string()),
                         error_category: None,
                     },
                 );
@@ -1060,7 +1182,9 @@ impl SessionActor {
                         duration_ms: turn_duration_ms,
                         tool_call_count: turn_tool_count,
                         model_id: turn_model_id,
-                        cancellation_category: Some("max_turns_reached".to_string()),
+                        cancellation_category: Some(
+                            crate::session::commands::MAX_TURNS_REACHED_CATEGORY.to_string(),
+                        ),
                         error_category: None,
                     },
                 );
@@ -1097,17 +1221,14 @@ impl SessionActor {
                         error_category: Some(error_category),
                     },
                 );
-                self.dispatch_hook(
-                    xai_grok_hooks::event::HookEventName::StopFailure,
-                    xai_grok_hooks::event::HookPayload::StopFailure {
+                self.report_turn_end(
+                    prompt_id,
+                    TurnEnd::Failed {
                         error: Self::stop_failure_error_type(err),
                         error_details: Self::turn_error_detail(err),
                         last_assistant_message: Some(Self::format_turn_error_message(err)),
                     },
-                    Some(prompt_id),
-                    None,
-                )
-                .await;
+                );
             }
         }
         xai_grok_telemetry::session_ctx::log_session_event(
@@ -1138,12 +1259,11 @@ impl SessionActor {
                 }
             }
             Ok(TurnOutcome::Cancelled { .. }) | Ok(TurnOutcome::MaxTurnsReached { .. }) => {
-                let input = xai_agent_lifecycle::TurnAbortInput::new(
+                self.notify_turn_abort(
+                    self.turn_report.epoch(),
                     xai_agent_lifecycle::TurnAbortReason::Interrupted,
-                );
-                for contributor in self.extension_registry.turn_lifecycle_contributors() {
-                    contributor.on_turn_abort(&input).await;
-                }
+                )
+                .await;
             }
             Err(err) => {
                 let message = err.to_string();
@@ -1153,31 +1273,10 @@ impl SessionActor {
                 }
             }
         }
-        if matches!(
-            result,
-            Ok(TurnOutcome::Cancelled { .. }) | Ok(TurnOutcome::MaxTurnsReached { .. })
-        ) {
-            self.cancel_running_turn_subagents();
-        }
-        self.flush_to_disk().await;
-        self.file_state_tracker
-            .end_prompt(&self.tool_context.fs, current_prompt_index)
-            .await;
-        if let Some(mut rewind_point) = self
-            .file_state_tracker
-            .get_rewind_point(current_prompt_index)
-            .await
-        {
-            rewind_point.normalize_to_relative(self.tool_context.cwd.as_ref());
-            let _ = self
-                .notifications
-                .persistence_tx
-                .send(PersistenceMsg::RewindPoint(rewind_point));
-        }
+        let usage = self.freeze_prompt_usage(prompt_id).await;
+        drop(turn_scope_guard);
         match result {
             Ok(outcome) => {
-                let usage = self.freeze_prompt_usage(prompt_id).await;
-                drop(turn_scope_guard);
                 self.chat_state_handle.flush();
                 let total_tokens = self.chat_state_handle.get_total_tokens().await;
                 let (stop_reason, mut snapshot, completion_kind, structured_output) = match outcome
@@ -1235,11 +1334,7 @@ impl SessionActor {
                     tool_overrides: None,
                 })
             }
-            Err(e) => {
-                let usage = self.freeze_prompt_usage(prompt_id).await;
-                drop(turn_scope_guard);
-                Err(crate::sampling::error::attach_prompt_usage(e, usage))
-            }
+            Err(e) => Err(crate::sampling::error::attach_prompt_usage(e, usage)),
         }
     }
     /// Wait for turn-blocking subagents (up to 120s on the turn task),
@@ -1650,6 +1745,9 @@ impl SessionActor {
             }
         }
     }
+    pub(super) fn is_first_turn_memory_score_visible(score: f64) -> bool {
+        format!("{score:.2}") != "0.00"
+    }
     /// Compute the first-turn memory reminder, if one should be injected.
     ///
     /// A block persisted by an earlier session segment (a prior `--resume`
@@ -1673,11 +1771,21 @@ impl SessionActor {
                 target: xai_grok_telemetry::memory_log::TARGET,
                 "MEMORY_INJECT: first-turn injection disabled by config"
             );
+            crate::session::memory_observation::log_memory_injection(
+                self.session_info.id.to_string(),
+                xai_grok_telemetry::memory_telemetry::MemoryInjectionOutcome::Skipped,
+                Default::default(),
+            );
             return None;
         }
         let (Some(storage), Some(params)) =
             (self.memory.storage(), self.memory.backend_params.as_ref())
         else {
+            crate::session::memory_observation::log_memory_injection(
+                self.session_info.id.to_string(),
+                xai_grok_telemetry::memory_telemetry::MemoryInjectionOutcome::Skipped,
+                Default::default(),
+            );
             return None;
         };
         let conversation = self.chat_state_handle.get_conversation().await;
@@ -1685,6 +1793,11 @@ impl SessionActor {
             tracing::info!(
                 target: xai_grok_telemetry::memory_log::TARGET,
                 "MEMORY_INJECT: existing memory-context block present in system message -- skipping re-injection to preserve prompt cache"
+            );
+            crate::session::memory_observation::log_memory_injection(
+                self.session_info.id.to_string(),
+                xai_grok_telemetry::memory_telemetry::MemoryInjectionOutcome::Skipped,
+                Default::default(),
             );
             return None;
         }
@@ -1707,34 +1820,62 @@ impl SessionActor {
             raw_query
         };
         let inject_start = std::time::Instant::now();
-        let inject_results = backend.search(&query, 6, configured_min_score).await.ok();
-        let result_count = inject_results.as_ref().map_or(0, |r| r.len());
-        let top_score = inject_results
-            .as_ref()
-            .and_then(|r| r.first())
-            .map_or(0.0, |r| r.score);
-        let total_snippet_chars: usize = inject_results
-            .as_ref()
-            .map_or(0, |r| r.iter().map(|s| s.snippet.len()).sum());
+        let search_result = backend.search(&query, 6, configured_min_score).await;
+        let (outcome, mut inject_results) = match search_result {
+            Ok(results) if results.is_empty() => (
+                xai_grok_telemetry::memory_telemetry::MemoryInjectionOutcome::Empty,
+                results,
+            ),
+            Ok(results) => (
+                xai_grok_telemetry::memory_telemetry::MemoryInjectionOutcome::Results,
+                results,
+            ),
+            Err(error) => {
+                tracing::warn!(
+                    target: xai_grok_telemetry::memory_log::TARGET,
+                    %error,
+                    "MEMORY_INJECT_SEARCH: search failed"
+                );
+                (
+                    xai_grok_telemetry::memory_telemetry::MemoryInjectionOutcome::Error,
+                    Vec::new(),
+                )
+            }
+        };
+        inject_results.retain(|result| Self::is_first_turn_memory_score_visible(result.score));
+        let outcome = if outcome
+            == xai_grok_telemetry::memory_telemetry::MemoryInjectionOutcome::Results
+            && inject_results.is_empty()
+        {
+            xai_grok_telemetry::memory_telemetry::MemoryInjectionOutcome::Empty
+        } else {
+            outcome
+        };
+        let result_count = inject_results.len();
+        let top_score = inject_results.first().map_or(0.0, |result| result.score);
+        let total_snippet_chars = inject_results
+            .iter()
+            .map(|result| result.snippet.len())
+            .sum();
         tracing::info!(
             target: xai_grok_telemetry::memory_log::TARGET,
             configured_min_score,
-            "MEMORY_INJECT_SEARCH: results={result_count}"
+            result_count,
+            "MEMORY_INJECT_SEARCH: completed"
         );
-        xai_grok_telemetry::session_ctx::log_event(
-            xai_grok_telemetry::memory_telemetry::MemoryInjection {
-                session_id: self.session_info.id.to_string(),
-                was_greeting_fallback: was_greeting,
+        crate::session::memory_observation::log_memory_injection(
+            self.session_info.id.to_string(),
+            outcome,
+            crate::session::memory_observation::MemoryInjectionMetrics {
+                is_greeting_fallback: was_greeting,
                 result_count,
                 total_snippet_chars,
                 top_score,
                 configured_min_score,
-                injection_duration_ms: inject_start.elapsed().as_millis() as u64,
+                duration_ms: inject_start.elapsed().as_millis() as u64,
             },
         );
-        inject_results.and_then(|results| {
-            crate::session::helpers::memory_context::format_memory_reminder(&results)
-        })
+        crate::session::helpers::memory_context::format_memory_reminder(&inject_results)
     }
     /// Inspect `tool_calls` for a `StructuredOutput` call and decide the turn's
     /// next step, pushing the call's `tool_result` (correction / retry error /
@@ -1892,6 +2033,7 @@ impl SessionActor {
         json_schema: Option<serde_json::Value>,
     ) -> Result<TurnOutcome, acp::Error> {
         let conv_turn_start = std::time::Instant::now();
+        let conv_turn_clock = DualClock::now();
         self.maybe_refresh_model_metadata_on_resume().await;
         self.maybe_compact_on_model_switch().await?;
         self.chat_state_handle
@@ -1966,6 +2108,7 @@ impl SessionActor {
         let mut turn_span_totals = TurnSpanTotals::default();
         let mut model_fingerprint: Option<String> = None;
         let mut structured_output_retries: u32 = 0;
+        let mut media_gen_resamples: u32 = 0;
         let structured_output_validator = json_schema.as_ref().map(|schema| {
             jsonschema::validator_for(schema).map_err(|e| format!("invalid output schema: {e}"))
         });
@@ -2066,7 +2209,7 @@ impl SessionActor {
                     .unwrap_or_else(|| ACTION_STATIONARITY_NUDGE_TEMPLATE.to_string());
                 self.push_system_reminder(&reminder);
             }
-            self.drain_pending_interjections().await;
+            self.drain_interjections_at_safe_point().await;
             self.flush_pending_skill_reminders().await;
             self.inject_pending_monitor_events().await;
             let memory_reminder = self.first_turn_memory_reminder().await;
@@ -2198,50 +2341,138 @@ impl SessionActor {
                     return Err(error);
                 }
                 Ok(SamplerTurnOutcome::CompactAndResubmit) => {
-                    auth_retry_schedule.reset();
+                    auth_retry_schedule.reset_on_success();
                     continue;
                 }
-                Ok(SamplerTurnOutcome::RefreshAuthAndResubmit) => {
-                    if let Some((attempt, delay)) = auth_retry_schedule.next_delay() {
-                        let delay_ms = delay.as_millis() as u64;
-                        tracing::warn!(
-                            attempt,
-                            delay_ms,
-                            "auth 401 retry: backing off before resubmit"
-                        );
-                        xai_grok_telemetry::unified_log::warn(
-                            "shell.turn.auth_retry_backoff",
+                Ok(SamplerTurnOutcome::RefreshAuthAndResubmit { credential, store }) => {
+                    if auth_retry_schedule.reset_if_incident_spans_suspend() {
+                        tracing::info!("auth 401 retry: incident spanned a suspend; budget reset");
+                        xai_grok_telemetry::unified_log::info(
+                            "shell.turn.auth_retry_reset_after_suspend",
                             Some(self.session_info.id.0.as_ref()),
-                            Some(serde_json::json!({
-                                "loop_index": loop_index,
-                                "attempt": attempt,
-                                "max_retries": AuthRetrySchedule::MAX_RETRIES,
-                                "delay_ms": delay_ms,
-                            })),
+                            Some(serde_json::json!({ "loop_index": loop_index })),
                         );
-                        self.send_xai_notification(XaiSessionUpdate::RetryState(
-                            crate::extensions::notification::RetryState::Retrying {
-                                attempt,
-                                max_retries: AuthRetrySchedule::MAX_RETRIES,
-                                reason: "Re-authenticated after 401; retrying request".to_string(),
-                            },
-                        ))
-                        .await;
-                        sleep(delay).await;
-                        continue;
                     }
-                    let msg = format!(
-                        "Auth recovery succeeded but inference request was \
-                         still rejected (401) after {} retries",
-                        AuthRetrySchedule::MAX_RETRIES
-                    );
-                    tracing::error!(msg);
-                    return Err(acp::Error::internal_error().data(
-                        crate::sampling::error::error_data_with_status(msg, Some(401)),
-                    ));
+                    match auth_retry_schedule.on_recovered_401(credential) {
+                        AuthRetryDecision::UnchargedResubmit { resubmit } => {
+                            tracing::warn!(
+                                resubmit,
+                                "auth 401 retry: no credential was sent; resubmitting uncharged"
+                            );
+                            xai_grok_telemetry::unified_log::warn(
+                                "shell.turn.auth_resubmit_uncharged",
+                                Some(self.session_info.id.0.as_ref()),
+                                Some(serde_json::json!({
+                                    "loop_index": loop_index,
+                                    "resubmit": resubmit,
+                                    "max_resubmits": AuthRetrySchedule::MAX_UNCHARGED_RESUBMITS,
+                                })),
+                            );
+                            self.send_xai_notification(XaiSessionUpdate::RetryState(
+                                crate::extensions::notification::RetryState::Retrying {
+                                    attempt: resubmit,
+                                    max_retries: AuthRetrySchedule::MAX_UNCHARGED_RESUBMITS,
+                                    reason: "Re-authenticated after 401 (request carried no \
+                                             credential); retrying request"
+                                        .to_string(),
+                                },
+                            ))
+                            .await;
+                            pace_uncharged_resubmit(store, self.auth_manager.as_ref()).await;
+                            continue;
+                        }
+                        AuthRetryDecision::Backoff { attempt, delay } => {
+                            let delay_ms = delay.as_millis() as u64;
+                            tracing::warn!(
+                                attempt,
+                                delay_ms,
+                                "auth 401 retry: backing off before resubmit"
+                            );
+                            xai_grok_telemetry::unified_log::warn(
+                                "shell.turn.auth_retry_backoff",
+                                Some(self.session_info.id.0.as_ref()),
+                                Some(serde_json::json!({
+                                    "loop_index": loop_index,
+                                    "attempt": attempt,
+                                    "max_retries": AuthRetrySchedule::MAX_RETRIES,
+                                    "delay_ms": delay_ms,
+                                })),
+                            );
+                            self.send_xai_notification(XaiSessionUpdate::RetryState(
+                                crate::extensions::notification::RetryState::Retrying {
+                                    attempt,
+                                    max_retries: AuthRetrySchedule::MAX_RETRIES,
+                                    reason: "Re-authenticated after 401; retrying request"
+                                        .to_string(),
+                                },
+                            ))
+                            .await;
+                            sleep(delay).await;
+                            continue;
+                        }
+                        decision @ (AuthRetryDecision::Exhausted
+                        | AuthRetryDecision::RunawayGuard { .. }) => {
+                            let (awake, wall, suspended) = conv_turn_clock.elapsed_split();
+                            let duration_note = if suspended >= std::time::Duration::from_secs(1) {
+                                format!(
+                                    " Turn ran {} wall-clock, {} of it suspended.",
+                                    human_duration(wall),
+                                    human_duration(suspended)
+                                )
+                            } else {
+                                format!(" Turn ran {} wall-clock.", human_duration(wall))
+                            };
+                            let (rejections, authenticated) = auth_retry_schedule.incident_counts();
+                            let uncharged = auth_retry_schedule.uncharged_rejections();
+                            let msg = match decision {
+                                AuthRetryDecision::RunawayGuard { rejections } => {
+                                    format!(
+                                        "Auth recovery kept succeeding but {rejections} requests \
+                                     were rejected (401) before a credential could be sent, \
+                                     with no successful response in between; stopping as a \
+                                     runaway guard.{duration_note}"
+                                    )
+                                }
+                                _ if authenticated == rejections => {
+                                    format!(
+                                        "Auth recovery succeeded but {rejections} authenticated \
+                                     inference requests were still rejected (401); giving up \
+                                     after {} retries.{duration_note}",
+                                        AuthRetrySchedule::MAX_RETRIES
+                                    )
+                                }
+                                _ => {
+                                    format!(
+                                        "Auth retry budget exhausted after {rejections} \
+                                     post-recovery 401s ({authenticated} provably carried a \
+                                     credential).{duration_note}"
+                                    )
+                                }
+                            };
+                            tracing::error!(msg);
+                            xai_grok_telemetry::unified_log::error(
+                                "shell.turn.auth_retry_exhausted",
+                                Some(self.session_info.id.0.as_ref()),
+                                Some(serde_json::json!({
+                                    "loop_index": loop_index,
+                                    "decision": match decision {
+                                        AuthRetryDecision::RunawayGuard { .. } => "runaway_guard",
+                                        _ => "exhausted",
+                                    },
+                                    "rejections": rejections,
+                                    "authenticated": authenticated,
+                                    "uncharged": uncharged,
+                                    "wall_secs": wall.as_secs(),
+                                    "awake_secs": awake.as_secs(),
+                                    "suspended_secs": suspended.as_secs(),
+                                })),
+                            );
+                            return Err(self.fail_turn_auth_budget_exhausted(msg).await);
+                        }
+                    }
                 }
             };
-            auth_retry_schedule.reset();
+            auth_retry_schedule.reset_on_success();
             let model_elapsed_ms = model_timer.elapsed().as_millis() as u64;
             let usage = response.usage.as_ref();
             let prompt_tokens = usage.map(|u| u.prompt_tokens);
@@ -2314,6 +2545,7 @@ impl SessionActor {
                 );
             }
             self.record_response_token_usage(&response, Some(model_duration_ms));
+            let response_completed = self.response_completed_update(&response);
             if let Some(pt) = prompt_timing.take() {
                 let mcp_count = self.mcp_state.lock().await.configs.len() as u32;
                 let mcp_tools = self
@@ -2335,11 +2567,49 @@ impl SessionActor {
                     turn_index,
                     mcp_count,
                     mcp_tools,
-                    self.mcp_strategy,
+                    self.mcp_strategy.get(),
                     self.current_model_id().await,
                 );
             }
             let mut tool_calls = response.tool_calls().to_vec();
+            let over_cap = self.media_gen_over_cap(&tool_calls);
+            if xai_grok_tools::media_gen_limits::should_resample_egregious(
+                &over_cap,
+                media_gen_resamples,
+                MAX_MEDIA_GEN_OVER_CAP_RESAMPLES,
+            ) {
+                media_gen_resamples += 1;
+                let egregious: Vec<_> = over_cap.into_iter().filter(|o| o.is_egregious()).collect();
+                let reminder = xai_grok_tools::media_gen_limits::resample_reminder(&egregious);
+                tracing::warn!(
+                    session_id = %self.session_info.id,
+                    resample = media_gen_resamples,
+                    "media_gen 2x over-cap — discarding generation and resampling"
+                );
+                xai_grok_telemetry::unified_log::info(
+                    "shell.media_gen.batch_resampled",
+                    Some(self.session_info.id.0.as_ref()),
+                    Some(serde_json::json!({
+                        "over": egregious.iter().map(|o| serde_json::json!({
+                            "tool_name": o.name,
+                            "total": o.total,
+                            "max": o.max,
+                        })).collect::<Vec<_>>(),
+                        "attempt": media_gen_resamples,
+                        "max_retries": MAX_MEDIA_GEN_OVER_CAP_RESAMPLES,
+                    })),
+                );
+                self.send_xai_notification(XaiSessionUpdate::RetryState(
+                    crate::extensions::notification::RetryState::Retrying {
+                        attempt: media_gen_resamples,
+                        max_retries: MAX_MEDIA_GEN_OVER_CAP_RESAMPLES,
+                        reason: "Too many parallel media-gen calls; retrying".to_string(),
+                    },
+                ))
+                .await;
+                self.push_system_reminder(&reminder);
+                continue;
+            }
             metrics_drop_guard.record_model_response(tool_calls.len());
             if let Some(fp) = response
                 .assistant()
@@ -2397,6 +2667,7 @@ impl SessionActor {
                 )
                 .await;
             }
+            self.send_buffered_xai_update(response_completed).await;
             if tool_calls.is_empty() {
                 if !schema_ok
                     && !turn_refused
@@ -2452,8 +2723,8 @@ impl SessionActor {
                         ));
                     }
                 }
-                if self.drain_pending_interjections().await {
-                    tracing::info!("Drained interjection(s) before turn completion — continuing");
+                if self.drain_interjections_at_safe_point().await {
+                    tracing::info!("Drained interjection(s) before turn completion; continuing");
                     continue;
                 }
                 let snapshot = self
@@ -2466,7 +2737,7 @@ impl SessionActor {
                     .await;
                 if self.drain_pending_interjections().await {
                     tracing::info!(
-                        "Drained late interjection(s) during turn-end bookkeeping — continuing"
+                        "Drained late interjection(s) during turn-end bookkeeping; continuing"
                     );
                     continue;
                 }
@@ -2622,6 +2893,9 @@ impl SessionActor {
         }
     }
 }
+/// Discard an egregious (2× cap) media-gen generation and re-sample this
+/// many times; later over-caps in the same turn use first-K.
+const MAX_MEDIA_GEN_OVER_CAP_RESAMPLES: u32 = 1;
 const MAX_CONSECUTIVE_IDENTICAL_TOOL_CALLS: u32 = 16;
 const NUDGE_AFTER_IDENTICAL_TOOL_CALLS: u32 = 8;
 const MAX_CONSECUTIVE_TRUE_NOOPS: u32 = 4;
@@ -2750,97 +3024,22 @@ mod identical_tool_call_run_tests {
         assert!(!run.take_nudge());
     }
 }
-/// Backoff schedule for resubmits after a *successful* 401 auth recovery
-/// (fresh token minted, request to be re-sent).
-///
-/// Two hard-won invariants, both regressions from the silent-hang incident
-/// where a turn froze 16m40s and then 11.6 days (user-cancelled at 27min):
-///
-/// - **Delays must be 1s/2s/4s.** `tokio_retry::ExponentialBackoff::
-///   from_millis(base)` raises `base` to the attempt number, so the base must
-///   stay small: `from_millis(1000)` yields 1000ⁿ ms = 1s → 16m40s → 11.57
-///   days. `from_millis(2).factor(500)` yields 2ⁿ × 500ms = 1s, 2s, 4s.
-/// - **The schedule is per-incident, not per-turn.** A long turn can span
-///   several hourly gateway token rotations; each rotation is an independent
-///   401→refresh→retry event. Without `reset()` after a successful response,
-///   the third rotation of one turn would land on the last (largest) delay
-///   and the fourth would fail the turn outright.
-struct AuthRetrySchedule {
-    delays: std::iter::Take<ExponentialBackoff>,
-    attempt: u32,
-}
-impl AuthRetrySchedule {
-    /// Consecutive post-recovery 401s tolerated before the turn fails.
-    const MAX_RETRIES: u32 = 3;
-    fn new() -> Self {
-        Self {
-            delays: ExponentialBackoff::from_millis(2)
-                .factor(500)
-                .max_delay(std::time::Duration::from_secs(10))
-                .take(Self::MAX_RETRIES as usize),
-            attempt: 0,
-        }
-    }
-    /// Next `(attempt_number, delay)` (1-indexed), or `None` once exhausted.
-    fn next_delay(&mut self) -> Option<(u32, std::time::Duration)> {
-        let delay = self.delays.next()?;
-        self.attempt += 1;
-        Some((self.attempt, delay))
-    }
-    /// A successful model response closes the incident: restart the schedule
-    /// so the next token rotation starts back at the shortest delay.
-    fn reset(&mut self) {
-        *self = Self::new();
-    }
-}
-#[cfg(test)]
-mod auth_retry_schedule_tests {
-    use super::AuthRetrySchedule;
-    use std::time::Duration;
-    /// Pins the exact schedule. Guards against the `from_millis(1000)`
-    /// footgun (baseⁿ semantics): that spelling produced sleeps of 1s,
-    /// 16m40s, and 11.57 days, observed in the field as a silent
-    /// ~27-minute hang in `waiting_model` that the user had to cancel.
-    #[test]
-    fn schedule_is_one_two_four_seconds_then_exhausted() {
-        let mut schedule = AuthRetrySchedule::new();
-        let steps: Vec<_> = std::iter::from_fn(|| schedule.next_delay()).collect();
-        assert_eq!(
-            steps,
-            vec![
-                (1, Duration::from_secs(1)),
-                (2, Duration::from_secs(2)),
-                (3, Duration::from_secs(4)),
-            ],
-        );
-        assert_eq!(
-            schedule.next_delay(),
-            None,
-            "must exhaust after MAX_RETRIES"
-        );
-    }
-    /// Each successful response must restart the schedule: hourly token
-    /// rotations within one long turn are independent incidents, so they
-    /// must not escalate toward exhaustion (turn failure).
-    #[test]
-    fn reset_restarts_delays_and_attempt_numbering() {
-        let mut schedule = AuthRetrySchedule::new();
-        schedule.next_delay();
-        schedule.next_delay();
-        schedule.reset();
-        assert_eq!(schedule.next_delay(), Some((1, Duration::from_secs(1))));
-    }
-}
 #[cfg(test)]
 mod user_echo_broadcast_tests {
-    use super::{UserEchoMode, user_echo_mode};
+    use super::{InputOrigin, PromptOrigin, UserEchoMode, user_echo_mode};
+    fn origin(prompt_id: &str) -> InputOrigin {
+        InputOrigin::new(PromptOrigin::from_prompt_id(prompt_id))
+    }
     /// Notification-drain: persisted (rewind/fork count user-chunk runs as
     /// turn boundaries) but never broadcast live; the pager hides it via the
     /// `hideFromScrollback` chunk meta.
     #[test]
     fn notification_drain_turn_is_persist_only() {
         assert_eq!(
-            user_echo_mode("notifications-019e0000-0000-7000-8000-0000000000aa"),
+            user_echo_mode(
+                "notifications-019e0000-0000-7000-8000-0000000000aa",
+                &origin("notifications-uuid"),
+            ),
             UserEchoMode::PersistOnly
         );
     }
@@ -2848,17 +3047,20 @@ mod user_echo_broadcast_tests {
     /// live so multi-client / dashboard viewers stay in sync.
     #[test]
     fn user_and_cron_turns_broadcast_live() {
-        assert_eq!(user_echo_mode("my-prompt"), UserEchoMode::Broadcast);
         assert_eq!(
-            user_echo_mode("scheduler-fired-abc"),
+            user_echo_mode("my-prompt", &origin("my-prompt")),
             UserEchoMode::Broadcast
         );
         assert_eq!(
-            user_echo_mode("task-completed-bg-1"),
+            user_echo_mode("scheduler-fired-abc", &origin("scheduler-fired-abc")),
             UserEchoMode::Broadcast
         );
         assert_eq!(
-            user_echo_mode("subagent-completed-xyz"),
+            user_echo_mode("task-completed-bg-1", &origin("task-completed-bg-1")),
+            UserEchoMode::Broadcast
+        );
+        assert_eq!(
+            user_echo_mode("subagent-completed-xyz", &origin("subagent-completed-xyz")),
             UserEchoMode::Broadcast
         );
     }
@@ -2868,7 +3070,10 @@ mod user_echo_broadcast_tests {
     #[test]
     fn interject_fallback_turn_is_persist_only() {
         assert_eq!(
-            user_echo_mode("interject-fallback-019e24b7"),
+            user_echo_mode(
+                "interject-fallback-019e24b7",
+                &origin("interject-fallback-019e24b7")
+            ),
             UserEchoMode::PersistOnly
         );
     }

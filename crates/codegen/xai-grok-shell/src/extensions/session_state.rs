@@ -44,7 +44,7 @@ fn validate_session_uuid(session_id: &str) -> Result<(), acp::Error> {
 /// `x.ai/session/state`: return metadata columns keyed by logical name. Errors when
 /// the session isn't found on this host, since it reads a single record whose absence
 /// is not an empty result (unlike the collection returned by `x.ai/session/updates`).
-pub async fn handle_state(args: &acp::ExtRequest) -> ExtResult {
+pub(crate) async fn handle_state(args: &acp::ExtRequest) -> ExtResult {
     let request: StateRequest = super::parse_params(args)?;
     validate_session_uuid(&request.session_id)?;
 
@@ -76,7 +76,7 @@ struct ImportRequest {
 
 /// `x.ai/session/import`: recreate a session on this host from mirrored columns and
 /// transcript. A session that already exists locally is left unchanged.
-pub async fn handle_import(args: &acp::ExtRequest) -> ExtResult {
+pub(crate) async fn handle_import(args: &acp::ExtRequest) -> ExtResult {
     let mut request: ImportRequest = super::parse_params(args)?;
     validate_session_uuid(&request.session_id)?;
 
@@ -168,7 +168,7 @@ fn write_import(
     state: &std::collections::HashMap<String, Value>,
     updates: &[Value],
 ) -> std::io::Result<()> {
-    std::fs::create_dir_all(dir)?;
+    crate::util::grok_home::create_dir_all_owner_only(dir)?;
 
     // Clear every file this import owns so a leftover from a failed attempt can't
     // merge with the new snapshot; this import is authoritative.
@@ -281,6 +281,12 @@ mod tests {
 
         write_import(dir, &state, &updates).unwrap();
 
+        #[cfg(unix)]
+        assert_eq!(
+            crate::test_support::unix_mode(dir),
+            0o700,
+            "imported session dir must be owner-only"
+        );
         assert!(dir.join("summary.json").exists(), "summary.json written");
         assert_eq!(
             std::fs::read_to_string(dir.join("plan.json")).unwrap(),

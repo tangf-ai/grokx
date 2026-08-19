@@ -1,20 +1,22 @@
 //! Prompt and bash-command submission dispatchers and reload-window helpers.
 
-use super::auth::{scrollback_has_recent_context_too_large, scrollback_has_recent_reauth_prompt};
+use super::auth::{
+    scrollback_has_recent_context_too_large, scrollback_has_recent_disk_full,
+    scrollback_has_recent_reauth_prompt, scrollback_has_recent_request_failed,
+};
 use super::billing::is_credit_limit_error;
 use super::ctx::with_active_agent;
 use super::interject;
 use super::permissions::drain_permission_queue;
 use super::queue::{
     apply_turn_start_shim, drain_prompt_state_to_last_queued, immediate_server_send_eligible,
-    maybe_drain_queue, note_peek_page_flip, push_server_queue_echo, retire_optimistic_echo,
+    maybe_drain_queue, note_peek_page_flip, push_and_page_flip, push_server_queue_echo,
+    retire_optimistic_echo,
 };
 use super::router::dispatch;
-use super::session::fork::open_project_question;
-use super::session::lifecycle::skip_picker_and_create_session;
 use super::voice::{merge_prompt_with_voice_interim, voice_stop_on_submit};
 use crate::app::actions::{Action, DoctorFixTarget, Effect};
-use crate::app::agent::{AgentId, AgentState};
+use crate::app::agent::{AgentCommand, AgentId, AgentState};
 use crate::app::agent_view::AgentView;
 use crate::app::app_view::{ActiveView, AppView};
 use crate::notifications::{NotificationEvent, NotificationEventKind};
@@ -23,6 +25,9 @@ use crate::scrollback::blocks::SessionEvent;
 use crate::slash::command::DoctorRequest;
 use agent_client_protocol as acp;
 use xai_grok_telemetry::session_ctx::log_event;
+
+/// Shared by every submit guard that refuses while the session reconnects.
+pub(super) const RECONNECTING_NOTICE: &str = "Reconnecting, please wait...";
 
 /// Chat kind for the next create: CLI `--chat` (`app.chat_mode`) or one-shot
 /// `/chat` (`deferred_startup.pending_chat`, consumed here).
@@ -198,10 +203,15 @@ pub(super) fn dispatch_open_history_search(app: &mut AppView) -> Vec<Effect> {
     with_active_agent(app, |agent| {
         let history = agent.combined_prompt_history();
         let current_text = agent.prompt.text().to_string();
-        agent
+        let opened = agent
             .prompt
             .history_search
             .activate(&history, &current_text);
+        if !opened {
+            // Matcher thread didn't start: the overlay stays closed on
+            // purpose (nothing could ever populate it).
+            tracing::debug!("history search unavailable: matcher spawn failed");
+        }
     });
     vec![]
 }
@@ -400,17 +410,6 @@ fn maybe_show_send_now_tip(app: &mut AppView) {
     }
 }
 
-/// Whether submitting `text` may open the project picker. Slash commands,
-/// `exit`/`quit` aliases, and empty input never send a prompt to the agent,
-/// so they must pass through untouched.
-pub(super) fn input_can_trigger_project_picker(text: &str) -> bool {
-    let t = text.trim();
-    !t.is_empty()
-        && !t.starts_with('/')
-        && !t.starts_with('!')
-        && !matches!(t, "exit" | "quit" | ":q" | ":q!" | ":wq" | ":wq!")
-}
-
 /// Body of [`dispatch_send_prompt`], parameterized over whether to consume
 /// the prompt textarea after the command is processed.
 ///
@@ -422,9 +421,7 @@ pub(super) fn input_can_trigger_project_picker(text: &str) -> bool {
 /// resolution and the downstream `Effect`s are identical in both cases.
 ///
 /// `literal = true` (follow-up chip click) submits `text` straight to the
-/// model: the slash-command, exit-alias, and project-picker branches are all
-/// skipped so server/model-controlled chip text can never execute a command
-/// nor be diverted into the project question.
+/// model: the slash-command and exit-alias branches are skipped so server/model-controlled chip text can never execute a command.
 pub(super) fn dispatch_send_prompt_inner(
     app: &mut AppView,
     text: String,
@@ -450,16 +447,8 @@ pub(super) fn dispatch_send_prompt_inner(
     };
 
     if app.reconnect_pending {
-        app.show_toast("Reconnecting, please wait...");
+        app.show_toast(RECONNECTING_NOTICE);
         return vec![];
-    }
-
-    // The picker intercepts only real, user-authored prompts; slash commands,
-    // exit aliases, empty input, and literal chip submissions pass through so
-    // they never spawn it (a chip is a model suggestion for an already-running
-    // session, not the first-prompt project choice).
-    if !literal && input_can_trigger_project_picker(&text) && app.needs_project_picker() {
-        return open_project_question(app, text);
     }
 
     let ActiveView::Agent(id) = app.active_view else {
@@ -479,6 +468,7 @@ pub(super) fn dispatch_send_prompt_inner(
     let voice_stt_language_from_app = app.voice_config.language.clone();
     let scheduler_background_loops_seed = app.scheduler_background_loops_seed;
     let login_method_id_from_app = app.login_method_id.as_ref().map(|id| id.0.to_string());
+    let leader_mode = app.leader_mode;
     let Some(agent) = app.agents.get_mut(&id) else {
         return vec![];
     };
@@ -551,6 +541,7 @@ pub(super) fn dispatch_send_prompt_inner(
                 bundle_state: &app.bundle_state,
                 screen_mode: app.screen_mode,
                 billing_surface_visible: app.usage_visible,
+                usage_command_visible: !app.has_external_auth_provider,
                 // PAGER-owned snapshot for slash commands.
                 pager_state: crate::settings::PagerLocalSnapshot {
                     multiline_mode: agent.multiline_mode,
@@ -607,15 +598,18 @@ pub(super) fn dispatch_send_prompt_inner(
                     });
                 }
                 if let Some(command) = command {
-                    if ctx.screen_mode.is_minimal() && !command.available_in_minimal() {
-                        // Central minimal gate: commands that drive the deleted
-                        // fullscreen pane / dashboard (/find, /dashboard, …)
-                        // have nothing to act on in scrollback-native mode.
-                        // Surface a friendly system block instead of running them.
-                        CommandResult::Message(format!(
-                            "/{} is not available in minimal mode",
-                            invocation.token
-                        ))
+                    // Central screen-mode gate. Such a command is already
+                    // filtered out of every completion surface, but it stays
+                    // resolvable so a fully-typed invocation earns a hint that
+                    // names the way out instead of leaking to the model.
+                    // A refusal added here must also extend the pre-check in `EditedCommandGate`
+                    // (`dispatch::queue`): that caller has to know the command will be refused
+                    // before it drops the queued row the text came from.
+                    if let Some(refusal) = command
+                        .mode_support()
+                        .refusal(invocation.token, ctx.screen_mode)
+                    {
+                        CommandResult::Message(refusal)
                     } else {
                         agent
                             .prompt
@@ -646,14 +640,14 @@ pub(super) fn dispatch_send_prompt_inner(
                 if consume_input {
                     agent.prompt.set_text("");
                 }
-                agent.scrollback.push_block(RenderBlock::system(msg));
+                push_and_page_flip(&mut agent.scrollback, RenderBlock::system(msg));
                 return vec![];
             }
             CommandResult::Message(msg) => {
                 if consume_input {
                     agent.prompt.set_text("");
                 }
-                agent.scrollback.push_block(RenderBlock::system(msg));
+                push_and_page_flip(&mut agent.scrollback, RenderBlock::system(msg));
                 return vec![];
             }
             CommandResult::Doctor(request) => {
@@ -745,10 +739,7 @@ pub(super) fn dispatch_send_prompt_inner(
             drain_prompt_state_to_last_queued(agent);
             agent.prompt.set_text("");
         }
-        // Every non-enqueue arm returned above. Queued slash work bypasses
-        // the picker, so create the deferred session or it never drains.
-        effects = skip_picker_and_create_session(app, id);
-    } else if !literal && matches!(trimmed, "exit" | "quit" | ":q" | ":q!" | ":wq" | ":wq!") {
+    } else if !literal && crate::slash::commands::exit::is_exit_alias(trimmed) {
         if consume_input {
             agent.prompt.set_text("");
         }
@@ -801,7 +792,7 @@ pub(super) fn dispatch_send_prompt_inner(
             .recognized_token_ranges(&text, &agent.session.models);
 
         let immediate_server_send =
-            immediate_server_send_eligible(agent) && agent.prompt.images.is_empty();
+            immediate_server_send_eligible(agent, leader_mode) && agent.prompt.images.is_empty();
         tracing::debug!(
             target: "qtrace",
             pid = std::process::id(),
@@ -817,13 +808,13 @@ pub(super) fn dispatch_send_prompt_inner(
             "plain prompt send routing decision",
         );
 
-        // Parked + held occupancy → append; empty held → cancel-and-send.
+        // Occupancy/park flags: only the image branch below immediately send-nows on an empty held wait.
         let parked_sendable_wait = agent.is_parked_on_sendable_wait();
         let hold_behind_existing_queue = parked_sendable_wait && agent.has_held_user_queue();
 
         // Images can't ride immediate server-send; empty-held park still send-nows.
         if !immediate_server_send
-            && immediate_server_send_eligible(agent)
+            && immediate_server_send_eligible(agent, leader_mode)
             && !agent.prompt.images.is_empty()
             && parked_sendable_wait
             && !hold_behind_existing_queue
@@ -850,10 +841,7 @@ pub(super) fn dispatch_send_prompt_inner(
             // `running_prompt_id` adoption + turn-start shim), the ACP gate must
             // treat its deltas as ours, not adopt them as another client's turn.
             agent.note_self_originated_prompt(&prompt_id);
-
-            if parked_sendable_wait && !hold_behind_existing_queue {
-                agent.arm_send_now_expectation(prompt_id.clone());
-            }
+            // Plain image-free sends stay unarmed: shell queue state and cancelTrigger decide disposition.
 
             if consume_input {
                 // Plain prompt: no images to drain. Clear textarea + record
@@ -889,7 +877,10 @@ pub(super) fn dispatch_send_prompt_inner(
                 Some(&sid_str),
                 Some(serde_json::json!({ "kind": "prompt", "len": text.len() })),
             );
-            if queued_while_running && !parked_sendable_wait {
+            if queued_while_running
+                && !parked_sendable_wait
+                && !crate::appearance::cache::load_follow_up_steer()
+            {
                 maybe_show_send_now_tip(app);
             }
             return vec![Effect::SendPrompt {
@@ -961,26 +952,19 @@ pub(super) fn dispatch_send_prompt_inner(
 /// the execute block from the shell IS the visual entry.
 pub(super) fn dispatch_send_bash_command(app: &mut AppView, command: String) -> Vec<Effect> {
     if app.reconnect_pending {
-        app.show_toast("Reconnecting, please wait...");
+        app.show_toast(RECONNECTING_NOTICE);
         return vec![];
     }
 
     let ActiveView::Agent(id) = app.active_view else {
         return vec![];
     };
+    let leader_mode = app.leader_mode;
     let Some(agent) = app.agents.get_mut(&id) else {
         return vec![];
     };
     // Submitting a bash command retires any edit-contextual ephemeral tip.
     agent.ephemeral_tip.clear_on_submit();
-    if agent.session.session_id.is_none() {
-        let effects = skip_picker_and_create_session(app, id);
-        if let Some(agent) = app.agents.get_mut(&id) {
-            agent.session.enqueue_bash_command(command);
-            agent.prompt.set_text("");
-        }
-        return effects;
-    }
 
     // Store in prompt history with `! ` prefix for restore semantics.
     let history_key = format!("! {}", command.trim());
@@ -999,7 +983,7 @@ pub(super) fn dispatch_send_bash_command(app: &mut AppView, command: String) -> 
     // into the shared queue with `kind="bash"`. On `running_prompt_id`
     // adoption the turn-start shim sets `bash_turn` (no user block). The IDLE
     // case is unchanged: enqueue locally + drain instantly.
-    let bash_immediate = immediate_server_send_eligible(agent);
+    let bash_immediate = immediate_server_send_eligible(agent, leader_mode);
     tracing::debug!(
         target: "qtrace",
         pid = std::process::id(),
@@ -1193,7 +1177,15 @@ pub(super) fn handle_prompt_response(
                 }
                 // Resolved-without-running never adopts; explicit for the
                 // session-less arm (no note_queue_echo_retired above).
-                agent.retire_send_now_painted_block(response_pid);
+                // Exception: an active-goal Send Now painted block still awaiting
+                // its interjection claim stays put — the `RemovedFromQueue`
+                // response is the expected outcome of routing the Send Now as an
+                // interjection, and `handle_interjection` converts the block in
+                // place. Retiring it here (before that claim wins the race) would
+                // drop and re-push the message at the scrollback end.
+                if !agent.is_send_now_awaiting_interjection_claim(response_pid) {
+                    agent.retire_send_now_painted_block(response_pid);
+                }
                 return vec![];
             }
         }
@@ -1209,7 +1201,7 @@ pub(super) fn handle_prompt_response(
         let wire_cancel_trigger = result.as_ref().ok().and_then(|pr| {
             pr.meta
                 .as_ref()?
-                .get("cancelTrigger")?
+                .get(crate::app::turn_completion::CANCEL_TRIGGER_KEY)?
                 .as_str()
                 .map(str::to_string)
         });
@@ -1218,6 +1210,15 @@ pub(super) fn handle_prompt_response(
                 Some(trigger) => trigger == "send_now",
                 None => expected_send_now.is_some(),
             };
+        // A hook-denied end rides the cancelled stop reason but is a policy
+        // block, not a user cancel — `cancelled_turn_event` picks the marker.
+        let wire_cancellation_category = result.as_ref().ok().and_then(|pr| {
+            pr.meta
+                .as_ref()?
+                .get(crate::app::turn_completion::CANCELLATION_CATEGORY_KEY)?
+                .as_str()
+                .map(str::to_string)
+        });
         let rate_limited = agent.session.rate_limited;
         // Fallback mirroring the credit-limit race guard below: if the retry
         // notification lost the race with (or never reached) this
@@ -1233,25 +1234,50 @@ pub(super) fn handle_prompt_response(
         // block, so the generic TurnFailed + error toast are redundant. Derived
         // from the scrollback (mirrors reauth), not a session flag.
         let context_overflow = scrollback_has_recent_context_too_large(&agent.scrollback);
+        let disk_full_from_error = result
+            .as_ref()
+            .err()
+            .is_some_and(|e| crate::app::effects::is_disk_full_error(e));
+        if disk_full_from_error && !scrollback_has_recent_disk_full(&agent.scrollback) {
+            agent
+                .scrollback
+                .push_block(RenderBlock::session_event(SessionEvent::DiskFull));
+        }
+        let disk_full = disk_full_from_error || scrollback_has_recent_disk_full(&agent.scrollback);
         // Fallback: if the retry notification didn't set the flag,
         // detect credit-limit denials (legacy 403 or pool 402) from
         // the PromptResponse error + HTTP status. Covers races where
         // the retry notification arrives after the PromptResponse.
+        // The error text is already banner-formatted ("Request failed (402) —
+        // …"), so recover the status from it when the field is absent.
         let credit_limit_blocked = agent.session.credit_limit_blocked
-            || result
-                .as_ref()
-                .err()
-                .is_some_and(|e| is_credit_limit_error(http_status, e));
+            || result.as_ref().err().is_some_and(|e| {
+                let status =
+                    http_status.or_else(|| crate::app::error_display::parse_http_status(e));
+                is_credit_limit_error(status, e)
+            });
         // A 401/auth failure already surfaced an actionable
         // `ReAuthRequired` prompt via the RetryState handler (which
         // runs before this PromptResponse). Suppress the redundant
         // "Turn failed" block + error toast so only the prompt shows.
+        // "(401)" matches both the raw "Unauthorized (401)" dump and the
+        // banner-formatted "Request failed (401) — …" text.
         let reauth_prompted = scrollback_has_recent_reauth_prompt(&agent.scrollback)
             || (http_status == Some(401)
-                && result
-                    .as_ref()
-                    .err()
-                    .is_some_and(|e| e.contains("Unauthorized (401)")));
+                && result.as_ref().err().is_some_and(|e| e.contains("(401)")));
+        let request_failed_shown = scrollback_has_recent_request_failed(&agent.scrollback);
+        // A dedicated prompt/modal/banner replaces the generic TurnFailed
+        // marker and error toast (rate limit, free-usage paywall, model
+        // incompatibility, credit 402/403, 401 re-auth, context overflow,
+        // disk-full, or a formatted RequestFailed banner from RetryState).
+        let dedicated_ux_shown = rate_limited
+            || free_usage_blocked
+            || model_incompatible
+            || credit_limit_blocked
+            || reauth_prompted
+            || context_overflow
+            || disk_full
+            || request_failed_shown;
         let elapsed = agent.turn_elapsed();
 
         {
@@ -1320,29 +1346,19 @@ pub(super) fn handle_prompt_response(
             // Send-now cancel: no marker (the new prompt is the next turn); the
             // `None` still flushes any held stop hooks standalone.
             (Ok(_), true) if send_now_cancel => None,
-            (Ok(_), true) => Some(SessionEvent::TurnCancelled {
-                elapsed: elapsed.unwrap_or_default(),
-            }),
+            (Ok(_), true) => Some(crate::app::turn_completion::cancelled_turn_event(
+                wire_cancellation_category.as_deref(),
+                elapsed.unwrap_or_default(),
+            )),
             (Ok(_), false) if agent.bash_turn => None,
             (Ok(_), false) => Some(SessionEvent::TurnCompleted {
                 // Legacy copy on purpose: unknown elapsed keeps the "in 0.0s"
                 // form here — only wake markers use the honest `None` form.
                 elapsed: Some(elapsed.unwrap_or_default()),
             }),
-            (Err(_), _)
-                if rate_limited
-                    || free_usage_blocked
-                    || model_incompatible
-                    || credit_limit_blocked
-                    || reauth_prompted
-                    || context_overflow =>
-            {
-                // Skip TurnFailed when a dedicated prompt/modal shows instead
-                // (rate limit, free-usage paywall, model incompatibility,
-                // credit 403, 401 re-auth, or a terminal context-window
-                // overflow).
-                None
-            }
+            (Err(_), _) if dedicated_ux_shown => None,
+            // `err` is already banner-formatted by `format_acp_error` at the
+            // producer — the single formatting owner. Don't re-format here.
             (Err(err), _) => Some(SessionEvent::TurnFailed {
                 error: err.clone(),
                 elapsed,
@@ -1364,14 +1380,7 @@ pub(super) fn handle_prompt_response(
                 };
                 Some((NotificationEventKind::TurnComplete, body))
             }
-            (Err(err), _)
-                if !rate_limited
-                    && !free_usage_blocked
-                    && !model_incompatible
-                    && !credit_limit_blocked
-                    && !reauth_prompted
-                    && !context_overflow =>
-            {
+            (Err(err), _) if !dedicated_ux_shown => {
                 Some((NotificationEventKind::AgentError, format!("Error: {err}")))
             }
             _ => None,
@@ -1496,28 +1505,19 @@ pub(super) fn handle_prompt_response(
         // prompt is retried automatically; otherwise the upsell
         // is shown.
         if credit_limit_blocked {
-            // Strip stale "Retry failed" / "Turn failed" error blocks
-            // that were pushed before the credit-limit was detected.
-            // Walk backwards from the end and remove matching events.
-            let mut to_remove = Vec::new();
-            for idx in (0..agent.scrollback.len()).rev() {
-                match agent.scrollback.entry(idx).map(|e| &e.block) {
-                    Some(crate::scrollback::block::RenderBlock::SessionEvent(ev))
-                        if matches!(
-                            &ev.event,
-                            SessionEvent::RetryFailed { .. } | SessionEvent::TurnFailed { .. }
-                        ) =>
-                    {
-                        to_remove.push(idx);
-                    }
-                    // Stop at the first non-error block.
-                    Some(
-                        crate::scrollback::block::RenderBlock::SessionEvent(_)
-                        | crate::scrollback::block::RenderBlock::System(_),
-                    ) => continue,
-                    _ => break,
-                }
-            }
+            // Strip stale error blocks that were pushed before the
+            // credit-limit was detected.
+            let to_remove: Vec<usize> = super::auth::trailing_session_events(&agent.scrollback)
+                .filter(|(_, ev)| {
+                    matches!(
+                        ev,
+                        SessionEvent::RequestFailed { .. }
+                            | SessionEvent::RetryFailed { .. }
+                            | SessionEvent::TurnFailed { .. }
+                    )
+                })
+                .map(|(idx, _)| idx)
+                .collect();
             for idx in to_remove {
                 agent.scrollback.remove_from(idx);
             }
@@ -1600,6 +1600,7 @@ pub(super) fn handle_prompt_response(
         effects.push(Effect::FetchBilling {
             agent_id,
             silent: true,
+            nonce: 0,
         });
         note_peek_page_flip(app, agent_id, page_flip_entry);
         return effects;
@@ -1613,10 +1614,23 @@ pub(super) fn handle_compact_complete(
     result: Result<(), String>,
 ) -> Vec<Effect> {
     if let Some(agent) = app.agents.get_mut(&agent_id) {
-        // Defensive: only process if we're still in CommandRunning state.
-        // This guards against state machine bugs or future cancellation support.
-        if !matches!(agent.session.state, AgentState::CommandRunning { .. }) {
-            tracing::debug!("Ignoring CompactComplete (not in CommandRunning state)");
+        // Defensive: only process if we're still in a compact command state.
+        let was_cancelling = matches!(
+            agent.session.state,
+            AgentState::CommandCancelling {
+                command: AgentCommand::Compact,
+            }
+        );
+        if !matches!(
+            agent.session.state,
+            AgentState::CommandRunning {
+                command: AgentCommand::Compact,
+                ..
+            } | AgentState::CommandCancelling {
+                command: AgentCommand::Compact,
+            }
+        ) {
+            tracing::debug!("Ignoring CompactComplete (not in compact command state)");
             return vec![];
         }
 
@@ -1629,6 +1643,11 @@ pub(super) fn handle_compact_complete(
                     SessionEvent::CompactCompleted {
                         elapsed: elapsed.unwrap_or_default(),
                     },
+                ));
+            }
+            Err(err) if was_cancelling || err.contains("compact cancelled") => {
+                agent.scrollback.push_block(RenderBlock::session_event(
+                    SessionEvent::CompactionCancelled,
                 ));
             }
             Err(err) => {

@@ -22,7 +22,7 @@ pub(crate) fn is_scheduler_fired_prompt(prompt_id: &str) -> bool {
 }
 
 /// Returns true for the auto-wake turn families (`task-completed-…`,
-/// `subagent-completed-…`, `notifications-…`). These run non-adopted — no
+/// `subagent-completed-…`, `workflow-completed-…`, `notifications-…`). These run non-adopted — no
 /// `PromptResponse`, no viewer finalize — so their durable `TurnCompleted` is
 /// the only signal marking the back-to-idle point (see [`finish_wake_turn`];
 /// a chatty wake closes with a marker, a silent one stays markerless).
@@ -92,12 +92,22 @@ pub(super) fn viewer_turn_anchor(turn_start_ms: Option<i64>) -> std::time::Insta
 /// with one; silence closes with none — except failures, which surface even
 /// when silent (the user's standing instruction stopped executing invisibly).
 /// Silent rate limits defer to the retry notifications, like the real-turn
-/// rails.
+/// rails. A hook-denied wake follows the cancelled policy (no failure
+/// carve-out): the `HookAnnotation` warning attributes the deny but is not
+/// turn output, so a silent block closes without a marker.
+///
+/// `cancel_trigger` is the signal's `_meta.cancelTrigger`. `"send_now"` marks
+/// an internal cancel-and-send, so the `TurnCancelled` marker is suppressed
+/// (wire trigger wins; `expect_send_now_cancel` is the older-shell fallback).
+/// `cancellation_category` is the signal's `_meta.cancellationCategory`;
+/// `"HookDenied"` picks the blocked-by-a-hook marker.
 pub(super) fn finish_wake_turn(
     agent: &mut AgentView,
     prompt_id: &str,
     stop_reason: &str,
     agent_result: Option<&str>,
+    cancel_trigger: Option<&str>,
+    cancellation_category: Option<&str>,
 ) {
     use crate::scrollback::blocks::SessionEvent;
 
@@ -117,6 +127,11 @@ pub(super) fn finish_wake_turn(
     } else {
         None
     };
+    // Wire trigger carries this case; pid-matched fallback is consistency-only (do not take/clear).
+    let send_now_cancel = match cancel_trigger {
+        Some(trigger) => trigger == "send_now",
+        None => agent.expect_send_now_cancel.as_deref() == Some(prompt_id),
+    };
     let already_failed = agent.failed_wake_marker_for.as_deref() == Some(prompt_id);
     let event = match stop_reason {
         "error" | "rate_limit"
@@ -126,21 +141,34 @@ pub(super) fn finish_wake_turn(
         }
         "error" | "rate_limit" => {
             agent.failed_wake_marker_for = Some(prompt_id.to_string());
-            Some(SessionEvent::TurnFailed {
-                error: agent_result.map(str::to_string).unwrap_or_else(|| {
-                    if stop_reason == "error" {
-                        "unknown error".to_string()
-                    } else {
-                        "rate limited".to_string()
-                    }
-                }),
-                elapsed,
-            })
+            // A dedicated banner (re-auth, overflow, disk-full, formatted
+            // request failure) from the retry-state rail already covers this
+            // failure — same dedupe as `turn_failed_event` on the local rails.
+            if crate::app::dispatch::scrollback_has_recent_error_banner(&agent.scrollback) {
+                None
+            } else {
+                let error = if stop_reason == "error" {
+                    crate::app::error_display::format_request_failure(
+                        None,
+                        None,
+                        agent_result.unwrap_or("unknown error"),
+                    )
+                    .message()
+                } else {
+                    agent_result
+                        .map(str::to_string)
+                        .unwrap_or_else(|| "rate limited".to_string())
+                };
+                Some(SessionEvent::TurnFailed { error, elapsed })
+            }
         }
         "cancelled" if !had_output => None,
-        "cancelled" => Some(SessionEvent::TurnCancelled {
-            elapsed: elapsed.unwrap_or_default(),
-        }),
+        // Send-now cancel: no marker (the sender's new prompt is the next turn).
+        "cancelled" if send_now_cancel => None,
+        "cancelled" => Some(crate::app::turn_completion::cancelled_turn_event(
+            cancellation_category,
+            elapsed.unwrap_or_default(),
+        )),
         _ if !had_output => None,
         _ => Some(SessionEvent::TurnCompleted { elapsed }),
     };

@@ -4,6 +4,7 @@
 
 use agent_client_protocol as acp;
 use xai_grok_shell::agent::config::UiConfig;
+use xai_grok_shell::util::config::DISPLAY_REFRESH_DEFAULT_AUTO_CADENCE_ENABLED;
 use xai_grok_tools::implementations::grok_build::ask_user_question;
 
 // ---------------------------------------------------------------------------
@@ -520,6 +521,10 @@ pub fn current_value_for(
         "combine_queued_prompts" => Some(SettingValue::Bool(
             crate::appearance::cache::load_combine_queued_prompts(),
         )),
+        "follow_up_behavior" => Some(SettingValue::Enum(
+            crate::appearance::cache::load_follow_up_behavior().as_canonical(),
+        )),
+        "confirm_before_rewind" => Some(SettingValue::Bool(ui.confirm_before_rewind_enabled())),
         "simple_mode" => Some(SettingValue::Bool(ui.simple_mode.unwrap_or(true))),
         // Per-tip contextual hints — `None` (inherit) reads as the default ON.
         "contextual_hints.undo" => {
@@ -560,9 +565,11 @@ pub fn current_value_for(
         "invert_scroll" => Some(SettingValue::Bool(
             crate::appearance::cache::load_invert_scroll(),
         )),
-        // Nested `[ui.display_refresh].auto_cadence_enabled`; None → default false.
+        // Nested `[ui.display_refresh].auto_cadence_enabled`; None → compiled default.
         "display_refresh_auto_cadence" => Some(SettingValue::Bool(
-            ui.display_refresh.auto_cadence_enabled.unwrap_or(false),
+            ui.display_refresh
+                .auto_cadence_enabled
+                .unwrap_or(DISPLAY_REFRESH_DEFAULT_AUTO_CADENCE_ENABLED),
         )),
         "scroll_lines" => Some(SettingValue::Int(
             crate::appearance::cache::load_scroll_lines()
@@ -696,13 +703,21 @@ pub fn current_value_for(
         // CLI batch: snapshot mirrors; `None` → effective default `true`.
         "show_tips" => Some(SettingValue::Bool(pager.show_tips.unwrap_or(true))),
         "auto_update" => Some(SettingValue::Bool(pager.auto_update.unwrap_or(true))),
-        // fork_secondary_model: baseline value folds to empty string.
+        // fork_secondary_model: baseline value folds to empty string. The
+        // mirror persists the ModelId slug but the DynamicEnum canonicals
+        // are catalog display names, so resolve via the snapshot; a stale
+        // id passes through raw.
         "fork_secondary_model" => Some(SettingValue::String({
             let baseline = xai_grok_shell::models::default_model();
             if ui.fork_secondary_model == baseline {
                 String::new()
             } else {
-                ui.fork_secondary_model.clone()
+                pager
+                    .available_models
+                    .iter()
+                    .find(|(_, id)| id.0.as_ref() == ui.fork_secondary_model.as_str())
+                    .map(|(name, _)| name.clone())
+                    .unwrap_or_else(|| ui.fork_secondary_model.clone())
             }
         })),
 
@@ -832,11 +847,25 @@ mod tests {
                         "page_flip_on_send default drifts from UiConfig::default()"
                     );
                 }
+                ("confirm_before_rewind", SettingKind::Bool { default }) => {
+                    assert_eq!(
+                        *default,
+                        ui.confirm_before_rewind_enabled(),
+                        "confirm_before_rewind default drifts from UiConfig::default()"
+                    );
+                }
                 ("combine_queued_prompts", SettingKind::Bool { default }) => {
                     assert_eq!(
                         *default,
                         ui.combine_queued_prompts.unwrap_or(false),
                         "combine_queued_prompts default drifts from UiConfig::default()"
+                    );
+                }
+                ("follow_up_behavior", SettingKind::Enum { default, .. }) => {
+                    assert_eq!(
+                        *default,
+                        ui.follow_up_behavior(),
+                        "follow_up_behavior default drifts from UiConfig::default()"
                     );
                 }
                 ("simple_mode", SettingKind::Bool { default }) => {
@@ -1008,6 +1037,9 @@ mod tests {
                     );
                 }
                 ("keep_text_selection", SettingKind::Enum { default, .. }) => {
+                    // The compile-time default is flash; the `word_select`
+                    // default is a startup-applied remote rollout flag, not part
+                    // of this static registry default.
                     let expected = if ui.keep_text_selection_enabled() {
                         "hold"
                     } else {
@@ -1116,12 +1148,15 @@ mod tests {
                         "invert_scroll default drifts from UiConfig::default()"
                     );
                 }
-                // display_refresh.auto_cadence_enabled: Option<bool>; None → false.
+                // display_refresh.auto_cadence_enabled: Option<bool>; None →
+                // DISPLAY_REFRESH_DEFAULT_AUTO_CADENCE_ENABLED.
                 ("display_refresh_auto_cadence", SettingKind::Bool { default }) => {
                     assert_eq!(
                         *default,
-                        ui.display_refresh.auto_cadence_enabled.unwrap_or(false),
-                        "display_refresh_auto_cadence default drifts from UiConfig::default()"
+                        ui.display_refresh
+                            .auto_cadence_enabled
+                            .unwrap_or(DISPLAY_REFRESH_DEFAULT_AUTO_CADENCE_ENABLED),
+                        "display_refresh_auto_cadence default drifts from resolve default"
                     );
                 }
                 // scroll_lines: Option<u8>; None → registry default 3 (the
@@ -1443,6 +1478,51 @@ mod tests {
         let pager = PagerLocalSnapshot::default();
         let value = current_value_for("auto_dark_theme", &ui, &pager).expect("must resolve");
         assert_eq!(value, SettingValue::Enum("groknight"));
+    }
+
+    /// The persisted `fork_secondary_model` slug resolves to the catalog
+    /// display name (matching the `default_model` row and the DynamicEnum
+    /// picker canonicals); the baseline still folds to the empty sentinel
+    /// and a slug missing from the catalog passes through raw.
+    #[test]
+    fn fork_secondary_model_current_value_resolves_display_name() {
+        let slug = "grok-4.5-fast";
+        assert_ne!(
+            slug,
+            xai_grok_shell::models::default_model(),
+            "test slug must differ from the baseline or the empty-fold arm masks the lookup",
+        );
+        let pager = PagerLocalSnapshot {
+            available_models: vec![(
+                "Grok 4.5 Fast".to_string(),
+                acp::ModelId::new(std::sync::Arc::from(slug)),
+            )],
+            ..Default::default()
+        };
+        let ui = UiConfig {
+            fork_secondary_model: slug.to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            current_value_for("fork_secondary_model", &ui, &pager),
+            Some(SettingValue::String("Grok 4.5 Fast".to_string())),
+        );
+
+        // Baseline folds to the empty "no override" sentinel.
+        assert_eq!(
+            current_value_for("fork_secondary_model", &UiConfig::default(), &pager),
+            Some(SettingValue::String(String::new())),
+        );
+
+        // Stale slug (not in the catalog) passes through unresolved.
+        let stale_ui = UiConfig {
+            fork_secondary_model: "retired-model".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            current_value_for("fork_secondary_model", &stale_ui, &pager),
+            Some(SettingValue::String("retired-model".to_string())),
+        );
     }
 
     /// Keywords must be lowercase and non-empty.

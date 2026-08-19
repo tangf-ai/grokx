@@ -6,6 +6,7 @@
 //! panel stays on screen until the user presses Esc, at which point
 //! the content is persisted to scrollback as a collapsed `BtwBlock`.
 
+use crate::render::SafeBuf;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
@@ -123,8 +124,9 @@ impl BtwOverlayState {
                     block_line_idx: idx,
                     screen_y: 0,
                     screen_x: 0,
-                    selectable_cols: 0..text.width() as u16,
+                    selectable_cols: 0..crate::scrollback::types::str_display_cells(&text) as u16,
                     text,
+                    painted_region: None,
                     joiner_to_previous,
                 });
             }
@@ -146,20 +148,49 @@ fn line_plain_text(line: &Line<'_>) -> String {
     line.spans.iter().map(|s| s.content.as_ref()).collect()
 }
 
+/// Wrap an error message to `content_width` columns, capped at `max_lines`
+/// with an ellipsis on the last line when cut. The caller passes the rows it
+/// can actually paint, so the truncation marker lands on a visible row even
+/// when the layout hands the panel a shorter rect than it asked for.
+fn wrapped_error_lines(error: &str, content_width: usize, max_lines: usize) -> Vec<String> {
+    if content_width == 0 {
+        return vec![String::new()];
+    }
+    let mut lines: Vec<String> = textwrap::wrap(error.trim(), content_width)
+        .into_iter()
+        .map(|l| l.into_owned())
+        .collect();
+    if lines.len() > max_lines {
+        lines.truncate(max_lines);
+        if let Some(last) = lines.last_mut() {
+            // Make room: a full-width last line + '…' would exceed
+            // `content_width` and the renderer would cut the ellipsis off.
+            while last.width() >= content_width {
+                last.pop();
+            }
+            last.push('\u{2026}');
+        }
+    }
+    lines
+}
+
 /// Compute the desired height of the btw inline panel.
 ///
 /// Returns 0 when there is nothing to show (state is `None`).
-/// Loading / Error = 3 rows (top border + 1 body + bottom border).
-/// Done = 2 (borders) + min(wrapped response lines, DONE_MAX_BODY_LINES).
+/// Loading = 3 rows (top border + 1 body + bottom border).
+/// Done / Error = 2 (borders) + min(wrapped lines, DONE_MAX_BODY_LINES).
 ///
-/// `content_width` is the available width for body text (panel width minus
-/// border and padding — typically `inner_width - 4`).
-pub fn btw_panel_height(state: Option<&BtwOverlayState>, content_width: u16) -> u16 {
+/// `panel_width` is the full panel width (`render_btw_panel`'s `area.width`);
+/// body text gets `panel_width - 4` (border + padding), matching the render.
+pub fn btw_panel_height(state: Option<&BtwOverlayState>, panel_width: u16) -> u16 {
+    let cw = panel_width.saturating_sub(4) as usize; // border + pad
     match state {
         None => 0,
-        Some(BtwOverlayState::Loading { .. } | BtwOverlayState::Error { .. }) => 3,
+        Some(BtwOverlayState::Loading { .. }) => 3,
+        Some(BtwOverlayState::Error { error, .. }) => {
+            2 + wrapped_error_lines(error, cw, DONE_MAX_BODY_LINES as usize).len() as u16
+        }
         Some(BtwOverlayState::Done { content, .. }) => {
-            let cw = content_width.saturating_sub(4) as usize; // border + pad
             let total = if cw > 0 {
                 content.with_wrapped_lines(cw, |w| w.lines.len())
             } else {
@@ -192,6 +223,8 @@ pub fn render_btw_panel(
     link_overlay: Option<&mut LinkOverlay>,
     // Generated-media paths for resolving relative file-path link targets.
     media_paths: &[std::path::PathBuf],
+    // Session cwd for resolving relative markdown link targets to on-disk files.
+    cwd: Option<&std::path::Path>,
 ) {
     if area.width < 12 || area.height < 3 {
         return;
@@ -364,7 +397,10 @@ pub fn render_btw_panel(
             let visible_count = end.saturating_sub(content_skip);
             for (row, idx) in (content_skip..end).enumerate() {
                 let bl = &block_output.lines[idx];
-                buf.set_line(
+                // Content paints bidi-aware (when rtl_bidi is on) so the shared
+                // selection machinery, which maps visual columns, agrees with
+                // the drawn cells — matching scrollback/list content.
+                buf.set_line_safe_bidi(
                     content_x,
                     body_y + row as u16,
                     &bl.content,
@@ -378,8 +414,9 @@ pub fn render_btw_panel(
                     block_line_idx: idx,
                     screen_y: body_y + row as u16,
                     screen_x: content_x,
-                    selectable_cols: 0..text.width() as u16,
+                    selectable_cols: 0..crate::scrollback::types::str_display_cells(&text) as u16,
                     text,
+                    painted_region: None,
                     joiner_to_previous,
                 });
             }
@@ -419,6 +456,7 @@ pub fn render_btw_panel(
                         content_x,
                         /* content_line_offset */ 0,
                         media_paths,
+                        cwd,
                         overlay,
                     );
                 });
@@ -438,24 +476,18 @@ pub fn render_btw_panel(
         }
         BtwOverlayState::Error { error, .. } => {
             let error_style = Style::default().fg(theme.accent_error).bg(bg);
-            let msg = if error.width() > content_width {
-                let mut s = String::new();
-                let mut w = 0;
-                for ch in error.chars() {
-                    let cw = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
-                    if w + cw + 1 > content_width {
-                        break;
-                    }
-                    s.push(ch);
-                    w += cw;
-                }
-                s.push('\u{2026}');
-                s
-            } else {
-                error.clone()
-            };
-            let line = Line::from(Span::styled(msg, error_style));
-            buf.set_line(content_x, body_y, &line, content_width as u16);
+            // Cap at the rows this rect can paint: the minimal renderer
+            // routinely hands the panel a shorter rect than it asked for,
+            // and the ellipsis must land on a row the user can see.
+            let max_rows =
+                (area.height.saturating_sub(2) as usize).min(DONE_MAX_BODY_LINES as usize);
+            for (i, text) in wrapped_error_lines(error, content_width, max_rows)
+                .into_iter()
+                .enumerate()
+            {
+                let line = Line::from(Span::styled(text, error_style));
+                buf.set_line(content_x, body_y + i as u16, &line, content_width as u16);
+            }
         }
     }
 }
@@ -473,7 +505,18 @@ mod tests {
         let area = Rect::new(0, 0, width, height);
         let mut buf = Buffer::empty(area);
         let mut model = ResolvedSelectionModel::default();
-        render_btw_panel(&mut buf, state, area, 0, false, None, &mut model, None, &[]);
+        render_btw_panel(
+            &mut buf,
+            state,
+            area,
+            0,
+            false,
+            None,
+            &mut model,
+            None,
+            &[],
+            None,
+        );
         model
     }
 
@@ -482,7 +525,18 @@ mod tests {
         let area = Rect::new(0, 0, width, height);
         let mut buf = Buffer::empty(area);
         let mut model = ResolvedSelectionModel::default();
-        render_btw_panel(&mut buf, state, area, 0, false, None, &mut model, None, &[]);
+        render_btw_panel(
+            &mut buf,
+            state,
+            area,
+            0,
+            false,
+            None,
+            &mut model,
+            None,
+            &[],
+            None,
+        );
         buf
     }
 
@@ -512,6 +566,7 @@ mod tests {
             &mut model,
             Some(&mut links),
             &[],
+            None,
         );
         (model, links)
     }
@@ -578,6 +633,104 @@ mod tests {
         let model = render_with_model(&state, 40, 4);
         assert!(model.ranges.is_empty());
         assert!(model.visible_blocks.is_empty());
+    }
+
+    /// A long error wraps across body rows instead of truncating to one line
+    /// with an ellipsis (the old behavior cut off the actionable tail).
+    #[test]
+    fn error_state_wraps_long_message_across_rows() {
+        let error = "Rate limited (429) — you've hit the rate limit for your \
+                     plan. Try again later or upgrade for higher limits.";
+        let state = BtwOverlayState::Error {
+            question: "q".to_string(),
+            error: error.to_string(),
+        };
+        // width 40 → content_width 36; the message needs 4 rows.
+        let height = btw_panel_height(Some(&state), 40);
+        assert!(height > 3, "long error must grow the panel, got {height}");
+
+        let buf = render_to_buffer(&state, 40, height);
+        let body: String = (1..height - 1).map(|y| row_text(&buf, 40, y)).collect();
+        assert!(
+            body.contains("upgrade for higher limits"),
+            "tail lost: {body}"
+        );
+        assert!(!body.contains('\u{2026}'), "no ellipsis when fully shown");
+    }
+
+    /// Short errors keep the compact 3-row panel.
+    #[test]
+    fn error_panel_height_stays_compact_for_short_error() {
+        let state = BtwOverlayState::Error {
+            question: "q".to_string(),
+            error: "boom".to_string(),
+        };
+        assert_eq!(btw_panel_height(Some(&state), 40), 3);
+        let buf = render_to_buffer(&state, 40, 3);
+        assert!(row_text(&buf, 40, 1).contains("boom"));
+    }
+
+    /// Pathologically long errors cap at DONE_MAX_BODY_LINES with an ellipsis,
+    /// and every line (including the ellipsized last one) fits the width so
+    /// the renderer can't cut the ellipsis off.
+    #[test]
+    fn error_body_caps_at_max_lines_with_ellipsis() {
+        let max = DONE_MAX_BODY_LINES as usize;
+        let error = "word ".repeat(400);
+        let lines = wrapped_error_lines(&error, 36, max);
+        assert_eq!(lines.len(), max);
+        assert!(lines.last().unwrap().ends_with('\u{2026}'));
+        for line in &lines {
+            assert!(line.width() <= 36, "line exceeds width: {line:?}");
+        }
+        // A word exactly filling the last line must lose a char to the '…'.
+        let exact = vec!["x".repeat(36); max + 1].join(" ");
+        let lines = wrapped_error_lines(&exact, 36, max);
+        assert_eq!(lines.last().unwrap().width(), 36);
+        assert!(lines.last().unwrap().ends_with('\u{2026}'));
+        // Wide (2-column) chars: the pop loop must free enough columns.
+        let cjk = "字".repeat(18 * (max + 1));
+        let lines = wrapped_error_lines(&cjk, 36, max);
+        assert!(lines.last().unwrap().ends_with('\u{2026}'));
+        assert!(lines.last().unwrap().width() <= 36);
+    }
+
+    /// Paragraph breaks survive the wrap, and a token wider than the panel
+    /// (a long URL) is broken instead of overflowing.
+    #[test]
+    fn error_wrap_keeps_paragraphs_and_breaks_long_tokens() {
+        let error = "first paragraph\n\nhttps://example.com/very/long/path/that/cannot/fit/in/one/panel/row";
+        let lines = wrapped_error_lines(error, 20, DONE_MAX_BODY_LINES as usize);
+        assert!(lines.contains(&String::new()), "blank paragraph gap kept");
+        for line in &lines {
+            assert!(line.width() <= 20, "line exceeds width: {line:?}");
+        }
+        assert!(lines.len() > 3, "URL must break across rows");
+    }
+
+    /// If the layout hands the panel a shorter rect than requested (routine in
+    /// minimal mode), the body caps at the rows it got — ellipsis on the last
+    /// visible row, bottom border intact.
+    #[test]
+    fn error_render_clamps_to_short_rect() {
+        let error = "word ".repeat(100);
+        let state = BtwOverlayState::Error {
+            question: "q".to_string(),
+            error,
+        };
+        // Desired height is far taller than the 5 rows given.
+        assert!(btw_panel_height(Some(&state), 40) > 5);
+        let buf = render_to_buffer(&state, 40, 5);
+        let last_body = row_text(&buf, 40, 3);
+        assert!(last_body.contains("word"), "last body row used");
+        assert!(
+            last_body.contains('\u{2026}'),
+            "cut body must end in an ellipsis: {last_body}"
+        );
+        assert!(
+            row_text(&buf, 40, 4).contains('╰'),
+            "bottom border must survive the clamp"
+        );
     }
 
     #[test]
@@ -889,6 +1042,7 @@ mod tests {
             &mut model,
             None,
             &[],
+            None,
         );
         let rect = hit
             .rect

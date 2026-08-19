@@ -62,10 +62,13 @@ without the master switch.
 | `GROK_EXTERNAL_OTEL` | `0` | Master switch. Distinct from `GROK_TELEMETRY_ENABLED`, which controls SpaceXAI-internal product analytics — the two govern opposite-pointing data flows. |
 | `OTEL_METRICS_EXPORTER` | `none` | `otlp` \| `console` \| `none`. |
 | `OTEL_LOGS_EXPORTER` | `none` | `otlp` \| `console` \| `none`. Gates the event stream. |
-| `OTEL_EXPORTER_OTLP_PROTOCOL` | `http/protobuf` | `http/protobuf` \| `grpc`. |
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | `http://localhost:4318` for HTTP, `http://localhost:4317` for gRPC | Base endpoint. For `http/protobuf`, `/v1/logs` and `/v1/metrics` are appended per the OTLP spec; for `grpc`, the collector endpoint is used as-is. |
+| `OTEL_EXPORTER_OTLP_PROTOCOL` | `http/protobuf` | `http/protobuf` \| `grpc`. Base protocol for both signals. |
+| `OTEL_EXPORTER_OTLP_LOGS_PROTOCOL` / `..._METRICS_PROTOCOL` | — | Per-signal protocol overrides (same values as the base protocol). Unrecognized values disable the stream. |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | `http://localhost:4318` for HTTP, `http://localhost:4317` for gRPC | Base endpoint. For `http/protobuf`, `/v1/logs` and `/v1/metrics` are appended per the OTLP spec; for `grpc`, the collector endpoint is used as-is. Path appending uses **that signal’s** protocol. |
 | `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` / `..._METRICS_ENDPOINT` | — | Signal-specific overrides, used verbatim. For gRPC these should normally be collector endpoints without `/v1/...` paths. |
 | `OTEL_EXPORTER_OTLP_HEADERS` (+ signal-specific variants) | — | Collector auth (`k=v,k2=v2`). The **only** headers the external exporters send, and the only supported collector-auth mechanism (no config-file headers key — tokens never live on disk). |
+| `OTEL_EXPORTER_OTLP_CERTIFICATE` (+ signal-specific variants) | — | Path to a PEM bundle with additional trusted CA certificate(s) for verifying the collector — for collectors behind a private/corporate CA. Additive to the default trust roots (system store and embedded Mozilla roots). Also settable via `[telemetry] otel_certificate`. |
+| `OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE` / `OTEL_EXPORTER_OTLP_CLIENT_KEY` (+ signal-specific `…_LOGS_…` / `…_METRICS_…` variants) | — | PEM **paths** for mTLS client identity. Both cert and key must be set (base or same signal); half-config is ignored with a warning. Unencrypted PEM keys only. Also settable via `[telemetry] otel_client_certificate` / `otel_client_key`. |
 | `OTEL_EXPORTER_OTLP_TIMEOUT` | `10000` (ms) | Export timeout. |
 | `OTEL_METRIC_EXPORT_INTERVAL` | `60000` (ms) | Metric export interval. |
 | `OTEL_BLRP_SCHEDULE_DELAY` (or alias `OTEL_LOGS_EXPORT_INTERVAL`) | `5000` (ms) | Log batch interval. |
@@ -98,6 +101,10 @@ otel_metrics_exporter = "otlp"
 otel_logs_exporter = "otlp"
 otel_endpoint = "https://collector.corp.example:4318"
 otel_protocol = "http/protobuf"  # or "grpc"
+# Optional PEM *paths* for private-CA trust and mTLS (never PEM contents):
+otel_certificate = "/etc/ssl/corp-ca.pem"
+otel_client_certificate = "/etc/ssl/client.crt"
+otel_client_key = "/etc/ssl/client.key"
 otel_log_user_prompts = false   # admins can pin these via requirements
 otel_log_tool_details = false
 ```
@@ -105,15 +112,45 @@ otel_log_tool_details = false
 The config keys are `otel_*` under `[telemetry]`; the **env vars keep their
 standard OTEL names** (`GROK_EXTERNAL_OTEL`, `OTEL_*`) for ecosystem
 interop, so the two layers use deliberately different namespaces. The
-`otel_protocol` config key maps to `OTEL_EXPORTER_OTLP_PROTOCOL`.
+`otel_protocol` config key maps to `OTEL_EXPORTER_OTLP_PROTOCOL`. Env vars
+win over config file paths for CA and client identity.
 
 There is deliberately no `headers` key: supply collector auth via
-`OTEL_EXPORTER_OTLP_HEADERS` so tokens are never stored on disk.
+`OTEL_EXPORTER_OTLP_HEADERS` so tokens are never stored on disk. Certificate
+and key config keys are **paths only** — never embed private key material
+in TOML.
+
+The external stream exports **logs and metrics only** (no customer-facing
+traces exporter).
 
 Managed deployments can additionally enable org-wide telemetry by distributing
 the `[telemetry]` `otel_*` keys through `grok setup` managed config /
 requirements pins, or force-disable it fleet-wide with the same local config
 layers (`external_otel_disabled`, content-gate locks).
+
+## Startup suppression (why nothing arrives for the first few seconds)
+
+Because xAI can force-disable this stream fleet-wide, the CLI holds emission
+closed at startup until it knows whether that switch is set — it fetches the
+fleet policy from `/v1/settings` and only then starts exporting. In a healthy
+setup that is well under a second and invisible.
+
+**The wait is bounded**, so a deployment that cannot reach xAI still exports:
+
+- If no fleet policy can apply at all — `[features] remote_fetch = false`, or
+  `[endpoints] cli_chat_proxy_base_url` points somewhere other than xAI — the
+  stream starts immediately, governed by your local configuration.
+- If the policy fetch fails or never completes (firewalled host, offline
+  laptop), emission starts anyway once the attempt is exhausted, and in all
+  cases no later than 30 seconds after startup.
+
+A fleet policy that arrives afterwards still applies; it can only ever
+*tighten* (disable the stream or force the content gates off), never enable
+something your local configuration did not.
+
+If your collector receives nothing at all, check the debug log
+(`grok --debug`) for `external otel:` lines — they record whether the stream
+resolved its configuration, and whether it is exporting or suppressed.
 
 ## Resource attributes
 
@@ -140,6 +177,25 @@ events only, never metrics.
 | `grok_code.tool.decision` | `{decision}` | `tool_name`, `decision` = `allow` \| `deny` \| `cancelled` \| `followup`, `access_kind`, `permission_mode` |
 | `grok_code.tool.usage` | `{call}` | `tool_name`, `outcome` |
 | `grok_code.error.count` | `{error}` | `error_category`, `model` |
+| `grok_code.startup.total` | `ms` | `outcome` = `ok` \| `timeout` \| `error`; `auth_mode` |
+| `grok_code.startup.phase_duration` | `ms` | `phase`, `outcome`, `auth_mode` |
+| `grok_code.startup.timeout` | `{timeout}` | `stuck_in`, `auth_mode` |
+
+`startup.total` measures process start to a usable session, recorded once per
+process; `outcome` = `timeout` or `error` means startup ended without one.
+`phase_duration` breaks the connect attempt down by step (`load_config`,
+`managed_policy`, `bootstrap`, `model_catalog`, `spawn_worker`,
+`leader_connect`, `acp_initialize`, `eager_auth`); filter on its `outcome`
+(`ok` | `timeout` | `cancelled` | `error`) so truncated samples do not skew
+`ok` percentiles. The later `app_init`
+and `session_create` phases appear in the log timeline and the summary
+strings, not in this metric. `stuck_in` on a timeout names the step that had
+not finished. That is often not the step that took the longest, because a step
+that runs without pausing finishes before the timeout is recorded. The error
+message Grok prints names the longest step instead, so the two can name
+different steps for the same timeout. Use `phase_duration` to compare them.
+`auth_mode` is `personal`, `team`, `deployment`, or `unknown`:
+startup cost differs by kind, so split by it before comparing.
 
 There is no `cost.usage` metric: join `grok_code.token.usage` with your own
 price sheet. `lines_of_code.count` and `active_time.total` are planned for a
@@ -169,7 +225,7 @@ active.
 | `grok_code.tool_decision` | `tool_name`, `decision`, `access_kind`, `permission_mode`, `source` |
 | `grok_code.mcp_server_connection` | `status`, `transport_type`, `duration_ms`, `tool_count?`, `error_type?`; `mcp_server.name` (**details**; collapsed to `mcp_server` otherwise) |
 | `grok_code.permission_mode_changed` | `to_mode`, `trigger` |
-| `grok_code.skill_activated` | `skill_source`; `skill.name` (**details**) |
+| `grok_code.skill_activated` | `skill_source`, `trigger` = `slash_command` \| `skill_md_read` \| `skill_tool`; `skill.name` (**details**) |
 | `grok_code.plugin_loaded` | `install_kind?`, `success`, `error_category?`; `plugin_name` (**details**) |
 | `grok_code.compaction` | `duration_ms`, `tokens_before`, `tokens_after`, `model?` |
 | `grok_code.subagent` | `phase` = `launched` \| `completed`, `subagent_type?`, `outcome?`, `duration_ms?` |

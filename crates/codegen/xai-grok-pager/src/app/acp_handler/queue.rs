@@ -43,6 +43,10 @@ pub(super) struct PromptCompletePayload {
     /// "Turn cancelled" marker); stamped top-level, absent on older shells.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) cancel_trigger: Option<String>,
+    /// Why a cancelled turn was cancelled (`"HookDenied"` picks the
+    /// blocked-by-hook marker); stamped top-level, absent on older shells.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) cancellation_category: Option<String>,
     /// `_meta` extension point — parsed defensively as a trigger fallback.
     #[serde(default, rename = "_meta", skip_serializing_if = "Option::is_none")]
     pub(super) meta: Option<serde_json::Value>,
@@ -54,9 +58,25 @@ impl PromptCompletePayload {
     /// `_meta.cancelTrigger` (the envelope shape of the durable rail).
     /// `None` (older shells) means a normal cancel.
     pub(super) fn cancel_trigger(&self) -> Option<&str> {
-        self.cancel_trigger
-            .as_deref()
-            .or_else(|| self.meta.as_ref()?.get("cancelTrigger")?.as_str())
+        self.cancel_trigger.as_deref().or_else(|| {
+            self.meta
+                .as_ref()?
+                .get(super::super::turn_completion::CANCEL_TRIGGER_KEY)?
+                .as_str()
+        })
+    }
+
+    /// The cancellation category (`"HookDenied"` picks the blocked-by-hook
+    /// marker), wherever it was stamped: the top-level field (the shell's
+    /// broadcast) with the `_meta` envelope shape as fallback. `None` (older
+    /// shells / plain user cancels) keeps the user-cancel copy.
+    pub(super) fn cancellation_category(&self) -> Option<&str> {
+        self.cancellation_category.as_deref().or_else(|| {
+            self.meta
+                .as_ref()?
+                .get(super::super::turn_completion::CANCELLATION_CATEGORY_KEY)?
+                .as_str()
+        })
     }
 }
 
@@ -167,6 +187,13 @@ pub(super) fn handle_queue_changed(notif: &acp::ExtNotification, app: &mut AppVi
                         && stashed_pid.as_deref() != Some(pid.as_str())
                         && !raw_entries.iter().any(|(eid, _)| eid == *pid)
                         && !agent.optimistic_queue_ids.contains(*pid)
+                        // An active-goal Send Now painted block awaiting its
+                        // interjection claim: its row legitimately vanishes from
+                        // the broadcast the instant the shell converts the Send
+                        // Now into an interjection, so absence here is expected.
+                        // Keep it in place for `handle_interjection` to convert;
+                        // retiring it would drop and re-push it at the end.
+                        && !agent.is_send_now_awaiting_interjection_claim(pid)
                 })
                 .cloned()
                 .collect();
@@ -219,6 +246,31 @@ pub(super) fn handle_queue_changed(notif: &acp::ExtNotification, app: &mut AppVi
                     expected_version,
                     new_text: None,
                 });
+        }
+    }
+
+    // Wake-turn marker reconcile: `running_prompt_id` is authoritative. A
+    // broadcast naming a wake prompt offers the stop affordance even before
+    // its first delta; any other value retires a stale marker (recovery for
+    // a lost wake terminal).
+    if let Some(aid) = agent_id
+        && let Some(agent) = app.agents.get_mut(&aid)
+    {
+        let running = running_prompt_id.as_deref();
+        if agent
+            .running_wake_turn
+            .as_ref()
+            .is_some_and(|wake| Some(wake.prompt_id.as_str()) != running)
+        {
+            agent.running_wake_turn = None;
+        }
+        if let Some(pid) = running
+            && is_wake_prompt(pid)
+        {
+            // The broadcast is authoritative: the shell says this wake is
+            // running, so an earlier terminal's record no longer applies.
+            agent.finished_wake_prompts.remove(pid);
+            agent.note_streaming_wake_turn(pid);
         }
     }
 
@@ -415,10 +467,13 @@ pub(super) fn handle_prompt_complete(notif: &acp::ExtNotification, app: &mut App
     let outcome = super::super::turn_completion::finalize_turn_from_terminal(
         agent,
         session_id,
-        payload.prompt_id.as_deref(),
-        payload.stop_reason.as_deref(),
-        payload.agent_result.as_deref(),
-        payload.cancel_trigger(),
+        super::super::turn_completion::TerminalSignal {
+            prompt_id: payload.prompt_id.as_deref(),
+            stop_reason: payload.stop_reason.as_deref(),
+            agent_result: payload.agent_result.as_deref(),
+            cancel_trigger: payload.cancel_trigger(),
+            cancellation_category: payload.cancellation_category(),
+        },
     );
     super::super::turn_completion::apply_terminal_outcome(outcome, app, id, is_active)
 }

@@ -1,5 +1,5 @@
 //! Subagent lifecycle soak: churn spawn/run/completion/eviction and assert
-//! threads, fds, and heap/RSS reach steady state. A stub `ChildRunner` drives
+//! threads, open files, and heap/RSS reach steady state. A stub `ChildRunner` drives
 //! the real coordinator/transport.
 //!
 //!   SUBAGENT_SOAK_CYCLES=20000 cargo test -p xai-grok-tools \
@@ -21,6 +21,7 @@ use tokio_util::sync::CancellationToken;
 
 use xai_grok_test_support::env::env_parse;
 use xai_grok_test_support::resources::{ResourceGrowth, ResourceSnapshot};
+use xai_grok_tools::implementations::grok_build::task::admission::SubagentLimits;
 use xai_grok_tools::implementations::grok_build::task::backend::{ChannelBackend, SubagentBackend};
 use xai_grok_tools::implementations::grok_build::task::coordinator::{
     ChildCompletion, ChildControl, ChildRunOutput, ChildRunRequest, ChildRunner, CoordinatorConfig,
@@ -45,7 +46,7 @@ impl Metric {
         match self {
             Metric::Rss => "rss",
             Metric::Threads => "threads",
-            Metric::Fds => "fds",
+            Metric::Fds => "open_files",
         }
     }
 
@@ -54,7 +55,7 @@ impl Metric {
         match self {
             Metric::Rss => "rss_bytes",
             Metric::Threads => "threads",
-            Metric::Fds => "fds",
+            Metric::Fds => "open_files",
         }
     }
 
@@ -69,7 +70,7 @@ impl Metric {
         match self {
             Metric::Rss => bounds.max_rss_growth_mib as f64,
             Metric::Threads => bounds.max_thread_growth as f64,
-            Metric::Fds => bounds.max_fd_growth as f64,
+            Metric::Fds => bounds.max_open_files_growth as f64,
         }
     }
 
@@ -81,8 +82,11 @@ impl Metric {
         }
     }
 
-    /// RSS is sampled on every unix; thread and fd counts are Linux-only.
-    fn expected_on_this_platform(self) -> bool {
+    /// Where a metric must be present and within budget. RSS everywhere;
+    /// threads and open files only on Linux — macOS now samples threads too,
+    /// but the budgets are tuned against Linux nightlies, so a macOS sample
+    /// lands in the summary without being enforced.
+    fn budgeted_on_this_platform(self) -> bool {
         match self {
             Metric::Rss => true,
             Metric::Threads | Metric::Fds => cfg!(target_os = "linux"),
@@ -100,22 +104,30 @@ impl MetricValue for ResourceSnapshot {
     fn value_of(&self, metric: Metric) -> Option<usize> {
         // Destructure so a new resource field is a compile error here, not a
         // silently dropped metric.
-        let ResourceSnapshot { rss, threads, fds } = *self;
+        let ResourceSnapshot {
+            rss,
+            threads,
+            open_files,
+        } = *self;
         match metric {
             Metric::Rss => rss,
             Metric::Threads => threads,
-            Metric::Fds => fds,
+            Metric::Fds => open_files,
         }
     }
 }
 
 impl MetricValue for ResourceGrowth {
     fn value_of(&self, metric: Metric) -> Option<usize> {
-        let ResourceGrowth { rss, threads, fds } = *self;
+        let ResourceGrowth {
+            rss,
+            threads,
+            open_files,
+        } = *self;
         match metric {
             Metric::Rss => rss,
             Metric::Threads => threads,
-            Metric::Fds => fds,
+            Metric::Fds => open_files,
         }
     }
 }
@@ -172,7 +184,7 @@ struct Bounds {
     measure: u64,
     concurrency: u64,
     max_thread_growth: u64,
-    max_fd_growth: u64,
+    max_open_files_growth: u64,
     max_rss_growth_mib: u64,
     max_blocks_per_cycle: f64,
     max_bytes_per_cycle: f64,
@@ -187,9 +199,9 @@ impl Bounds {
             warmup: env_parse("SUBAGENT_SOAK_WARMUP", MAX_COMPLETED_ENTRIES as u64),
             measure: env_parse("SUBAGENT_SOAK_CYCLES", 512u64),
             concurrency: env_parse("SUBAGENT_SOAK_CONCURRENCY", 16u64),
-            // RSS is looser than threads and fds to absorb allocator noise.
+            // RSS is looser than threads and open files to absorb allocator noise.
             max_thread_growth: env_parse("SUBAGENT_SOAK_MAX_THREAD_GROWTH", 8u64),
-            max_fd_growth: env_parse("SUBAGENT_SOAK_MAX_FD_GROWTH", 16u64),
+            max_open_files_growth: env_parse("SUBAGENT_SOAK_MAX_OPEN_FILES_GROWTH", 16u64),
             max_rss_growth_mib: env_parse("SUBAGENT_SOAK_MAX_RSS_GROWTH_MIB", 256u64),
             max_blocks_per_cycle: env_parse("SUBAGENT_SOAK_MAX_BLOCKS_PER_CYCLE", 2.0f64),
             max_bytes_per_cycle: env_parse("SUBAGENT_SOAK_MAX_BYTES_PER_CYCLE", 4096.0f64),
@@ -221,11 +233,13 @@ fn serialize_counts<S: Serializer>(
         pending,
         active,
         completed,
+        queued,
     } = counts;
     let entries = [
         ("pending", pending),
         ("active", active),
         ("completed", completed),
+        ("queued", queued),
     ];
     let mut map = serializer.serialize_map(Some(entries.len()))?;
     for (key, value) in entries {
@@ -310,6 +324,8 @@ impl ChildRunner for SoakRunner {
                 request,
                 cancellation,
                 reporter,
+                queued_for: _,
+                session_running: _,
             } = run;
             let promoted = reporter
                 .started(StartedChild {
@@ -494,20 +510,24 @@ async fn measure(
     }
 }
 
-/// Takes `expected` as a parameter so the skip arm is testable on any platform.
+/// Takes `budgeted` as a parameter so both arms are testable on any platform.
+/// An unbudgeted metric never fails: missing is fine, and a present value
+/// (macOS thread counts) is informational, not measured against a bound
+/// tuned for another platform.
 fn metric_failure(
     metric: Metric,
     value: Option<usize>,
-    expected: bool,
+    budgeted: bool,
     bounds: &Bounds,
 ) -> Option<String> {
+    if !budgeted {
+        return None;
+    }
     let Some(raw) = value else {
-        return expected.then(|| {
-            format!(
-                "{}: growth sample unavailable; the soak cannot bound it",
-                metric.label()
-            )
-        });
+        return Some(format!(
+            "{}: growth sample unavailable; the soak cannot bound it",
+            metric.label()
+        ));
     };
     let growth = metric.growth_in_budget_unit(raw);
     let budget = metric.budget(bounds);
@@ -552,8 +572,8 @@ fn check_bounds(bounds: &Bounds, m: &Measurement) -> Vec<String> {
     }
 
     for metric in Metric::iter() {
-        let expected = metric.expected_on_this_platform();
-        if let Some(f) = metric_failure(metric, m.growth.value_of(metric), expected, bounds) {
+        let budgeted = metric.budgeted_on_this_platform();
+        if let Some(f) = metric_failure(metric, m.growth.value_of(metric), budgeted, bounds) {
             failures.push(f);
         }
     }
@@ -595,7 +615,7 @@ fn assert_bounds(bounds: &Bounds, m: &Measurement) {
 /// Keep this the only test in the binary that creates a `dhat::Profiler`.
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "subagent soak; run with --ignored (SUBAGENT_SOAK_CYCLES bounds the measured window)"]
-async fn subagent_lifecycle_soak_bounds_threads_fds_and_heap() {
+async fn subagent_lifecycle_soak_bounds_threads_open_files_and_heap() {
     #[cfg(feature = "dhat-heap")]
     let _profiler = dhat::Profiler::builder().testing().build();
 
@@ -605,8 +625,14 @@ async fn subagent_lifecycle_soak_bounds_threads_fds_and_heap() {
     local
         .run_until(async move {
             let (command_tx, command_rx) = tokio::sync::mpsc::unbounded_channel();
+            // The soak measures registry churn, not admission: keep every
+            // spawn unthrottled so cycle counts stay resource-bound.
             let config = CoordinatorConfig {
                 foreground_budget: Duration::from_secs(600),
+                limits: SubagentLimits {
+                    max_concurrent: usize::MAX,
+                    ..SubagentLimits::default()
+                },
                 ..CoordinatorConfig::default()
             };
             let gate = Arc::new(tokio::sync::Semaphore::new(0));
@@ -646,7 +672,7 @@ mod tests {
         let snapshot = ResourceSnapshot {
             rss: Some(11),
             threads: Some(22),
-            fds: Some(33),
+            open_files: Some(33),
         };
         assert_eq!(snapshot.value_of(Metric::Rss), Some(11));
         assert_eq!(snapshot.value_of(Metric::Threads), Some(22));
@@ -655,7 +681,7 @@ mod tests {
         let growth = ResourceGrowth {
             rss: Some(1),
             threads: None,
-            fds: Some(3),
+            open_files: Some(3),
         };
         assert_eq!(growth.value_of(Metric::Rss), Some(1));
         assert_eq!(growth.value_of(Metric::Threads), None);
@@ -669,10 +695,10 @@ mod tests {
         let snapshot = ResourceSnapshot {
             rss: Some(1),
             threads: None,
-            fds: Some(3),
+            open_files: Some(3),
         };
         let json = serde_json::to_string(&Wrap(snapshot)).expect("snapshot serializes");
-        assert_eq!(json, r#"{"rss_bytes":1,"threads":null,"fds":3}"#);
+        assert_eq!(json, r#"{"rss_bytes":1,"threads":null,"open_files":3}"#);
     }
 
     #[test]
@@ -696,7 +722,7 @@ mod tests {
             measure: 0,
             concurrency: 0,
             max_thread_growth: 3,
-            max_fd_growth: 5,
+            max_open_files_growth: 5,
             max_rss_growth_mib: 7,
             max_blocks_per_cycle: 1.0,
             max_bytes_per_cycle: 2.0,
@@ -729,7 +755,7 @@ mod tests {
             measure: 4,
             concurrency: 4,
             max_thread_growth: 100,
-            max_fd_growth: 100,
+            max_open_files_growth: 100,
             max_rss_growth_mib: 100,
             max_blocks_per_cycle: 10.0,
             max_bytes_per_cycle: 10_000.0,
@@ -741,7 +767,7 @@ mod tests {
         ResourceGrowth {
             rss: Some(0),
             threads: Some(0),
-            fds: Some(0),
+            open_files: Some(0),
         }
     }
 
@@ -754,6 +780,7 @@ mod tests {
                 pending: 0,
                 active: 0,
                 completed: 0,
+                queued: 0,
             },
             heap,
             quiesced: true,
@@ -771,7 +798,7 @@ mod tests {
         let growth = ResourceGrowth {
             rss: None,
             threads: Some(0),
-            fds: Some(0),
+            open_files: Some(0),
         };
         let failures = check_bounds(&generous_bounds(), &drained(growth, None));
         assert!(
@@ -783,9 +810,12 @@ mod tests {
     }
 
     #[test]
-    fn metric_failure_covers_expected_missing_unexpected_missing_and_budget() {
+    fn metric_failure_covers_unbudgeted_missing_and_budget_arms() {
         let b = generous_bounds();
         assert!(metric_failure(Metric::Threads, None, false, &b).is_none());
+        // An unbudgeted metric with a present, over-budget value stays
+        // informational (macOS thread counts against Linux-tuned bounds).
+        assert!(metric_failure(Metric::Threads, Some(usize::MAX), false, &b).is_none());
         assert!(
             metric_failure(Metric::Rss, None, true, &b)
                 .unwrap()
@@ -814,7 +844,7 @@ mod tests {
         let growth = ResourceGrowth {
             rss: Some(200 * 1024 * 1024),
             threads: Some(0),
-            fds: Some(0),
+            open_files: Some(0),
         };
         let failures = check_bounds(&generous_bounds(), &drained(growth, None));
         assert!(
@@ -828,7 +858,7 @@ mod tests {
         let growth = ResourceGrowth {
             rss: Some(100 * 1024 * 1024),
             threads: Some(100),
-            fds: Some(100),
+            open_files: Some(100),
         };
         assert!(check_bounds(&generous_bounds(), &drained(growth, None)).is_empty());
     }
@@ -884,22 +914,28 @@ mod tests {
         );
     }
 
+    /// Thread and open-file budgets only bite on Linux; elsewhere the same
+    /// over-budget growth is informational and must not fail the soak.
     #[test]
-    fn check_bounds_flags_thread_and_fd_over_budget() {
+    fn check_bounds_flags_thread_and_open_files_over_budget_on_linux_only() {
         let growth = ResourceGrowth {
             rss: Some(0),
             threads: Some(200),
-            fds: Some(200),
+            open_files: Some(200),
         };
         let failures = check_bounds(&generous_bounds(), &drained(growth, None));
-        assert!(
-            failures.iter().any(|f| f.starts_with("threads:")),
-            "{failures:?}"
-        );
-        assert!(
-            failures.iter().any(|f| f.starts_with("fds:")),
-            "{failures:?}"
-        );
+        if cfg!(target_os = "linux") {
+            assert!(
+                failures.iter().any(|f| f.starts_with("threads:")),
+                "{failures:?}"
+            );
+            assert!(
+                failures.iter().any(|f| f.starts_with("open_files:")),
+                "{failures:?}"
+            );
+        } else {
+            assert!(failures.is_empty(), "{failures:?}");
+        }
     }
 
     #[test]

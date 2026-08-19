@@ -6,7 +6,7 @@ use super::*;
 #[derive(Debug)]
 pub(super) struct MemoryFlushSnapshot {
     counts: xai_chat_state::ConversationCounts,
-    chat_history: Vec<ChatRequestMessage>,
+    chat_history: Vec<ConversationItem>,
 }
 
 /// Build first-turn injection backend params without mutating the shared
@@ -22,7 +22,7 @@ pub(super) fn build_initial_injection_backend_params(
     initial_injection_config: &crate::config::MemoryInitialInjectionConfig,
 ) -> (crate::session::memory::MemoryBackendParams, f64) {
     let mut injection_params = params.clone();
-    injection_params.search_source = "injection";
+    injection_params.search_source = crate::session::memory::MemorySearchSource::Injection;
     let effective_min_score = initial_injection_config
         .min_score
         .map(|min_score| {
@@ -76,6 +76,7 @@ impl SessionActor {
         xai_grok_telemetry::session_ctx::log_event(
             xai_grok_telemetry::memory_telemetry::MemorySessionSummary {
                 session_id: self.session_info.id.to_string(),
+                memory_enabled: self.memory.is_enabled(),
                 session_duration_secs: self.session_start.elapsed().as_secs(),
                 flush_count: telem.flush_count,
                 flush_success_count: telem.flush_success_count,
@@ -91,6 +92,80 @@ impl SessionActor {
                 dream_error_count: telem.dream_error_count,
             },
         );
+    }
+
+    /// Session-end memory save, empty-session-gated dream, and memory summary
+    /// telemetry. Shared by Shutdown and channel-closed so the dream gate cannot
+    /// drift between exit arms.
+    ///
+    /// `log_suffix` is appended to the `MEMORY_SESSION_END:` log line so each
+    /// arm keeps a distinct reason string in logs.
+    pub(super) async fn run_session_end_memory_pipeline(&self, log_suffix: &str) {
+        let mut session_end_result = "disabled";
+        let mut total_chunks_at_end = 0usize;
+        // Dream consolidates *prior* logs. Run after Written/Failed, or when
+        // save was Skipped for config (`save_on_end=false`) but the session
+        // still meets the size threshold. Empty/brief sessions stay off.
+        let mut run_exit_dream = false;
+        if !self.startup_hints.is_subagent {
+            if let Some(storage) = self.memory.storage() {
+                let conversation = self.chat_state_handle.get_conversation().await;
+                let result = crate::session::memory::hooks::on_session_end(
+                    &storage,
+                    &conversation,
+                    &self.session_info.id.0,
+                    self.memory.save_on_end,
+                );
+                match &result {
+                    crate::session::memory::hooks::SessionEndResult::Written(path_str) => {
+                        session_end_result = "written";
+                        run_exit_dream = true;
+                        self.reindex_and_embed(std::path::Path::new(path_str), "session")
+                            .await;
+                        self.send_xai_notification(XaiSessionUpdate::MemorySessionSaved {
+                            path: path_str.clone(),
+                        })
+                        .await;
+                    }
+                    crate::session::memory::hooks::SessionEndResult::Skipped => {
+                        session_end_result = "skipped";
+                        // `Skipped` also means save_on_end=false — still dream
+                        // when the conversation is substantial.
+                        run_exit_dream =
+                            crate::session::memory::hooks::queries_meeting_session_end_threshold(
+                                &conversation,
+                            )
+                            .is_some();
+                    }
+                    crate::session::memory::hooks::SessionEndResult::Failed(_) => {
+                        session_end_result = "failed";
+                        run_exit_dream = true;
+                    }
+                }
+                total_chunks_at_end = storage.total_chunk_count();
+                let telem = self.memory.telemetry_snapshot();
+                let msg = format!("MEMORY_SESSION_END: {log_suffix}");
+                tracing::info!(
+                    target: xai_grok_telemetry::memory_log::TARGET,
+                    result = ?result,
+                    tool_searches = telem.tool_search_count,
+                    injection_searches = telem.injection_count,
+                    recovery_searches = telem.compaction_recovery_count,
+                    "{msg}"
+                );
+            }
+        } else {
+            tracing::debug!(
+                target: xai_grok_telemetry::memory_log::TARGET,
+                "MEMORY_SUBAGENT_SKIP: skipping on_session_end for subagent session"
+            );
+            return;
+        }
+        if run_exit_dream {
+            self.maybe_run_dream().await;
+        }
+        let telem = self.memory.telemetry_snapshot();
+        self.emit_memory_session_summary(&telem, total_chunks_at_end, session_end_result);
     }
 
     /// Reindex a single file and embed any new chunks.
@@ -361,7 +436,7 @@ impl SessionActor {
         trigger: &str,
         snapshot: Option<MemoryFlushSnapshot>,
     ) -> bool {
-        use crate::session::helpers::memory_flush::*;
+        use xai_grok_memory::flush::*;
 
         // Atomically acquire the flushing lock. If another flush is already
         // running (idle timer, pre-compaction, or user-requested), skip.
@@ -404,7 +479,10 @@ impl SessionActor {
                 tool = counts.tool_result,
                 total = counts.total,
             );
-            let recent = super::helpers::memory_flush::select_flush_window(chat_history, 20);
+            let recent = crate::session::helpers::memory_flush_window::select_flush_window(
+                chat_history,
+                20,
+            );
 
             let flush_count = self.memory.flush_count.load(std::sync::atomic::Ordering::Relaxed);
             let system_prompt = if flush_count > 0 {
@@ -422,7 +500,9 @@ impl SessionActor {
                 "MEMORY_FLUSH: sending {n} recent messages to model (+ system prompt + user closer)",
                 n = recent.len(),
             );
-            items.extend(recent.into_iter().map(ConversationItem::from));
+            items.extend(
+                xai_chat_state::compaction_utils::ModelRequestHistory::from_raw(recent).into_items(),
+            );
             items.push(ConversationItem::user(
                 "Now write the memory summary as described in the system prompt.",
             ));
@@ -612,16 +692,6 @@ impl SessionActor {
             },
         );
 
-        // Rolling session summary on each flush — crash-safe telemetry.
-        let total_chunks = self
-            .memory
-            .storage
-            .borrow()
-            .as_ref()
-            .map_or(0, |s| s.total_chunk_count());
-        let telem = self.memory.telemetry_snapshot();
-        self.emit_memory_session_summary(&telem, total_chunks, "flush_checkpoint");
-
         let flush_trigger = match trigger {
             "slash_command" => xai_grok_telemetry::events::MemoryFlushTrigger::SlashCommand,
             "interval" => xai_grok_telemetry::events::MemoryFlushTrigger::Interval,
@@ -650,9 +720,8 @@ impl SessionActor {
             self.chat_state_handle.get_conversation_counts(),
             self.chat_state_handle.get_conversation(),
         );
-        let chat_history = crate::sampling::conversation_to_chat_messages(
-            xai_chat_state::compaction_utils::prepare_conversation_for_summarization(conversation),
-        );
+        let chat_history =
+            xai_chat_state::compaction_utils::prepare_conversation_for_summarization(conversation);
         MemoryFlushSnapshot {
             counts,
             chat_history,

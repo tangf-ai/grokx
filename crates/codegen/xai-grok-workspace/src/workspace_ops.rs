@@ -30,7 +30,6 @@ use std::sync::atomic::AtomicBool;
 use xai_computer_hub_sdk::ToolHarness;
 use xai_grok_tools::types::output::ToolRunResult;
 use xai_grok_workspace_client::{WorkspaceClient, is_transport_fatal};
-pub use xai_grok_workspace_types::rpc::WorkspaceRpc;
 pub use xai_grok_workspace_types::rpc::agents_md::DiscoverAgentsMdReq;
 pub use xai_grok_workspace_types::rpc::code_nav::{
     CodeFindDefinitionsReq, CodeFindReferencesReq, CodeGotoDefinitionReq, CodeGotoReferencesReq,
@@ -46,10 +45,10 @@ pub use xai_grok_workspace_types::rpc::git::{
     BinaryFileInfoData, CheckoutCommitResponse, CommitWithPatchData, DetectVcsKindReq,
     DiffStatsSummary, GitBranchesReq, GitCheckoutCommitReq, GitCheckoutReq, GitCollectChangesReq,
     GitCollectChangesResponse, GitCommitReq, GitCurrentCommitReq, GitDiffReq, GitDiscardReq,
-    GitFilesReq, GitInfoReq, GitResolveRootReq, GitStageContentReq, GitStageReq, GitStashReq,
-    GitStatusExtReq, GitStatusExtResponse, GitStatusFormat, GitStatusReq, GitSyncBaseReq,
-    GitUnstageReq, IdentityData, PublicBaseData, RepoInfo, UNTRACKED_CONTENT_THRESHOLD,
-    UncommittedChangesData, UntrackedFileData,
+    GitEnsureBindingReq, GitFilesReq, GitInfoReq, GitMergeToMainReq, GitPushReq, GitResolveRootReq,
+    GitStageContentReq, GitStageReq, GitStashReq, GitStatusExtReq, GitStatusExtResponse,
+    GitStatusFormat, GitStatusReq, GitSyncBaseReq, GitUnstageReq, IdentityData, PublicBaseData,
+    RepoInfo, UNTRACKED_CONTENT_THRESHOLD, UncommittedChangesData, UntrackedFileData,
 };
 pub use xai_grok_workspace_types::rpc::hooks::{
     HookEventNameWire, HookRegistryReq, HookRegistryWire, HookSpecWire,
@@ -62,6 +61,9 @@ pub use xai_grok_workspace_types::rpc::hunks::{
     HunkGetStagedFilesReq, HunkLineInfoWire, HunkSingleActionReq, HunkSourceWire,
     HunkTurnActionReq, HunkWire, SessionStatsWire, SessionSummaryWire, TurnSummaryWire,
 };
+pub use xai_grok_workspace_types::rpc::repos::{
+    ProvisionedRepo, RepoManifest, ReposListReq, ReposListResponse,
+};
 pub use xai_grok_workspace_types::rpc::search::{FuzzyChangeReq, FuzzyCloseReq, FuzzyOpenReq};
 pub use xai_grok_workspace_types::rpc::session::{BeginPromptReq, EndPromptReq, RewindToReq};
 pub use xai_grok_workspace_types::rpc::skills::DiscoverSkillsReq;
@@ -71,12 +73,17 @@ pub use xai_grok_workspace_types::rpc::worktree::{
     PrepareWorktreeFromWorktreeResponse, WorktreeDbPathReq, WorktreeDbPathResponse,
     WorktreeDbRebuildReq, WorktreeDbStatsReq, WorktreeGcReq, WorktreeListReq, WorktreeShowReq,
 };
+pub use xai_grok_workspace_types::rpc::{RpcActivityClass, WorkspaceRpc};
 /// Implements [`WorkspaceRpc`] for request types whose responses
 /// reference crate-internal types and so cannot live in the types crate.
+/// The activity class is a required argument for the same reason the trait
+/// const has no default: every method's author must decide.
 macro_rules! workspace_rpc {
-    ($ty:ty, $method:literal, $resp:ty) => {
+    ($ty:ty, $method:literal, $resp:ty, $activity:ident) => {
         impl crate::workspace_ops::WorkspaceRpc for $ty {
             const METHOD: &'static str = $method;
+            const ACTIVITY: crate::workspace_ops::RpcActivityClass =
+                crate::workspace_ops::RpcActivityClass::$activity;
             type Response = $resp;
         }
     };
@@ -137,6 +144,7 @@ pub struct GetRewindPointsReq {
 }
 impl WorkspaceRpc for GetRewindPointsReq {
     const METHOD: &'static str = "workspace.get_rewind_points";
+    const ACTIVITY: RpcActivityClass = RpcActivityClass::Read;
     type Response = Vec<crate::session::file_state::RewindPoint>;
 }
 fn hunk_line_info_to_wire(info: &xai_hunk_tracker::types::HunkLineInfo) -> HunkLineInfoWire {
@@ -252,17 +260,117 @@ fn session_tracker(
         .ok_or_else(|| WorkspaceError::SessionNotFound(sid.to_owned()))?;
     Ok(session.hunk_tracker().clone())
 }
+/// Ancestor hop budget when locating `.grok/repos.json`.
+///
+/// Grove rewrite is one hop (`/workspace/app` → `/workspace`). Desktop
+/// workspaces can sit deeper than that; this is a backstop only. Primary
+/// bounds are the sandbox root (`/workspace`) and the user-global grok home.
+const REPOS_MANIFEST_MAX_ANCESTOR_HOPS: usize = 16;
+/// Directories to probe for [`REPOS_MANIFEST_RELATIVE_PATH`], starting at
+/// `root_cwd` (post-grove-rewrite agent cwd) and walking up.
+///
+/// Does not escape the sandbox workspace or load `~/.grok/repos.json` /
+/// `$GROK_HOME/repos.json` (user-global, not a provisioned workspace).
+fn repos_manifest_search_dirs(start: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let rel = xai_grok_workspace_types::rpc::repos::REPOS_MANIFEST_RELATIVE_PATH;
+    #[allow(deprecated)]
+    let home = std::env::home_dir();
+    let mut global_manifests = Vec::with_capacity(2);
+    if let Some(v) = std::env::var_os("GROK_HOME")
+        && !v.is_empty()
+    {
+        global_manifests.push(std::path::PathBuf::from(v).join("repos.json"));
+    }
+    if let Some(user_home) = xai_grok_config::user_grok_home() {
+        global_manifests.push(user_home.join("repos.json"));
+    }
+    let mut out = Vec::new();
+    let mut dir = Some(start);
+    for _ in 0..=REPOS_MANIFEST_MAX_ANCESTOR_HOPS {
+        let Some(d) = dir else {
+            break;
+        };
+        let manifest = d.join(rel);
+        if global_manifests.iter().any(|g| g == &manifest) {
+            break;
+        }
+        if home.as_deref() == Some(d) || crate::trust::is_home_dir(d) {
+            break;
+        }
+        out.push(d.to_path_buf());
+        if d == std::path::Path::new("/workspace") {
+            break;
+        }
+        dir = d.parent();
+    }
+    out
+}
+#[async_trait]
+impl WorkspaceOp for ReposListReq {
+    async fn execute(
+        &self,
+        ws: &WorkspaceHandle,
+        _session_id: Option<&str>,
+    ) -> WorkspaceResult<Self::Response> {
+        let rel = xai_grok_workspace_types::rpc::repos::REPOS_MANIFEST_RELATIVE_PATH;
+        let start = ws.root_cwd()?;
+        let mut manifest = RepoManifest::new(Vec::new());
+        for d in repos_manifest_search_dirs(&start) {
+            let path = d.join(rel);
+            match tokio::fs::read(&path).await {
+                Ok(bytes) => {
+                    manifest = RepoManifest::from_json_bytes(&bytes).map_err(|e| {
+                        WorkspaceError::HubError(format!(
+                            "invalid repos manifest at {}: {e}",
+                            path.display()
+                        ))
+                    })?;
+                    break;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(WorkspaceError::HubError(format!(
+                        "failed to read repos manifest at {}: {e}",
+                        path.display()
+                    )));
+                }
+            }
+        }
+        Ok(ReposListResponse {
+            version: manifest.version,
+            repos: manifest.repos,
+        })
+    }
+}
 /// Resolve the directory a git op runs in: the explicit `git_root` when the
 /// caller provides one (the per-session repo, which the desktop sends per
 /// window), else the workspace root. Without this, every session's git
 /// queries/mutations would target the workspace launch directory's repo.
-fn git_op_cwd(
+pub(crate) async fn git_op_cwd(
     ws: &WorkspaceHandle,
     git_root: &Option<std::path::PathBuf>,
 ) -> WorkspaceResult<std::path::PathBuf> {
     match git_root {
         Some(root) => Ok(root.clone()),
         None => ws.root_cwd(),
+    }
+}
+/// Every provisioned mount (or the workspace root when none). Prompt, graph,
+/// fs-notify, and turn-commit walk this list so multi-repo is not primary-only.
+pub(crate) async fn materialized_git_roots(
+    ws: &WorkspaceHandle,
+) -> WorkspaceResult<Vec<std::path::PathBuf>> {
+    let root = ws.root_cwd()?;
+    let manifest = load_repos_manifest(&root).await?;
+    Ok(manifest.materialized_mounts(&root))
+}
+async fn load_repos_manifest(root: &std::path::Path) -> WorkspaceResult<RepoManifest> {
+    let path = root.join(xai_grok_workspace_types::rpc::repos::REPOS_MANIFEST_RELATIVE_PATH);
+    match tokio::fs::read(&path).await {
+        Ok(bytes) => RepoManifest::from_json_bytes(&bytes)
+            .map_err(|e| WorkspaceError::HubError(e.to_string())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(RepoManifest::new(Vec::new())),
+        Err(e) => Err(WorkspaceError::HubError(e.to_string())),
     }
 }
 #[async_trait]
@@ -272,7 +380,7 @@ impl WorkspaceOp for GitStatusExtReq {
         ws: &WorkspaceHandle,
         _session_id: Option<&str>,
     ) -> WorkspaceResult<Self::Response> {
-        let cwd = git_op_cwd(ws, &self.git_root)?;
+        let cwd = git_op_cwd(ws, &self.git_root).await?;
         match self.format {
             GitStatusFormat::Structured => {
                 let data = crate::session::git::status(
@@ -302,7 +410,7 @@ impl WorkspaceOp for GitFilesReq {
         ws: &WorkspaceHandle,
         _session_id: Option<&str>,
     ) -> WorkspaceResult<Self::Response> {
-        let cwd = git_op_cwd(ws, &self.git_root)?;
+        let cwd = git_op_cwd(ws, &self.git_root).await?;
         crate::session::git::read_files(&cwd, &self.paths, &self.version)
             .await
             .map_err(|e| WorkspaceError::HubError(e.to_string()))
@@ -315,7 +423,7 @@ impl WorkspaceOp for GitDiffReq {
         ws: &WorkspaceHandle,
         _session_id: Option<&str>,
     ) -> WorkspaceResult<Self::Response> {
-        let cwd = git_op_cwd(ws, &self.git_root)?;
+        let cwd = git_op_cwd(ws, &self.git_root).await?;
         crate::session::git::diffs(
             &cwd,
             self.paths.as_deref(),
@@ -336,7 +444,7 @@ impl WorkspaceOp for GitStageReq {
         ws: &WorkspaceHandle,
         _session_id: Option<&str>,
     ) -> WorkspaceResult<Self::Response> {
-        let cwd = git_op_cwd(ws, &self.git_root)?;
+        let cwd = git_op_cwd(ws, &self.git_root).await?;
         crate::session::git::stage(&cwd, self.paths.clone())
             .await
             .map_err(|e| WorkspaceError::HubError(e.to_string()))
@@ -349,7 +457,7 @@ impl WorkspaceOp for GitStageContentReq {
         ws: &WorkspaceHandle,
         _session_id: Option<&str>,
     ) -> WorkspaceResult<Self::Response> {
-        let cwd = git_op_cwd(ws, &self.git_root)?;
+        let cwd = git_op_cwd(ws, &self.git_root).await?;
         crate::session::git::stage_content(&cwd, &self.path, &self.content)
             .await
             .map_err(|e| WorkspaceError::HubError(e.to_string()))
@@ -362,7 +470,7 @@ impl WorkspaceOp for GitUnstageReq {
         ws: &WorkspaceHandle,
         _session_id: Option<&str>,
     ) -> WorkspaceResult<Self::Response> {
-        let cwd = git_op_cwd(ws, &self.git_root)?;
+        let cwd = git_op_cwd(ws, &self.git_root).await?;
         crate::session::git::unstage(&cwd, self.paths.clone())
             .await
             .map_err(|e| WorkspaceError::HubError(e.to_string()))
@@ -375,7 +483,7 @@ impl WorkspaceOp for GitDiscardReq {
         ws: &WorkspaceHandle,
         _session_id: Option<&str>,
     ) -> WorkspaceResult<Self::Response> {
-        let cwd = git_op_cwd(ws, &self.git_root)?;
+        let cwd = git_op_cwd(ws, &self.git_root).await?;
         crate::session::git::discard(&cwd, self.paths.clone(), self.scope, self.include_untracked)
             .await
             .map_err(|e| WorkspaceError::HubError(e.to_string()))
@@ -388,7 +496,7 @@ impl WorkspaceOp for GitCommitReq {
         ws: &WorkspaceHandle,
         _session_id: Option<&str>,
     ) -> WorkspaceResult<Self::Response> {
-        let cwd = git_op_cwd(ws, &self.git_root)?;
+        let cwd = git_op_cwd(ws, &self.git_root).await?;
         crate::session::git::commit(&cwd, self)
             .await
             .map_err(|e| WorkspaceError::HubError(e.to_string()))
@@ -401,7 +509,7 @@ impl WorkspaceOp for GitSyncBaseReq {
         ws: &WorkspaceHandle,
         _session_id: Option<&str>,
     ) -> WorkspaceResult<Self::Response> {
-        let cwd = git_op_cwd(ws, &self.git_root)?;
+        let cwd = git_op_cwd(ws, &self.git_root).await?;
         crate::session::git::sync_base(
             &cwd,
             self.base_ref.as_deref(),
@@ -419,8 +527,53 @@ impl WorkspaceOp for GitCheckoutReq {
         ws: &WorkspaceHandle,
         _session_id: Option<&str>,
     ) -> WorkspaceResult<Self::Response> {
-        let cwd = git_op_cwd(ws, &self.git_root)?;
+        let cwd = git_op_cwd(ws, &self.git_root).await?;
         crate::session::git::checkout_branch(&cwd, &self.branch, self.create)
+            .await
+            .map_err(|e| WorkspaceError::HubError(e.to_string()))
+    }
+}
+#[async_trait]
+impl WorkspaceOp for GitEnsureBindingReq {
+    async fn execute(
+        &self,
+        ws: &WorkspaceHandle,
+        _session_id: Option<&str>,
+    ) -> WorkspaceResult<Self::Response> {
+        let cwd = git_op_cwd(ws, &self.git_root).await?;
+        crate::session::git::ensure_binding(&cwd, &self.session_branch, &self.base_ref)
+            .await
+            .map_err(|e| WorkspaceError::HubError(e.to_string()))
+    }
+}
+#[async_trait]
+impl WorkspaceOp for GitMergeToMainReq {
+    async fn execute(
+        &self,
+        ws: &WorkspaceHandle,
+        _session_id: Option<&str>,
+    ) -> WorkspaceResult<Self::Response> {
+        let cwd = git_op_cwd(ws, &self.git_root).await?;
+        let target = self.required_target_branch().ok_or_else(|| {
+            WorkspaceError::HubError(
+                "target_branch is required; omit/empty is rejected (no silent main default)"
+                    .to_string(),
+            )
+        })?;
+        crate::session::git::merge_to_main(&cwd, &self.session_branch, target, self.push)
+            .await
+            .map_err(|e| WorkspaceError::HubError(e.to_string()))
+    }
+}
+#[async_trait]
+impl WorkspaceOp for GitPushReq {
+    async fn execute(
+        &self,
+        ws: &WorkspaceHandle,
+        _session_id: Option<&str>,
+    ) -> WorkspaceResult<Self::Response> {
+        let cwd = git_op_cwd(ws, &self.git_root).await?;
+        crate::session::git::push_branch(&cwd, self.branch.as_deref())
             .await
             .map_err(|e| WorkspaceError::HubError(e.to_string()))
     }
@@ -432,7 +585,7 @@ impl WorkspaceOp for GitStashReq {
         ws: &WorkspaceHandle,
         _session_id: Option<&str>,
     ) -> WorkspaceResult<Self::Response> {
-        let cwd = git_op_cwd(ws, &self.git_root)?;
+        let cwd = git_op_cwd(ws, &self.git_root).await?;
         crate::session::git::stash(&cwd, self.include_untracked)
             .await
             .map_err(|e| WorkspaceError::HubError(e.to_string()))
@@ -445,7 +598,7 @@ impl WorkspaceOp for GitInfoReq {
         ws: &WorkspaceHandle,
         _session_id: Option<&str>,
     ) -> WorkspaceResult<Self::Response> {
-        let cwd = git_op_cwd(ws, &self.git_root)?;
+        let cwd = git_op_cwd(ws, &self.git_root).await?;
         crate::session::git::git_info(&cwd)
             .await
             .map_err(|e| WorkspaceError::HubError(e.to_string()))
@@ -458,7 +611,7 @@ impl WorkspaceOp for GitBranchesReq {
         ws: &WorkspaceHandle,
         _session_id: Option<&str>,
     ) -> WorkspaceResult<Self::Response> {
-        let cwd = git_op_cwd(ws, &self.git_root)?;
+        let cwd = git_op_cwd(ws, &self.git_root).await?;
         crate::session::git::list_branches(&cwd)
             .await
             .map_err(|e| WorkspaceError::HubError(e.to_string()))
@@ -515,70 +668,21 @@ impl WorkspaceOp for GitCheckoutCommitReq {
         _ws: &WorkspaceHandle,
         _session_id: Option<&str>,
     ) -> WorkspaceResult<Self::Response> {
-        use crate::session::git::git_cli;
-        let git_root = &self.git_root;
-        let head_commit = &self.head_commit;
-        if let Some(current) = crate::session::git::get_current_commit(git_root).await
-            && current == *head_commit
-        {
-            return Ok(CheckoutCommitResponse {
-                checked_out: true,
-                stashed: false,
-                fetched: false,
-                error: None,
-            });
-        }
-        let mut stashed = false;
-        if self.stash_if_dirty {
-            let status = git_cli(git_root, &["status", "--porcelain"]).await;
-            if let Ok(output) = &status
-                && !output.trim().is_empty()
-            {
-                let msg = format!("auto-stash before checkout {head_commit}");
-                if git_cli(git_root, &["stash", "push", "-m", &msg])
-                    .await
-                    .is_ok()
-                {
-                    stashed = true;
-                }
-            }
-        }
-        match git_cli(git_root, &["checkout", head_commit]).await {
-            Ok(_) => Ok(CheckoutCommitResponse {
-                checked_out: true,
-                stashed,
-                fetched: false,
-                error: None,
-            }),
-            Err(_) => {
-                let _ = git_cli(git_root, &["fetch", "origin"]).await;
-                match git_cli(git_root, &["checkout", head_commit]).await {
-                    Ok(_) => Ok(CheckoutCommitResponse {
-                        checked_out: true,
-                        stashed,
-                        fetched: true,
-                        error: None,
-                    }),
-                    Err(e) => {
-                        if stashed {
-                            let _ = git_cli(git_root, &["stash", "pop"]).await;
-                        }
-                        Ok(CheckoutCommitResponse {
-                            checked_out: false,
-                            stashed: false,
-                            fetched: true,
-                            error: Some(e.to_string()),
-                        })
-                    }
-                }
-            }
-        }
+        Ok(crate::session::git::checkout_commit_with_fetch(
+            &self.git_root,
+            &self.head_commit,
+            self.stash_if_dirty,
+        )
+        .await)
     }
 }
 workspace_rpc!(
     PrepareWorktreeFromWorktreeReq,
     "workspace.prepare_worktree_from_worktree",
-    PrepareWorktreeFromWorktreeResponse
+    PrepareWorktreeFromWorktreeResponse,
+    // Validation + path resolution only; the fork itself is the (Mutation)
+    // `worktree_create_from_worktree_sync` that follows.
+    Read
 );
 #[async_trait]
 impl WorkspaceOp for PrepareWorktreeFromWorktreeReq {
@@ -959,9 +1063,9 @@ impl WorkspaceOp for PutFilesReq {
     async fn execute(
         &self,
         ws: &WorkspaceHandle,
-        _session_id: Option<&str>,
+        session_id: Option<&str>,
     ) -> WorkspaceResult<Self::Response> {
-        ws.put_files(self.files.clone()).await
+        ws.put_files(session_id, self.files.clone()).await
     }
 }
 #[async_trait]
@@ -969,9 +1073,9 @@ impl WorkspaceOp for GetFilesReq {
     async fn execute(
         &self,
         ws: &WorkspaceHandle,
-        _session_id: Option<&str>,
+        session_id: Option<&str>,
     ) -> WorkspaceResult<Self::Response> {
-        ws.get_files(self.files.clone()).await
+        ws.get_files(session_id, self.files.clone()).await
     }
 }
 #[async_trait]
@@ -979,9 +1083,9 @@ impl WorkspaceOp for ClientFsListReq {
     async fn execute(
         &self,
         ws: &WorkspaceHandle,
-        _session_id: Option<&str>,
+        session_id: Option<&str>,
     ) -> WorkspaceResult<Self::Response> {
-        crate::file_system::client_fs::list(ws, self).await
+        crate::file_system::client_fs::list(ws, session_id, self).await
     }
 }
 #[async_trait]
@@ -989,9 +1093,9 @@ impl WorkspaceOp for ClientFsStatReq {
     async fn execute(
         &self,
         ws: &WorkspaceHandle,
-        _session_id: Option<&str>,
+        session_id: Option<&str>,
     ) -> WorkspaceResult<Self::Response> {
-        crate::file_system::client_fs::stat(ws, self).await
+        crate::file_system::client_fs::stat(ws, session_id, self).await
     }
 }
 #[async_trait]
@@ -999,9 +1103,9 @@ impl WorkspaceOp for ClientFsReadFileReq {
     async fn execute(
         &self,
         ws: &WorkspaceHandle,
-        _session_id: Option<&str>,
+        session_id: Option<&str>,
     ) -> WorkspaceResult<Self::Response> {
-        crate::file_system::client_fs::read_file(ws, self).await
+        crate::file_system::client_fs::read_file(ws, session_id, self).await
     }
 }
 /// Resolve the index root for a code-nav op. Prefers the explicit per-session
@@ -1029,6 +1133,22 @@ fn resolve_index_for_workspace(
     let (handle, _was_new) = ws.get_or_create_codebase_index(index_root.clone());
     Ok((handle, index_root))
 }
+fn resolve_index_for_file(
+    ws: &WorkspaceHandle,
+    root: Option<&std::path::Path>,
+    file: &str,
+) -> WorkspaceResult<(
+    std::sync::Arc<xai_codebase_graph::IndexManagerHandle>,
+    std::path::PathBuf,
+)> {
+    if root.is_none() {
+        let file_path = std::path::Path::new(file);
+        if let Some(handle) = ws.get_covering_codebase_index(file_path) {
+            return Ok((handle, file_path.to_path_buf()));
+        }
+    }
+    resolve_index_for_workspace(ws, root)
+}
 #[async_trait]
 impl WorkspaceOp for CodeGotoDefinitionReq {
     async fn execute(
@@ -1036,7 +1156,7 @@ impl WorkspaceOp for CodeGotoDefinitionReq {
         ws: &WorkspaceHandle,
         _session_id: Option<&str>,
     ) -> WorkspaceResult<Self::Response> {
-        let (handle, _root) = resolve_index_for_workspace(ws, self.root.as_deref())?;
+        let (handle, _root) = resolve_index_for_file(ws, self.root.as_deref(), &self.file)?;
         let result = handle
             .goto_definition(std::path::PathBuf::from(&self.file), self.line, self.col)
             .await
@@ -1051,7 +1171,7 @@ impl WorkspaceOp for CodeGotoReferencesReq {
         ws: &WorkspaceHandle,
         _session_id: Option<&str>,
     ) -> WorkspaceResult<Self::Response> {
-        let (handle, _root) = resolve_index_for_workspace(ws, self.root.as_deref())?;
+        let (handle, _root) = resolve_index_for_file(ws, self.root.as_deref(), &self.file)?;
         let result = handle
             .goto_references(
                 std::path::PathBuf::from(&self.file),
@@ -1449,6 +1569,15 @@ impl WorkspaceOps {
     pub async fn workspace_info(&self) -> WorkspaceResult<Value> {
         self.rpc(&WorkspaceInfoReq {}).await
     }
+    /// Server binary version without an RPC round-trip: own version in
+    /// local mode, the hub bind report in proxy mode (`None` before the
+    /// first bind or against servers predating the field).
+    pub fn server_version(&self) -> Option<String> {
+        match self {
+            Self::Local { .. } => Some(xai_grok_version::VERSION.to_owned()),
+            Self::Proxy { client } => client.server_binary_version(),
+        }
+    }
     /// **DEPRECATED**: Use [`Self::git_status_ext`] with `format: GitStatusFormat::Prompt`
     /// instead. This method will be removed in a future release.
     pub async fn git_status(&self) -> WorkspaceResult<Value> {
@@ -1468,6 +1597,10 @@ impl WorkspaceOps {
         req: &GitStatusExtReq,
     ) -> WorkspaceResult<GitStatusExtResponse> {
         self.dispatch(req, None).await
+    }
+    /// List provisioned repos from the in-sandbox manifest.
+    pub async fn repos_list(&self) -> WorkspaceResult<ReposListResponse> {
+        self.dispatch(&ReposListReq {}, None).await
     }
     pub async fn hook_registry(&self) -> WorkspaceResult<xai_grok_hooks::discovery::HookRegistry> {
         let wire = self.dispatch(&HookRegistryReq {}, None).await?;
@@ -1609,6 +1742,7 @@ mod tests {
     /// the wire contract.
     #[test]
     fn pinned_workspace_method_wire_names() {
+        assert_eq!(ReposListReq::METHOD, "workspace.repos_list");
         assert_eq!(HookRegistryReq::METHOD, "workspace.hook_registry");
         assert_eq!(HunkGetAllHunksReq::METHOD, "workspace.get_all_hunks");
         assert_eq!(
@@ -1631,8 +1765,8 @@ mod tests {
     /// The reported bug: every window's git queries ran against the workspace
     /// launch directory. `git_op_cwd` must return the per-session repo the
     /// client sends, and only fall back to the workspace root when none is given.
-    #[test]
-    fn git_op_cwd_uses_explicit_git_root_per_window() {
+    #[tokio::test]
+    async fn git_op_cwd_uses_explicit_git_root_per_window() {
         let ops = WorkspaceOps::for_test();
         let WorkspaceOps::Local { handle } = &ops else {
             unreachable!("for_test builds a local handle");
@@ -1641,14 +1775,179 @@ mod tests {
         let window_a = std::path::PathBuf::from("/repos/xai-main");
         let window_b = std::path::PathBuf::from("/repos/xai-main-2");
         assert_eq!(
-            git_op_cwd(handle, &Some(window_a.clone())).unwrap(),
+            git_op_cwd(handle, &Some(window_a.clone())).await.unwrap(),
             window_a
         );
         assert_eq!(
-            git_op_cwd(handle, &Some(window_b.clone())).unwrap(),
+            git_op_cwd(handle, &Some(window_b.clone())).await.unwrap(),
             window_b
         );
-        assert_eq!(git_op_cwd(handle, &None).unwrap(), workspace_root);
+        assert_eq!(git_op_cwd(handle, &None).await.unwrap(), workspace_root);
+    }
+    #[tokio::test]
+    async fn repos_list_reads_real_manifest_empty_one_and_many() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ops = WorkspaceOps::for_test_in(tmp.path());
+        let empty = ops.repos_list().await.expect("empty list");
+        assert!(empty.repos.is_empty(), "missing manifest → empty list");
+        assert_eq!(
+            empty.version,
+            xai_grok_workspace_types::rpc::repos::REPOS_MANIFEST_VERSION
+        );
+        let one = RepoManifest::new(vec![ProvisionedRepo {
+            name: "app".into(),
+            repository: "acme/app".into(),
+            mount_path: "/workspace/app".into(),
+            base_branch: "main".into(),
+            session_branch: "conv/1".into(),
+        }]);
+        std::fs::create_dir_all(tmp.path().join(".grok")).unwrap();
+        std::fs::write(
+            tmp.path()
+                .join(xai_grok_workspace_types::rpc::repos::REPOS_MANIFEST_RELATIVE_PATH),
+            one.to_json_bytes().unwrap(),
+        )
+        .unwrap();
+        let listed = ops.repos_list().await.expect("one repo");
+        assert_eq!(one.repos, listed.repos);
+        assert_eq!(one.version, listed.version);
+        let many = RepoManifest::new(vec![
+            ProvisionedRepo {
+                name: "app".into(),
+                repository: "acme/app".into(),
+                mount_path: "/workspace/app".into(),
+                base_branch: "main".into(),
+                session_branch: "conv/1".into(),
+            },
+            ProvisionedRepo {
+                name: "lib".into(),
+                repository: "acme/lib".into(),
+                mount_path: "/workspace/lib".into(),
+                base_branch: "develop".into(),
+                session_branch: "feat/x".into(),
+            },
+        ]);
+        std::fs::write(
+            tmp.path()
+                .join(xai_grok_workspace_types::rpc::repos::REPOS_MANIFEST_RELATIVE_PATH),
+            many.to_json_bytes().unwrap(),
+        )
+        .unwrap();
+        let listed = ops.repos_list().await.expect("many repos");
+        assert_eq!(many.repos, listed.repos);
+        assert_eq!(many.version, listed.version);
+    }
+    #[tokio::test]
+    async fn repos_list_walks_up_from_rewritten_cwd() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sandbox_ws = tmp.path();
+        let agent_cwd = sandbox_ws.join("app");
+        std::fs::create_dir_all(&agent_cwd).unwrap();
+        let one = RepoManifest::new(vec![ProvisionedRepo {
+            name: "app".into(),
+            repository: "acme/app".into(),
+            mount_path: "/workspace/app".into(),
+            base_branch: "".into(),
+            session_branch: "conv/1".into(),
+        }]);
+        std::fs::create_dir_all(sandbox_ws.join(".grok")).unwrap();
+        std::fs::write(
+            sandbox_ws.join(xai_grok_workspace_types::rpc::repos::REPOS_MANIFEST_RELATIVE_PATH),
+            one.to_json_bytes().unwrap(),
+        )
+        .unwrap();
+        let ops = WorkspaceOps::for_test_in(&agent_cwd);
+        let listed = ops.repos_list().await.expect("walk up to sandbox ws");
+        assert_eq!(one.repos, listed.repos);
+    }
+    #[test]
+    fn repos_manifest_search_dirs_stops_at_sandbox_workspace_root() {
+        let _lock = crate::ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::TestEnvGuard::set("HOME", home.path());
+        let _unset_grok = crate::TestEnvGuard::unset("GROK_HOME");
+        let dirs = repos_manifest_search_dirs(std::path::Path::new("/workspace/app"));
+        assert_eq!(
+            dirs,
+            vec![
+                std::path::PathBuf::from("/workspace/app"),
+                std::path::PathBuf::from("/workspace"),
+            ]
+        );
+    }
+    #[test]
+    fn repos_manifest_search_dirs_keeps_sandbox_root_when_home_unset() {
+        let _lock = crate::ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _home = crate::TestEnvGuard::unset("HOME");
+        let _unset_grok = crate::TestEnvGuard::unset("GROK_HOME");
+        let dirs = repos_manifest_search_dirs(std::path::Path::new("/workspace/app"));
+        assert!(
+            dirs.contains(&std::path::PathBuf::from("/workspace/app")),
+            "agent cwd must still be probed: {dirs:?}"
+        );
+        assert!(
+            dirs.contains(&std::path::PathBuf::from("/workspace")),
+            "sandbox root manifest must not be treated as user-global when HOME is unset: {dirs:?}"
+        );
+    }
+    #[test]
+    fn repos_manifest_search_dirs_skips_user_global_grok_home() {
+        let _lock = crate::ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::TestEnvGuard::set("HOME", home.path());
+        let _unset_grok = crate::TestEnvGuard::unset("GROK_HOME");
+        let start = home.path().join("src").join("org").join("app");
+        let dirs = repos_manifest_search_dirs(&start);
+        assert!(dirs.contains(&start));
+        assert!(dirs.contains(&home.path().join("src").join("org")));
+        assert!(dirs.contains(&home.path().join("src")));
+        assert!(
+            !dirs.iter().any(|d| d == home.path()),
+            "must not probe $HOME/.grok/repos.json: {dirs:?}"
+        );
+    }
+    /// Sync + `block_on` so `ENV_TEST_LOCK` is not held across `.await`
+    /// (clippy `await_holding_lock`).
+    #[test]
+    fn repos_list_does_not_load_user_global_manifest() {
+        let _lock = crate::ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::TestEnvGuard::set("HOME", home.path());
+        let _unset_grok = crate::TestEnvGuard::unset("GROK_HOME");
+        let global = RepoManifest::new(vec![ProvisionedRepo {
+            name: "global".into(),
+            repository: "acme/global".into(),
+            mount_path: "/unrelated".into(),
+            base_branch: "main".into(),
+            session_branch: "x".into(),
+        }]);
+        std::fs::create_dir_all(home.path().join(".grok")).unwrap();
+        std::fs::write(
+            home.path().join(".grok").join("repos.json"),
+            global.to_json_bytes().unwrap(),
+        )
+        .unwrap();
+        let agent_cwd = home.path().join("src").join("app");
+        std::fs::create_dir_all(&agent_cwd).unwrap();
+        let ops = WorkspaceOps::for_test_in(&agent_cwd);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let listed = rt.block_on(ops.repos_list()).expect("list");
+        assert!(
+            listed.repos.is_empty(),
+            "missing workspace manifest must not fall back to ~/.grok/repos.json: {:?}",
+            listed.repos
+        );
     }
     /// Regression: a long-lived (leader) workspace must reclaim the per-session
     /// `FinalizedToolset` — and the MCP tools / `McpState` / `events.jsonl`
@@ -1858,6 +2157,7 @@ mod tests {
                 E::SessionEnd => HookEventNameWire::SessionEnd,
                 E::Stop => HookEventNameWire::Stop,
                 E::StopFailure => HookEventNameWire::StopFailure,
+                E::StopCancelled => HookEventNameWire::StopCancelled,
                 E::PreToolUse => HookEventNameWire::PreToolUse,
                 E::PostToolUse => HookEventNameWire::PostToolUse,
                 E::PostToolUseFailure => HookEventNameWire::PostToolUseFailure,
@@ -1876,6 +2176,7 @@ mod tests {
             E::SessionEnd,
             E::Stop,
             E::StopFailure,
+            E::StopCancelled,
             E::PreToolUse,
             E::PostToolUse,
             E::PostToolUseFailure,

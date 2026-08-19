@@ -14,7 +14,9 @@
 //! see [`validate_requirements`].
 
 pub mod campaigns;
+mod config_layers;
 pub mod config_override;
+mod env_overlay;
 pub mod fs_atomic;
 pub mod global_hook_sources;
 mod loader;
@@ -39,17 +41,22 @@ pub use global_hook_sources::{
     resolve_global_hook_sources, unique_ancestors_rootward,
 };
 
+pub use config_layers::{
+    CampaignsState, ConfigLayers, campaigns_application_disabled, campaigns_state_path,
+    load_dismissed_ids_from_home, load_effective_config_disk_only,
+};
+pub use env_overlay::{
+    GROK_CONFIG_ENV, GROK_CONFIG_PATH_ENV, OverlaySource, ResolvedOverlay, resolved_env_overlay,
+};
 #[cfg(unix)]
 pub use global_hook_sources::{
     validate_direct_hook_json_file, validated_hook_json_files_for_sources,
 };
 pub use loader::{
-    CampaignsState, ConfigLayers, HookConfigLayer, HookProvenance, MANAGED_CONFIG_FILENAME,
-    ManagedConfigLayer, REQUIREMENTS_FILENAME, USER_CONFIG_FILENAME,
-    apply_version_overrides_with_registered, campaigns_application_disabled, campaigns_state_path,
+    HookConfigLayer, HookProvenance, MANAGED_CONFIG_FILENAME, ManagedConfigLayer,
+    REQUIREMENTS_FILENAME, USER_CONFIG_FILENAME, apply_version_overrides_with_registered,
     deep_merge_toml, expand_env_vars_in_string, expand_env_vars_in_toml, hook_config_layers,
-    hook_config_layers_at, load_config_file, load_dismissed_ids_from_home,
-    load_effective_config_disk_only, load_from_disk, load_managed_config,
+    hook_config_layers_at, load_config_file, load_from_disk, load_managed_config,
     load_system_managed_config, load_toml_file, managed_config_layers, managed_config_layers_at,
     toml_error_detail,
 };
@@ -62,9 +69,10 @@ pub use managed_cache::{
     mark_managed_config_synced, mark_managed_config_synced_at, normalize_identity,
 };
 pub use paths::{
-    claude_managed_settings_path, claude_managed_settings_probe_path, decode_cwd_from_dirname,
-    default_grok_home, encode_cwd_dirname, ensure_sessions_cwd_dir, grok_application,
-    grok_application_in, grok_home, sessions_cwd_dir, system_config_dir, user_grok_home,
+    claude_managed_settings_path, claude_managed_settings_probe_path, create_dir_all_owner_only,
+    decode_cwd_from_dirname, default_grok_home, encode_cwd_dirname, ensure_sessions_cwd_dir,
+    ensure_sessions_cwd_dir_in, grok_application, grok_application_in, grok_home, sessions_cwd_dir,
+    sessions_cwd_dir_in, set_dir_owner_only, system_config_dir, user_grok_home,
 };
 pub use validation::{
     RequirementsError, RequirementsLayer, RequirementsSource, load_merged_requirements,

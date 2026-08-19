@@ -29,7 +29,6 @@ pub struct AppearanceConfig {
     pub animation: AnimationConfig,
     pub prompt: PromptViewConfig,
     pub scrollback: ScrollbackConfig,
-    pub todo: TodoConfig,
     pub turn_status: TurnStatusConfig,
     /// Show timestamps on user/agent messages. Toggled via `/timestamps`.
     pub show_timestamps: bool,
@@ -167,6 +166,11 @@ pub struct ScrollbackDisplayConfig {
     /// behind a compact "╶╶ N more" header. 0 disables group truncation.
     /// Default: 10.
     pub group_max_visible: u16,
+    /// Apply UAX #9 bidi reordering in the app before painting scrollback
+    /// lines. **Default false** — many terminals already reorder; enabling
+    /// both double-flips Arabic/Persian. Turn on only if your terminal does
+    /// not handle RTL.
+    pub rtl_bidi: bool,
 }
 
 impl Default for ScrollbackDisplayConfig {
@@ -184,6 +188,7 @@ impl Default for ScrollbackDisplayConfig {
             sticky_headers: true,
             tab_width: 4,
             group_max_visible: 10,
+            rtl_bidi: false,
         }
     }
 }
@@ -354,13 +359,17 @@ impl Default for ScrollConfig {
     }
 }
 
-/// Follow indicator display mode.
+/// Scroll indicator display mode: the ▼ jump-to-bottom arrow below
+/// scrollback and its ▲ jump-to-response-top mirror under the sticky
+/// prompt header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum FollowIndicator {
-    /// No follow indicator.
+    /// No scroll indicators.
     None,
     /// Show ▼ centered in the gap row below scrollback when not following
-    /// and there's content below the viewport.
+    /// and there's content below the viewport, and ▲ centered under the
+    /// sticky prompt header while the answer being read starts above the
+    /// viewport top.
     #[default]
     Center,
 }
@@ -407,34 +416,6 @@ impl AnimationConfig {
     pub fn tick_interval(&self) -> std::time::Duration {
         let fps = self.fps.max(1) as u64;
         std::time::Duration::from_millis(1000 / fps)
-    }
-}
-
-/// Badge format for the todo status counts in the status bar.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum TodoBadgeFormat {
-    /// Colon format: `[▶:1 □:4 ✓:3 ✗:2]` — compact, icon:count.
-    Colon,
-    /// Comma format: `[1 ▶, 4 □, 3 ✓, 2 ✗]` — count icon, comma-separated.
-    Comma,
-    /// Default format: `2/5` — a `done/total` progress fraction (done =
-    /// completed, total = all tasks except cancelled).
-    #[default]
-    Default,
-}
-
-/// Todo pane configuration.
-#[derive(Debug, Clone, Copy)]
-pub struct TodoConfig {
-    /// Badge format in the status bar.
-    pub badge_format: TodoBadgeFormat,
-}
-
-impl Default for TodoConfig {
-    fn default() -> Self {
-        Self {
-            badge_format: TodoBadgeFormat::Default,
-        }
     }
 }
 
@@ -751,8 +732,6 @@ pub struct RawAppearanceConfig {
     pub prompt: RawPromptViewConfig,
     /// Scrollback pane settings (layout, scrollbar, scroll, blocks).
     pub scrollback: RawScrollbackConfig,
-    /// Todo pane settings (badge format).
-    pub todo: RawTodoConfig,
     /// Disable hooks & plugins UI (/hooks and /plugins commands, scrollback annotations).
     /// Defaults to false (plugins enabled).
     pub disable_plugins: bool,
@@ -897,6 +876,9 @@ pub struct RawScrollbackDisplayConfig {
     /// Maximum visible entries in a consecutive group of collapsed tool/thinking blocks.
     /// Older entries are hidden behind a compact header. 0 = disable. Default: 10.
     pub group_max_visible: Option<u16>,
+    /// App-side RTL bidi reordering for scrollback. Default false (terminals often
+    /// already reorder; enabling both double-flips Arabic/Persian).
+    pub rtl_bidi: Option<bool>,
 }
 
 impl Default for RawScrollbackDisplayConfig {
@@ -914,6 +896,7 @@ impl Default for RawScrollbackDisplayConfig {
             sticky_headers: Some(true),
             tab_width: Some(4),
             group_max_visible: Some(10),
+            rtl_bidi: Some(false),
         }
     }
 }
@@ -991,8 +974,8 @@ pub struct RawScrollConfig {
     /// If a scroll would be less than this percentage, scroll by this amount instead.
     /// 0 = minimal scroll (default), 25 = quarter page, 100 = full page.
     pub min_page_fraction: u8,
-    /// Follow indicator in the gap row below scrollback.
-    /// "none" = hidden, "center" = ▼ centered when content is below viewport.
+    /// Scroll indicators: the ▼ below scrollback and the ▲ under the sticky
+    /// prompt header. "none" = hidden, "center" = centered arrows.
     pub follow_indicator: RawFollowIndicator,
     /// When follow mode scrolls to new content, auto-select the latest entry.
     pub follow_auto_select: bool,
@@ -1019,13 +1002,13 @@ impl Default for RawScrollConfig {
     }
 }
 
-/// Follow indicator display mode (TOML format).
+/// Scroll indicator display mode (TOML format).
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum RawFollowIndicator {
-    /// No follow indicator.
+    /// No scroll indicators.
     None,
-    /// Show ▼ centered in the gap row below scrollback.
+    /// Show ▼ centered below scrollback and ▲ under the sticky prompt header.
     #[default]
     Center,
 }
@@ -1049,48 +1032,6 @@ pub enum RawToolBullet {
     Triangle,
     /// `◆` (filled diamond).
     Diamond,
-}
-
-/// Todo pane configuration (TOML format).
-#[derive(Debug, Clone, Serialize, Deserialize, Documented, DocumentedFields)]
-#[serde(default)]
-pub struct RawTodoConfig {
-    /// Badge format in the status bar.
-    /// "default" = colored numbers only [1 2 3 4].
-    /// "colon" = icon:count [▶:1 □:4 ✓:3].
-    /// "comma" = count icon, comma-separated [1 ▶, 4 □, 3 ✓].
-    pub badge_format: RawTodoBadgeFormat,
-}
-
-impl Default for RawTodoConfig {
-    fn default() -> Self {
-        Self {
-            badge_format: RawTodoBadgeFormat::Default,
-        }
-    }
-}
-
-/// Badge format for the todo status counts (TOML format).
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum RawTodoBadgeFormat {
-    /// Colored numbers only: `[1 2 3 4]`.
-    #[default]
-    Default,
-    /// Icon:count: `[▶:1 □:4 ✓:3 ✗:2]`.
-    Colon,
-    /// Count icon, comma-separated: `[1 ▶, 4 □, 3 ✓, 2 ✗]`.
-    Comma,
-}
-
-impl From<RawTodoBadgeFormat> for TodoBadgeFormat {
-    fn from(raw: RawTodoBadgeFormat) -> Self {
-        match raw {
-            RawTodoBadgeFormat::Default => TodoBadgeFormat::Default,
-            RawTodoBadgeFormat::Colon => TodoBadgeFormat::Colon,
-            RawTodoBadgeFormat::Comma => TodoBadgeFormat::Comma,
-        }
-    }
 }
 
 /// Animation configuration (TOML format).
@@ -1441,10 +1382,8 @@ impl From<RawAppearanceConfig> for AppearanceConfig {
                     sticky_headers: raw.scrollback.display.sticky_headers.unwrap_or(true),
                     tab_width: raw.scrollback.display.tab_width.unwrap_or(4),
                     group_max_visible: raw.scrollback.display.group_max_visible.unwrap_or(10),
+                    rtl_bidi: raw.scrollback.display.rtl_bidi.unwrap_or(false),
                 },
-            },
-            todo: TodoConfig {
-                badge_format: raw.todo.badge_format.into(),
             },
             turn_status: TurnStatusConfig::default(),
             show_timestamps: true, // runtime-only, loaded from config.toml via persist
@@ -1878,10 +1817,6 @@ impl RawAppearanceConfig {
 
         if let Some(terminal) = doc.get_mut("terminal").and_then(Item::as_table_mut) {
             annotate_table::<RawTerminalConfig>(terminal);
-        }
-
-        if let Some(todo) = doc.get_mut("todo").and_then(Item::as_table_mut) {
-            annotate_table::<RawTodoConfig>(todo);
         }
 
         if let Some(animation) = doc.get_mut("animation").and_then(Item::as_table_mut) {

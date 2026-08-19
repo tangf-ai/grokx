@@ -39,6 +39,27 @@ impl TelemetryMode {
         }
     }
 }
+#[cfg(test)]
+mod telemetry_mode_tests {
+    use super::TelemetryMode;
+    /// A parent process hands its resolved mode to spawned children via
+    /// `GROK_TELEMETRY_ENABLED={mode}` (Display), so every Display output
+    /// must parse back to the same mode.
+    #[test]
+    fn display_round_trips_through_parse() {
+        for mode in [
+            TelemetryMode::Enabled,
+            TelemetryMode::Disabled,
+            TelemetryMode::SessionMetrics,
+        ] {
+            assert_eq!(
+                TelemetryMode::parse(&mode.to_string()),
+                Some(mode),
+                "Display value for {mode:?} must parse back to itself"
+            );
+        }
+    }
+}
 impl std::fmt::Display for TelemetryMode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -111,6 +132,9 @@ pub struct TelemetryConfig {
     /// External OTLP transport: `http/protobuf` | `grpc`.
     #[serde(alias = "otel_transport")]
     pub otel_protocol: Option<String>,
+    pub otel_certificate: Option<String>,
+    pub otel_client_certificate: Option<String>,
+    pub otel_client_key: Option<String>,
     /// External OTEL content gate (admins can pin to `false` via requirements).
     pub otel_log_user_prompts: Option<bool>,
     /// External OTEL content gate (admins can pin to `false` via requirements).
@@ -149,6 +173,9 @@ impl Default for TelemetryConfig {
             otel_logs_exporter: None,
             otel_endpoint: None,
             otel_protocol: None,
+            otel_certificate: None,
+            otel_client_certificate: None,
+            otel_client_key: None,
             otel_log_user_prompts: None,
             otel_log_tool_details: None,
         }

@@ -362,7 +362,9 @@ impl AgentBuilder {
     /// Mark this session as non-interactive (headless / SDK / stdio /
     /// generic-ACP). Suppresses prompt sections that only make sense when
     /// a human is typing into the TUI prompt input (e.g. the `! <command>`
-    /// shell-prefix tip and the `<user_guide>` TUI pointer).
+    /// shell-prefix tip and the `<user_guide>` TUI pointer), and stamps
+    /// `non_interactive` into the ask_user_question params so an unanswered
+    /// questionnaire returns no-operator text instead of "user declined".
     pub fn with_is_non_interactive(mut self, value: bool) -> Self {
         self.is_non_interactive = value;
         self
@@ -565,7 +567,7 @@ impl AgentBuilder {
     /// agent's tool config after `ensure_plan_mode_tools` injection, so
     /// the model cannot ask the user structured questions regardless of
     /// which built-in profile is in use. Driven by the shell's resolved gate
-    /// (`resolve_ask_user_question`, default ON — remote settings/config/env act as
+    /// (the `ask_user_question` feature, default ON: remote settings/config/env act as
     /// a kill-switch) and/or the pager's `--no-ask-user` (`_meta.askUserQuestion`).
     pub fn with_ask_user_question_enabled(mut self, enabled: bool) -> Self {
         self.ask_user_question_enabled = enabled;
@@ -872,6 +874,11 @@ impl AgentBuilder {
                 ask_params,
             );
         }
+        if self.is_non_interactive {
+            let mut ni = serde_json::Map::new();
+            ni.insert("non_interactive".into(), serde_json::Value::Bool(true));
+            merge_tool_params(&mut tool_config, &["GrokBuild:ask_user_question"], &ni);
+        }
         if !definition.disallowed_tools.is_empty() {
             let before: std::collections::HashSet<String> =
                 tool_config.tools.iter().map(|tc| tc.id.clone()).collect();
@@ -1158,6 +1165,7 @@ impl AgentBuilder {
             prompt_mode: definition.prompt_mode.clone(),
             audience: self.prompt_audience,
             prompt_body: definition.prompt_body.clone(),
+            include_browser_verification: definition.include_browser_verification(),
             system_prompt: definition.system_prompt.clone(),
             agents_md_files,
             persona_summaries: self.persona_summaries,
@@ -1820,6 +1828,33 @@ mod tests {
             .expect("finalize must insert Params for the injected ask_user_question");
         assert_eq!(applied.0.timeout_enabled, Some(false));
         assert_eq!(applied.0.timeout_secs, Some(5));
+        assert_eq!(applied.0.non_interactive, None);
+    }
+    /// A non-interactive build stamps `non_interactive: true` into the AUQ
+    /// params (session state, not user config) so cancel/timeout return the
+    /// no-operator text.
+    #[tokio::test]
+    async fn non_interactive_build_stamps_ask_user_question_params() {
+        use xai_grok_tools::computer::local::LocalTerminalBackend;
+        use xai_grok_tools::implementations::grok_build::ask_user_question::AskUserQuestionParams;
+        use xai_grok_tools::notification::ToolNotificationHandle;
+        use xai_grok_tools::types::resources::Params;
+        let agent = AgentBuilder::new(
+            std::env::temp_dir(),
+            Arc::new(LocalTerminalBackend::new()),
+            ToolNotificationHandle::noop(),
+        )
+        .from_definition(crate::config::AgentDefinition::default_grok_build())
+        .with_is_non_interactive(true)
+        .build()
+        .await
+        .expect("agent should build");
+        let applied = agent
+            .tool_bridge()
+            .read_resource::<Params<AskUserQuestionParams>>()
+            .await
+            .expect("finalize must insert Params for the injected ask_user_question");
+        assert_eq!(applied.0.non_interactive, Some(true));
     }
     async fn build_with_tools(tools: Vec<String>, disallowed: Vec<String>) -> crate::agent::Agent {
         use xai_grok_tools::computer::local::LocalTerminalBackend;
@@ -2253,6 +2288,8 @@ mod tests {
             model: "test-web-search-model".into(),
             extra_headers: Default::default(),
             alpha_test_key: None,
+            allowed_domains: None,
+            excluded_domains: None,
         })
         .with_web_fetch_config(WebFetchConfig::Enabled {
             params: Default::default(),
@@ -2380,6 +2417,8 @@ mod tests {
                 model: "test-web-search-model".into(),
                 extra_headers: Default::default(),
                 alpha_test_key: None,
+                allowed_domains: None,
+                excluded_domains: None,
             }
         } else {
             WebSearchConfig::Disabled

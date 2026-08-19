@@ -33,7 +33,9 @@ const ALL_SETTINGS_EXERCISED: &[&str] = &[
     "show_timestamps",
     "show_timeline",
     "page_flip_on_send",
+    "confirm_before_rewind",
     "combine_queued_prompts",
+    "follow_up_behavior",
     "simple_mode",
     "vim_mode",
     "remember_tool_approvals",
@@ -215,12 +217,19 @@ fn assert_set_bool_action(outcome: SettingsKeyOutcome, key: &str, expected: bool
         ("page_flip_on_send", Action::SetPageFlipOnSend(b)) => {
             assert_eq!(b, expected, "SetPageFlipOnSend value differs from expected")
         }
+        ("confirm_before_rewind", Action::SetConfirmBeforeRewind(b)) => {
+            assert_eq!(
+                b, expected,
+                "SetConfirmBeforeRewind value differs from expected"
+            )
+        }
         ("combine_queued_prompts", Action::SetCombineQueuedPrompts(b)) => {
             assert_eq!(
                 b, expected,
                 "SetCombineQueuedPrompts value differs from expected"
             )
         }
+
         ("simple_mode", Action::SetSimpleMode(b)) => {
             assert_eq!(b, expected, "SetSimpleMode value differs from expected")
         }
@@ -398,12 +407,63 @@ fn space_on_page_flip_on_send_dispatches_typed_setter() {
 }
 
 #[test]
+fn space_on_confirm_before_rewind_dispatches_typed_setter() {
+    let mut s = make_state();
+    navigate_to(&mut s, "confirm_before_rewind");
+    let outcome = handle_settings_key(&mut s, &press(KeyCode::Char(' ')));
+    let default_on = UiConfig::default().confirm_before_rewind_enabled();
+    assert_set_bool_action(outcome, "confirm_before_rewind", !default_on);
+}
+
+#[test]
 fn space_on_combine_queued_prompts_dispatches_typed_setter() {
     let mut s = make_state();
     navigate_to(&mut s, "combine_queued_prompts");
     let outcome = handle_settings_key(&mut s, &press(KeyCode::Char(' ')));
     let default_on = UiConfig::default().combine_queued_prompts.unwrap_or(false);
     assert_set_bool_action(outcome, "combine_queued_prompts", !default_on);
+}
+
+#[test]
+fn enter_on_follow_up_behavior_row_enters_picking_enum() {
+    let mut s = make_state();
+    navigate_to(&mut s, "follow_up_behavior");
+    let outcome = handle_settings_key(&mut s, &press(KeyCode::Enter));
+    assert!(
+        matches!(outcome, SettingsKeyOutcome::Changed),
+        "Enter on follow_up_behavior row must transition to PickingEnum, got {outcome:?}"
+    );
+    match &s.mode() {
+        SettingsModalMode::PickingEnum {
+            key,
+            original_value,
+            ..
+        } => {
+            assert_eq!(*key, "follow_up_behavior");
+            assert_eq!(
+                original_value,
+                &SettingValue::Enum("queue"),
+                "default follow_up_behavior is queue"
+            );
+        }
+        other => panic!("expected PickingEnum mode, got {other:?}"),
+    }
+}
+
+#[test]
+fn follow_up_behavior_picker_enter_dispatches_set_commit() {
+    let mut s = make_state();
+    navigate_to(&mut s, "follow_up_behavior");
+    let _ = handle_settings_key(&mut s, &press(KeyCode::Enter));
+    // Default is queue (index 0); Down → steer.
+    let _ = handle_settings_key(&mut s, &press(KeyCode::Down));
+    let outcome = handle_settings_key(&mut s, &press(KeyCode::Enter));
+    match outcome {
+        SettingsKeyOutcome::Action(Action::SetFollowUpBehavior(mode)) => {
+            assert_eq!(mode, xai_grok_pager::appearance::FollowUpBehavior::Steer);
+        }
+        other => panic!("expected SetFollowUpBehavior(Steer), got {other:?}"),
+    }
 }
 
 #[test]
@@ -670,6 +730,43 @@ fn mouse_click_on_combine_queued_prompts_indicator_toggles_in_one_click() {
     assert_set_bool_action(outcome, "combine_queued_prompts", !default_on);
 }
 
+#[test]
+fn mouse_click_on_follow_up_behavior_indicator_opens_picker() {
+    let mut s = make_state();
+    synth_rects(&mut s);
+    let row_y = row_idx_for(&s, "follow_up_behavior") as u16;
+    let outcome = handle_settings_mouse(
+        &mut s,
+        MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        72,
+        row_y,
+    );
+    assert!(
+        matches!(outcome, SettingsKeyOutcome::Changed),
+        "click on follow_up_behavior indicator should open picker, got {outcome:?}"
+    );
+    assert!(
+        matches!(s.mode(), SettingsModalMode::PickingEnum { key, .. } if key == "follow_up_behavior"),
+        "expected PickingEnum(follow_up_behavior), got {:?}",
+        s.mode()
+    );
+}
+
+#[test]
+fn mouse_click_on_confirm_before_rewind_indicator_toggles_in_one_click() {
+    let mut s = make_state();
+    synth_rects(&mut s);
+    let row_y = row_idx_for(&s, "confirm_before_rewind") as u16;
+    let outcome = handle_settings_mouse(
+        &mut s,
+        MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        72,
+        row_y,
+    );
+    let default_on = UiConfig::default().confirm_before_rewind_enabled();
+    assert_set_bool_action(outcome, "confirm_before_rewind", !default_on);
+}
+
 /// Value-column click toggles `remember_tool_approvals` in one click.
 #[test]
 fn mouse_click_on_remember_tool_approvals_indicator_toggles_in_one_click() {
@@ -847,6 +944,9 @@ fn slash_enters_filter_mode_and_chars_go_to_query_no_action_leak() {
             }
             SettingsKeyOutcome::ActionPair(a, b) => {
                 panic!("filter mode leaked ActionPair({a:?}, {b:?}) for char {c:?}");
+            }
+            SettingsKeyOutcome::ActionThenClose(a) => {
+                panic!("filter mode leaked ActionThenClose({a:?}) for char {c:?}");
             }
             SettingsKeyOutcome::Close => {
                 panic!("filter mode unexpectedly closed on char {c:?}");
@@ -1797,6 +1897,7 @@ fn registry_kind_membership_through_pr_14() {
             "show_timeline",
             "show_timestamps",
             "page_flip_on_send",
+            "confirm_before_rewind",
             "combine_queued_prompts",
             "simple_mode",
             "vim_mode",
@@ -1830,6 +1931,7 @@ fn registry_kind_membership_through_pr_14() {
             "auto_light_theme",
             "coding_data_sharing",
             "default_selected_permission",
+            "follow_up_behavior",
             "hunk_tracker_mode",
             "keep_text_selection",
             "permission_mode",
@@ -1899,6 +2001,7 @@ fn enum_settings_membership_through_pr_14() {
             "auto_light_theme",
             "coding_data_sharing",
             "default_selected_permission",
+            "follow_up_behavior",
             "hunk_tracker_mode",
             "keep_text_selection",
             "permission_mode",
@@ -1932,6 +2035,9 @@ fn defaults_round_trip_through_registry() {
     xai_grok_pager::appearance::cache::set_group_tool_verbs(true);
     xai_grok_pager::appearance::cache::set_page_flip_on_send(true);
     xai_grok_pager::appearance::cache::set_combine_queued_prompts(false);
+    xai_grok_pager::appearance::cache::set_follow_up_behavior(
+        xai_grok_pager::appearance::FollowUpBehavior::Queue,
+    );
     xai_grok_pager::appearance::cache::set_scroll_mode(
         xai_grok_pager::appearance::ScrollMode::Auto,
     );
@@ -1947,7 +2053,9 @@ fn defaults_round_trip_through_registry() {
             "show_timestamps" => SettingValue::Bool(true),
             "show_timeline" => SettingValue::Bool(false),
             "page_flip_on_send" => SettingValue::Bool(true),
+            "confirm_before_rewind" => SettingValue::Bool(true),
             "combine_queued_prompts" => SettingValue::Bool(false),
+            "follow_up_behavior" => SettingValue::Enum("queue"),
             "simple_mode" => SettingValue::Bool(true),
             "vim_mode" => SettingValue::Bool(false),
             "remember_tool_approvals" => SettingValue::Bool(false),
@@ -1965,7 +2073,7 @@ fn defaults_round_trip_through_registry() {
             "scroll_mode" => SettingValue::Enum("auto"),
             "scroll_lines" => SettingValue::Int(3),
             "invert_scroll" => SettingValue::Bool(false),
-            "display_refresh_auto_cadence" => SettingValue::Bool(false),
+            "display_refresh_auto_cadence" => SettingValue::Bool(true),
             "coding_data_sharing" => SettingValue::Enum("opt-out"),
             "default_selected_permission" => SettingValue::Enum("always_allow_all_sessions"),
             "hunk_tracker_mode" => SettingValue::Enum("agent_only"),
@@ -2047,6 +2155,7 @@ fn settings_value_payload_matches_kind() {
             | SettingsKeyOutcome::Action(Action::SetTimestamps(_))
             | SettingsKeyOutcome::Action(Action::SetTimeline(_))
             | SettingsKeyOutcome::Action(Action::SetPageFlipOnSend(_))
+            | SettingsKeyOutcome::Action(Action::SetConfirmBeforeRewind(_))
             | SettingsKeyOutcome::Action(Action::SetCombineQueuedPrompts(_))
             | SettingsKeyOutcome::Action(Action::SetSimpleMode(_))
             | SettingsKeyOutcome::Action(Action::SetMultilineMode(_))
@@ -6700,6 +6809,12 @@ fn enter_on_keep_text_selection_row_enters_picking_enum() {
 
 #[test]
 fn keep_text_selection_picker_nav_does_not_dispatch_preview() {
+    // Pin the cache-backed live value so the picker seeds at flash (idx 0)
+    // regardless of a sibling test that set hold/word_select on this thread.
+    // (word_select is the last choice, so Down would clamp; flash gives room.)
+    xai_grok_pager::appearance::cache::set_keep_text_selection(
+        xai_grok_pager::appearance::TextSelection::Flash,
+    );
     for nav_key in &[
         KeyCode::Down,
         KeyCode::Up,
@@ -7183,22 +7298,23 @@ fn invert_scroll_renders_under_mouse_shell_owned_default_false() {
 }
 
 // ---------------------------------------------------------------------------
-// display_refresh_auto_cadence — SHELL-owned Bool (Appearance, default false)
+// display_refresh_auto_cadence — SHELL-owned Bool (Appearance, default ON)
 // ---------------------------------------------------------------------------
 
 #[test]
 fn display_refresh_auto_cadence_space_dispatches_typed_setter() {
+    // Default is on; space toggles off.
     let mut s = make_state();
     navigate_to(&mut s, "display_refresh_auto_cadence");
     let outcome = handle_settings_key(&mut s, &press(KeyCode::Char(' ')));
-    assert_set_bool_action(outcome, "display_refresh_auto_cadence", true);
+    assert_set_bool_action(outcome, "display_refresh_auto_cadence", false);
 }
 
 #[test]
 fn display_refresh_auto_cadence_enter_dispatches_typed_setter() {
-    // Seed on so Enter toggles off.
+    // Seed off so Enter toggles on.
     let mut ui = UiConfig::default();
-    ui.display_refresh.auto_cadence_enabled = Some(true);
+    ui.display_refresh.auto_cadence_enabled = Some(false);
     let mut s = SettingsModalState::new(
         Arc::new(SettingsRegistry::defaults()),
         ui,
@@ -7209,11 +7325,12 @@ fn display_refresh_auto_cadence_enter_dispatches_typed_setter() {
     );
     navigate_to(&mut s, "display_refresh_auto_cadence");
     let outcome = handle_settings_key(&mut s, &press(KeyCode::Enter));
-    assert_set_bool_action(outcome, "display_refresh_auto_cadence", false);
+    assert_set_bool_action(outcome, "display_refresh_auto_cadence", true);
 }
 
 #[test]
 fn display_refresh_auto_cadence_mouse_click_two_stage_toggles() {
+    // Default is on; second body-click toggles off.
     let mut s = make_state();
     synth_rects(&mut s);
     let row_y = row_idx_for(&s, "display_refresh_auto_cadence") as u16;
@@ -7233,7 +7350,7 @@ fn display_refresh_auto_cadence_mouse_click_two_stage_toggles() {
         10,
         row_y,
     );
-    assert_set_bool_action(outcome, "display_refresh_auto_cadence", true);
+    assert_set_bool_action(outcome, "display_refresh_auto_cadence", false);
 }
 
 #[test]
@@ -7249,7 +7366,7 @@ fn display_refresh_auto_cadence_meta_appearance_shell_restart_hidden_minimal() {
     assert_eq!(meta.label, "Match display refresh rate");
     match &meta.kind {
         SettingKind::Bool { default } => {
-            assert!(!default, "display_refresh_auto_cadence must default OFF")
+            assert!(*default, "display_refresh_auto_cadence must default ON")
         }
         other => panic!("expected Bool kind for display_refresh_auto_cadence, got {other:?}"),
     }
@@ -7262,13 +7379,13 @@ fn display_refresh_auto_cadence_defaults_roundtrip_via_current_value_for() {
     let pager = PagerLocalSnapshot::default();
     let value = current_value_for("display_refresh_auto_cadence", &ui, &pager)
         .expect("current_value_for(display_refresh_auto_cadence) must resolve");
-    assert_eq!(value, SettingValue::Bool(false));
-
-    let mut ui_on = UiConfig::default();
-    ui_on.display_refresh.auto_cadence_enabled = Some(true);
-    let value = current_value_for("display_refresh_auto_cadence", &ui_on, &pager)
-        .expect("current_value_for(display_refresh_auto_cadence) must resolve");
     assert_eq!(value, SettingValue::Bool(true));
+
+    let mut ui_off = UiConfig::default();
+    ui_off.display_refresh.auto_cadence_enabled = Some(false);
+    let value = current_value_for("display_refresh_auto_cadence", &ui_off, &pager)
+        .expect("current_value_for(display_refresh_auto_cadence) must resolve");
+    assert_eq!(value, SettingValue::Bool(false));
 }
 
 // ---------------------------------------------------------------------------

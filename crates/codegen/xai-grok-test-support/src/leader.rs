@@ -901,6 +901,7 @@ mod tests {
             .stderr(std::process::Stdio::null())
             .envs(xai_tty_utils::pager_env());
         xai_tty_utils::detach_std_command(&mut cmd);
+        #[allow(clippy::disallowed_methods)] // test fixture; the test reaps it
         let child = cmd.spawn().expect("spawn fake persistent leader");
         let pid = child.id();
         let tree = TestProcessTree::try_attach(pid, "fake persistent leader")
@@ -982,15 +983,21 @@ mod tests {
             pid_file.display()
         );
         let fixture = fixture(temp.path(), fake_leader(&script));
+        // The redirect creates the pid file before `echo` writes, so it can read back empty.
         let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-        while !pid_file.exists() && tokio::time::Instant::now() < deadline {
+        let descendant: u32 = loop {
+            if let Ok(raw) = std::fs::read_to_string(&pid_file)
+                && let Ok(pid) = raw.trim().parse()
+            {
+                break pid;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for pid file {}",
+                pid_file.display()
+            );
             tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        let descendant: u32 = std::fs::read_to_string(&pid_file)
-            .expect("descendant pid")
-            .trim()
-            .parse()
-            .expect("parse descendant pid");
+        };
 
         fixture.close().await.expect("close fixture");
         let deadline = tokio::time::Instant::now() + Duration::from_secs(2);

@@ -10,9 +10,28 @@ Settings resolve highest-priority first:
 
 1. **CLI flags** (e.g. `--yolo`, `--model`, `--sandbox`)
 2. **Environment variables** (e.g. `XAI_API_KEY`, `GROK_MEMORY`)
-3. **config.toml** (`~/.grok/config.toml`)
-4. **Managed / requirements config** (files your org may deploy, e.g. `managed_config.toml` / `requirements.toml`)
-5. **Built-in defaults**
+3. **`requirements.toml` / MDM** (org-enforced; clamps every config layer below, including the overlay)
+4. **`GROK_CONFIG` / `GROK_CONFIG_PATH` overlay** (above `config.toml` and managed, below `requirements.toml` / MDM)
+5. **config.toml** (`~/.grok/config.toml`)
+6. **`managed_config.toml`** (org-deployed defaults; below `config.toml`)
+7. **Built-in defaults**
+
+Within the config-file tier, the layers merge lowest-to-highest: `managed_config.toml` → `config.toml` → `GROK_CONFIG` overlay → `requirements.toml` / MDM. So `requirements.toml` and MDM clamp **both** your `config.toml` and the overlay.
+
+`GROK_CONFIG` / `GROK_CONFIG_PATH` (tier 4) are config **overlays**: a merged config layer, not direct-setting environment variables like `XAI_API_KEY` (tier 2). They set config keys (subject to the allowlist below), so read them as part of the config-file tier rather than the env-var tier.
+
+### Injecting config with `GROK_CONFIG`
+
+A harness or ACP client that launches `grok agent stdio` can inject settings without writing a `config.toml` or relocating `$GROK_HOME`:
+
+- **`GROK_CONFIG`**: an inline JSON object overlay.
+- **`GROK_CONFIG_PATH`**: an *additional* file overlay (not a replacement for `config.toml`), a JSON or TOML file read by its extension (`.json` → JSON, else TOML). `GROK_CONFIG` wins if both are set. An empty `GROK_CONFIG` is treated as unset, and a malformed one logs a warning and falls through to `GROK_CONFIG_PATH`.
+
+The overlay is **deep-merged** on top of your `config.toml` (it overrides only the keys it sets), placed above the user/managed layers but **below** `requirements.toml` / MDM so an enterprise pin still wins. A malformed blob is ignored with a warning. This mirrors `CODEX_CONFIG` from the `codex-acp` adapter (a JSON object merged into the session config); Grok is ACP-native, so the overlay lives in the agent itself. It only affects settings read from the merged config, and it is **not** a permission-escalation path. The overlay is confined, fail-closed, to an **allowlist** of soft settings (`models`, `features`, a narrowed `toolset`, and a `shell_environment_policy` limited to its filter fields, which select among env names the launcher already controls and cannot inject an env value into tool subprocesses); every other table is dropped at the choke point, so the overlay cannot spawn commands, set auth policy, redirect network traffic, elevate trust, or add a discovery source. Even on the allowlisted settings, a specific set of security gates read the raw disk layers rather than the overlay. The `ConfigLayers::env_overlay` rustdoc is the canonical list of what the overlay can and cannot reach and which gates read it overlay-free; see also the [internal environment-variables reference](../internal/22-environment-variables.md). Use `GROK_DEFAULT_SELECTED_PERMISSION` for headless permission control. For example, to set the default reasoning effort:
+
+```bash
+GROK_CONFIG='{"models": {"default_reasoning_effort": "high"}}' grok agent stdio
+```
 
 ---
 
@@ -57,6 +76,9 @@ collapsed_edit_blocks = false          # show edits as one-line +N/-M diffstat s
 page_flip_on_send = true               # pin a just-sent prompt at the top of the viewport so the
                                        # response starts on a fresh page (default: true); set false
                                        # so sending never moves the scroll position
+follow_up_behavior = "queue"           # mid-turn follow-ups: "queue" (wait for turn end; default) or
+                                       # "steer" (plain Enter still queues visibly, then injects at the
+                                       # next tool/model safe gap). See Keyboard Shortcuts → Mid-turn.
 screen_mode = "fullscreen"             # default render mode: "fullscreen" | "minimal"
                                        # (unset → fullscreen); set via /settings → Default screen mode
 
@@ -76,6 +98,16 @@ load_envrc = true                      # load .envrc environment variables
 
 [tools]
 respect_gitignore = false              # default: false; set true to make every tool skip gitignored files
+
+# Optional caps on parallel media generation in a single model step.
+# Per tool name. First 2×-or-more burst: discard that step and retry once.
+# Any other over-cap (including a second 2× burst) keeps the first K.
+# Defaults: image 8, video 4.
+# Env vars GROK_MAX_PARALLEL_IMAGE_GEN_CALLS / GROK_MAX_PARALLEL_VIDEO_GEN_CALLS
+# override these values (see environment-variables doc).
+# [tools.media_gen]
+# max_parallel_image_gen_calls = 8
+# max_parallel_video_gen_calls = 4
 ```
 
 #### Input mode
@@ -182,9 +214,17 @@ timeout_secs = 1800                    # seconds to wait when enabled (default: 
 proxy_endpoint = "https://proxy.example.com"   # egress proxy URL
 allowed_domains = ["docs.rs", "x.ai"]          # override the built-in allowlist
 allow_local = false                            # true = allow localhost / 127.0.0.0/8 / ::1 only
+
+[toolset.web_search]
+# Restrict web_search to these domains (max 5). Mutually exclusive with excluded_domains.
+allowed_domains = ["docs.x.ai", "arxiv.org"]
+# ...or block these domains instead (leave allowed_domains unset):
+# excluded_domains = ["reddit.com", "pinterest.com"]
 ```
 
 `allow_local` is off by default (SSRF fail-closed). Turn it on (or set `GROK_WEB_FETCH_ALLOW_LOCAL=1`) and `web_fetch` may reach **explicit** loopback hosts only — private, link-local, and cloud-metadata ranges stay blocked. Resolution: TOML > env > default off.
+
+`[toolset.web_search]` constrains the `web_search` tool's domains — the allowlist/blocklist the search itself runs under (not a post-filter). `allowed_domains` and `excluded_domains` are **mutually exclusive**; if you set both, the allowlist wins and the blocklist is dropped with a warning. An empty or absent list is unbounded. This applies to both the backend-hosted search (models with server-side search) and the client-side fallback. A configured policy is **authoritative**: it cannot be bypassed by the model — the model's own per-call `allowed_domains` is ignored whenever you have set `allowed_domains` or `excluded_domains` here (so a blocklist is a real block). The model's per-call allowlist only applies when you have configured nothing. Resolution: requirements → user `config.toml` → managed → default (unset). Config is read at session start, so edit it before starting a session — changes don't apply mid-session.
 
 `[toolset.ask_user_question]` is honored across **requirements.toml**, **managed config**, and your user **`config.toml`**. Precedence: requirements → env (`GROK_ASK_USER_QUESTION_TIMEOUT_ENABLED` / `GROK_ASK_USER_QUESTION_TIMEOUT_SECS`) → user config → managed → defaults. Set `timeout_enabled = false` in your user config to disable the automatic questionnaire timeout for yourself; `timeout_secs` must be a positive integer. You can also toggle `timeout_enabled` from `/settings` → **Ask-Question timeout** (under Agent & Approval); changes apply to newly started sessions.
 
@@ -263,7 +303,7 @@ Priority for `[mcp_servers]` and `[plugins]`: `.grok/config.toml` (current dir) 
 
 ### Memory
 
-Persist knowledge across sessions (requires `--experimental-memory` or `GROK_MEMORY=1`).
+Persist knowledge across sessions. Enable memory with `GROK_MEMORY=1`, `[memory] enabled = true`, or managed remote settings.
 
 ```toml
 [memory]
@@ -277,14 +317,14 @@ enabled = true                        # watch memory files for external edits
 
 [memory.search]
 max_results = 6                       # default number of results
-min_score = 0.35                      # minimum relevance score
+min_score = 0.7                       # minimum relevance score
 
 [memory.initial_injection]
 enabled = true                        # auto-inject memory on first turn
-min_score = 0.0                       # score threshold for first-turn injection
+min_score = 0.9                       # score threshold for first-turn injection
 
 [memory.embedding]
-model = "embedding-model"             # embedding model name
+# model is unset by default, so retrieval uses full-text search only
 dimensions = 1024                     # vector dimensions
 ```
 
@@ -371,13 +411,12 @@ disabled = ["user/a1b2c3d4/noisy-plugin"]
 
 ### Hints
 
-`[hints]` holds small persisted UI preferences — mostly "stop asking me" opt-outs. Grok writes these for you when you pick a "don't ask again" option in the TUI, but you can edit or delete them by hand; removing a key restores the default.
+`[hints]` holds small persisted UI preferences: remembered answers and modal layout. Grok writes these for you as you use the TUI, but you can edit or delete them by hand; removing a key restores the default.
 
-`[hints]` is read from the **effective config merge**, with the usual precedence: system managed → user `managed_config.toml` → user `config.toml` → user `requirements.toml` → system `requirements.toml`, higher layers winning. The TUI only ever **writes** opt-outs to your user `~/.grok/config.toml`.
+`[hints]` is read from the **effective config merge**, with the usual precedence: system managed → user `managed_config.toml` → user `config.toml` → user `requirements.toml` → system `requirements.toml`, higher layers winning. The TUI only ever **writes** these to your user `~/.grok/config.toml`.
 
 ```toml
 [hints]
-project_picker_disabled = false        # skip the project-directory picker
 memory_modal_fullscreen = false        # remember the memory modal fullscreen state
 new_session_worktree_mode = "never"    # /new worktree prompt: "ask" | "always" | "never"
 fork_worktree_mode = "ask"             # /fork worktree prompt: "ask" | "always" | "never"
@@ -385,7 +424,6 @@ fork_worktree_mode = "ask"             # /fork worktree prompt: "ask" | "always"
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `project_picker_disabled` | bool | `false` | When `true`, skips the picker that asks you to choose a project directory on the first prompt when Grok launches from a non-project directory (home, Desktop, Downloads, `/tmp`). Set automatically when you choose **"Don't ask me again"** in that picker. Teams can pin it in `managed_config.toml` or `requirements.toml`. |
 | `memory_modal_fullscreen` | bool | `false` | Remembers whether the memory modal was last opened fullscreen. |
 | `new_session_worktree_mode` | string | `"never"` | Worktree prompt for `/new`: `ask` shows the popup, `always` creates a worktree, `never` skips it. |
 | `fork_worktree_mode` | string | `"ask"` | Worktree prompt for `/fork`: `ask`, `always`, or `never`. |
@@ -511,6 +549,9 @@ otel_metrics_exporter = "otlp"                            # otlp | console | non
 otel_logs_exporter = "otlp"                               # otlp | console | none
 otel_endpoint = "https://collector.corp.example:4318"     # OTLP base endpoint
 otel_protocol = "http/protobuf"                           # http/protobuf | grpc
+otel_certificate = "/etc/ssl/corp-ca.pem"                 # optional: trust private CA (path only)
+otel_client_certificate = "/etc/ssl/client.crt"           # optional: mTLS client cert (path only)
+otel_client_key = "/etc/ssl/client.key"                   # optional: mTLS client key (path only)
 otel_log_user_prompts = false                             # content gate (admins can pin via requirements)
 otel_log_tool_details = false                             # content gate (admins can pin via requirements)
 ```
@@ -630,7 +671,7 @@ gap_right = 0                         # gap between scrollbar and screen edge
 [scrollback.scroll]
 margin = 0                            # minimum context lines above/below selection
 min_page_fraction = 0                 # minimum scroll as % of viewport (0-100)
-follow_indicator = "center"           # follow indicator: "center" or "none"
+follow_indicator = "center"           # ▼/▲ scroll indicators: "center" or "none"
 follow_auto_select = true             # auto-select latest entry in follow mode
 follow_by_overscroll = true           # scrolling past bottom engages follow mode
 anchor_on_fold = true                 # keep block position when folding
@@ -673,19 +714,6 @@ animate = true                        # animated accent while thinking
 truncated_lines = 3                   # lines in truncated mode
 ```
 
-### Todo
-
-```toml
-[todo]
-badge_format = "default"              # "default", "colon", or "comma"
-```
-
-Badge format examples:
-
-- `default`: `2/5` — a `done/total` progress fraction (done = completed, total = all tasks except cancelled).
-- `colon`: `[>:1 [ ]:4 ok:3 x:2]` — icon:count.
-- `comma`: `[1 >, 4 [ ], 3 ok, 2 x]` — count icon, comma-separated.
-
 ### Plugins
 
 ```toml
@@ -727,6 +755,7 @@ The key ones. See the README for the complete list.
 | `GROK_WEB_FETCH_ALLOW_LOCAL` | Allow `web_fetch` to explicit loopback hosts only (`localhost` / `127.0.0.0/8` / `::1`). Same as `[toolset.web_fetch] allow_local`. Default off; private/metadata stay blocked. |
 | `GROK_AGENT` | Custom agent definition path or name |
 | `GROK_SANDBOX` | Sandbox profile (off, workspace, devbox, read-only, strict; or a custom profile name) |
+| `GROK_EXIT_TIMEOUT_SECS` | Seconds after a quit is requested before the process is force-exited if teardown hangs (default: 20, `0` disables; a hard exit follows 5s later) |
 
 ### Logging
 

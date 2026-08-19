@@ -38,7 +38,8 @@ pub use error_codes::{
 };
 pub use error_wire::ToolErrorWire;
 pub use frames::{
-    AttachRoute, HookFrame, HookReplyFrame, LastSeq, LogsDonateParams, MAX_DONATION_BYTES,
+    AttachRoute, HookFrame, HookReplyFrame, IMAGE_CAPABILITIES_V1, IdleWithholdReason, LastSeq,
+    LogsDonateParams, MAX_DONATION_BYTES, MAX_IMAGE_CAPABILITIES, MAX_IMAGE_CAPABILITY_LEN,
     MAX_LOG_RECORDS_PER_DONATION, MAX_METRICS_PER_DONATION, MAX_SPANS_PER_DONATION,
     MAX_SYSTEM_NOTIFY_PAYLOAD_BYTES, MetricsDonateParams, NotificationFilter, PingFrame, PongFrame,
     ServeParams, ServeResult, ServerBindAck, ServerBindOutcome, ServerBindParams, ServerInfo,
@@ -52,7 +53,7 @@ pub use frames::{
     ToolServerGetStatusParams, ToolServerGetStatusResult, ToolServerLifecycleStatus,
     ToolServerStatusPayload, ToolsChanged, ToolsListParams, ToolsListResult, ToolsSearchParams,
     ToolsSearchResultBody, TracesDonateParams, UnsubscribeAck, UnsubscribeNotificationsParams,
-    UnsubscribeOutcome,
+    UnsubscribeOutcome, is_image_capability_token,
 };
 pub use handshake::{HelloAckMsg, HelloMsg, PROTOCOL_VERSION};
 pub use hook::HookEvent;

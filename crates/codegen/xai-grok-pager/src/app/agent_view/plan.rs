@@ -9,11 +9,22 @@ use crate::app::actions::Action;
 use crate::app::app_view::InputOutcome;
 use crate::views::file_search::line_viewer::LineViewerState;
 use crate::views::list_pane::ListItem;
-use crate::views::plan_approval_view::{PlanApprovalFocus, PlanComment, PlanReviewSource};
+use crate::views::plan_approval_view::{
+    PlanApprovalFocus, PlanApprovalViewState, PlanComment, PlanReviewSource,
+};
 use crate::views::prompt_widget::{EnterOutcome, PromptEvent};
 #[cfg(test)]
 use crossterm::event::KeyModifiers;
 use crossterm::event::{KeyCode, KeyEvent};
+/// Telemetry for every way a plan review resolves ("build", "abandon",
+/// "revise").
+fn log_plan_submit(action: &str) {
+    use xai_grok_telemetry::events::PlanSubmit;
+    use xai_grok_telemetry::session_ctx::log_event;
+    log_event(PlanSubmit {
+        action: action.to_string(),
+    });
+}
 impl AgentView {
     /// Resolve the absolute path to the plan file for this session.
     fn plan_file_path(&self) -> Option<std::path::PathBuf> {
@@ -179,8 +190,18 @@ impl AgentView {
         let Some(mut pav) = self.plan_approval_view.take() else {
             return InputOutcome::Changed;
         };
-        let review_comments = if !pav.comments.is_empty() {
-            let formatted = pav.format_feedback(None);
+        let freeform = {
+            let t = self.prompt.text_without_image_chips();
+            let trimmed = t.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_owned())
+            }
+        };
+        Self::merge_live_images_into_stash(&mut self.prompt, &mut pav.stashed_prompt);
+        let review_comments = {
+            let formatted = pav.format_feedback(freeform.as_deref());
             if formatted.trim().is_empty() {
                 None
             } else {
@@ -189,23 +210,9 @@ impl AgentView {
                     formatted
                 ))
             }
-        } else {
-            None
         };
         pav.send_approved();
-        self.latest_inline_plan_content = None;
-        self.plan_next_comment_id = pav.next_comment_id;
-        self.prompt.restore(pav.stashed_prompt);
-        self.line_viewer = None;
-        self.casual_commenting_range = None;
-        self.casual_editing_comment_id = None;
-        {
-            use xai_grok_telemetry::events::PlanSubmit;
-            use xai_grok_telemetry::session_ctx::log_event;
-            log_event(PlanSubmit {
-                action: "build".to_string(),
-            });
-        }
+        self.close_plan_review(pav, "build");
         if let Some(text) = review_comments {
             return InputOutcome::Action(Action::Interject {
                 text,
@@ -214,26 +221,101 @@ impl AgentView {
         }
         InputOutcome::Changed
     }
+    /// Fold freeform-only images into the session draft. Prefill clones share
+    /// `display_number` *and* payload with the session image and are dropped;
+    /// number reuse after freeform clear (Ctrl+C resets the counter) is not a
+    /// clone and must renumber-merge. New images get matching `[Image #N]` chip
+    /// text/elements so `restore` can re-bind them.
+    fn merge_live_images_into_stash(
+        prompt: &mut crate::views::prompt_widget::PromptWidget,
+        session: &mut crate::views::prompt_widget::StashedPrompt,
+    ) {
+        let live = prompt.drain_images();
+        for mut img in live {
+            if session.images.iter().any(|s| {
+                s.display_number == img.display_number && Self::same_image_payload(s, &img)
+            }) {
+                crate::prompt_images::cleanup_temp_file(&img);
+                continue;
+            }
+            session.image_counter = session.image_counter.max(
+                session
+                    .images
+                    .iter()
+                    .map(|i| i.display_number)
+                    .max()
+                    .unwrap_or(0),
+            );
+            session.image_counter += 1;
+            let dn = session.image_counter;
+            img.display_number = dn;
+            if !session.text.is_empty()
+                && !session.text.ends_with(' ')
+                && !session.text.ends_with('\n')
+            {
+                session.text.push(' ');
+            }
+            let placeholder = crate::prompt_images::display_text(dn);
+            let start = session.text.len();
+            session.text.push_str(&placeholder);
+            let end = session.text.len();
+            session.text.push(' ');
+            session.chip_elements.push(crate::app::agent::ChipElement {
+                range: start..end,
+                kind: crate::views::prompt_widget::KIND_IMAGE,
+                display: None,
+            });
+            session.images.push(img);
+            session.cursor = session.text.len();
+        }
+    }
+    /// Content identity for prefill-clone detection (not display_number alone).
+    fn same_image_payload(
+        a: &crate::prompt_images::PastedImage,
+        b: &crate::prompt_images::PastedImage,
+    ) -> bool {
+        match (&a.encoded_bytes, &b.encoded_bytes) {
+            (Some(ea), Some(eb)) if ea == eb => return true,
+            _ => {}
+        }
+        match (&a.session_image_path, &b.session_image_path) {
+            (Some(pa), Some(pb)) if pa == pb => return true,
+            _ => {}
+        }
+        match (&a.source_path, &b.source_path) {
+            (Some(pa), Some(pb)) if pa == pb => return true,
+            _ => {}
+        }
+        false
+    }
     pub(crate) fn abandon_plan(&mut self) -> InputOutcome {
         let Some(mut pav) = self.plan_approval_view.take() else {
             return InputOutcome::Changed;
         };
         pav.send_abandoned();
+        self.close_plan_review(pav, "abandon");
+        InputOutcome::Changed
+    }
+    /// Shared teardown for the two plan-review decisions that end the
+    /// review (approve and abandon). The shell leaves plan mode as a
+    /// result, but its confirming `CurrentModeUpdate("default")` is
+    /// fire-and-forget and only arrives after the exit tool runs — so
+    /// flip the mode indicator optimistically here (a lost update would
+    /// otherwise leave the badge stuck on "plan"), restore the
+    /// pre-review UI, and log the decision.
+    ///
+    /// Not for the revision path (`send_plan_feedback`): the shell
+    /// stays in plan mode there, so the indicator must stay on.
+    fn close_plan_review(&mut self, pav: PlanApprovalViewState, action: &'static str) {
         self.plan_mode_pending = Some(false);
+        self.plan_freeform_prefill_deferred = false;
         self.latest_inline_plan_content = None;
         self.plan_next_comment_id = pav.next_comment_id;
         self.prompt.restore(pav.stashed_prompt);
         self.line_viewer = None;
         self.casual_commenting_range = None;
         self.casual_editing_comment_id = None;
-        {
-            use xai_grok_telemetry::events::PlanSubmit;
-            use xai_grok_telemetry::session_ctx::log_event;
-            log_event(PlanSubmit {
-                action: "abandon".to_string(),
-            });
-        }
-        InputOutcome::Changed
+        log_plan_submit(action);
     }
     fn send_plan_feedback(&mut self, feedback: Option<String>) -> InputOutcome {
         let Some(mut pav) = self.plan_approval_view.take() else {
@@ -251,30 +333,24 @@ impl AgentView {
             self.scrollback
                 .push_block(crate::scrollback::RenderBlock::user_prompt(msg.to_string()));
         }
+        Self::merge_live_images_into_stash(&mut self.prompt, &mut pav.stashed_prompt);
         pav.send_cancelled(to_send);
         if pav.source == PlanReviewSource::Inline {
             self.latest_inline_plan_content = None;
         }
+        self.plan_freeform_prefill_deferred = false;
         self.plan_next_comment_id = pav.next_comment_id;
         self.prompt.restore(pav.stashed_prompt);
         self.line_viewer = None;
         self.prompt.textarea.cancel_undo_group();
         self.show_toast("Plan revision sent.");
-        {
-            use xai_grok_telemetry::events::PlanSubmit;
-            use xai_grok_telemetry::session_ctx::log_event;
-            log_event(PlanSubmit {
-                action: "revise".to_string(),
-            });
-        }
+        log_plan_submit("revise");
         InputOutcome::Changed
     }
     pub(crate) fn reopen_plan_approval(&mut self) {
         if let Some(ref mut pav) = self.plan_approval_view {
-            pav.stashed_prompt = self.prompt.stash();
             pav.focus = PlanApprovalFocus::Preview;
         }
-        self.prompt.set_text("");
         self.show_plan_preview_if_available();
         if self.line_viewer.is_none() {
             if let Some(ref mut pav) = self.plan_approval_view {
@@ -284,24 +360,29 @@ impl AgentView {
             viewer.plan_mut().feedback_active = true;
         }
     }
-    /// Discard an in-progress comment draft: clear the prompt text and
-    /// drop the selected line range + pending edit + stashed feedback.
-    /// Used whenever focus leaves the prompt without an explicit save
-    /// or cancel (e.g. Tab back to Preview, click into the modal).
-    fn discard_in_progress_comment(&mut self) {
-        if let Some(ref mut pav) = self.plan_approval_view {
+    fn leave_plan_commenting_restore_freeform(&mut self) {
+        let stashed = if let Some(ref mut pav) = self.plan_approval_view {
             pav.commenting_range = None;
             pav.editing_comment_id = None;
-            pav.stashed_feedback_prompt = None;
+            pav.stashed_feedback_prompt.take()
+        } else {
+            None
+        };
+        if let Some(stashed) = stashed {
+            self.prompt.restore(stashed);
+        } else {
+            self.prompt.set_text("");
         }
-        self.prompt.set_text("");
+    }
+    pub(super) fn discard_in_progress_comment(&mut self) {
+        self.leave_plan_commenting_restore_freeform();
     }
     pub(super) fn handle_plan_feedback_key(&mut self, key: &KeyEvent) -> InputOutcome {
         let is_commenting = self
             .plan_approval_view
             .as_ref()
             .is_some_and(|pav| pav.focus == PlanApprovalFocus::Commenting);
-        if key.code == KeyCode::Tab && key.modifiers.is_empty() {
+        if crate::input::key::RowWalk::from_key(key).is_some() {
             let focus = self.plan_approval_view.as_ref().map(|p| p.focus);
             match focus {
                 Some(PlanApprovalFocus::Prompt) | Some(PlanApprovalFocus::Commenting) => {
@@ -333,19 +414,10 @@ impl AgentView {
                 return InputOutcome::Changed;
             }
             if is_commenting {
-                let stashed = if let Some(ref mut pav) = self.plan_approval_view {
+                if let Some(ref mut pav) = self.plan_approval_view {
                     pav.focus = PlanApprovalFocus::Preview;
-                    pav.editing_comment_id = None;
-                    pav.commenting_range = None;
-                    pav.stashed_feedback_prompt.take()
-                } else {
-                    None
-                };
-                if let Some(stashed) = stashed {
-                    self.prompt.restore(stashed);
-                } else {
-                    self.prompt.set_text("");
                 }
+                self.discard_in_progress_comment();
                 return InputOutcome::Changed;
             }
             if let Some(ref mut pav) = self.plan_approval_view {
@@ -353,13 +425,21 @@ impl AgentView {
             }
             return InputOutcome::Changed;
         }
+        if !is_commenting
+            && key.code == KeyCode::Char('a')
+            && key.modifiers.is_empty()
+            && self.prompt.text_without_image_chips().trim().is_empty()
+            && !self.prompt.file_search_visible()
+        {
+            return self.approve_plan();
+        }
         match self.prompt.route_enter(key) {
             EnterOutcome::NewlineInserted => return InputOutcome::Changed,
             EnterOutcome::Submit => {
                 if is_commenting {
                     return self.save_plan_comment();
                 }
-                let text = self.prompt.text().to_string();
+                let freeform_text = self.prompt.text_without_image_chips();
                 let has_comments = self
                     .plan_approval_view
                     .as_ref()
@@ -369,13 +449,17 @@ impl AgentView {
                     .as_ref()
                     .is_some_and(|pav| pav.focus == PlanApprovalFocus::Prompt);
                 if prompt_focused {
-                    if text.trim().is_empty() && !has_comments {
-                        return self.approve_plan();
+                    if freeform_text.trim().is_empty() && !has_comments {
+                        self.show_toast("Type revision notes, or press a to approve.");
+                        return InputOutcome::Changed;
                     }
-                    let freeform = if text.trim().is_empty() {
-                        None
-                    } else {
-                        Some(text)
+                    let freeform = {
+                        let trimmed = freeform_text.trim();
+                        if trimmed.is_empty() {
+                            None
+                        } else {
+                            Some(trimmed.to_owned())
+                        }
                     };
                     return self.send_plan_feedback(freeform);
                 }
@@ -406,7 +490,9 @@ impl AgentView {
             {
                 let comment_text = comment.text.clone();
                 let comment_range = comment.line_range.clone();
-                pav.stashed_feedback_prompt = Some(self.prompt.stash());
+                if pav.stashed_feedback_prompt.is_none() {
+                    pav.stashed_feedback_prompt = Some(self.prompt.stash());
+                }
                 pav.editing_comment_id = Some(comment_id);
                 pav.commenting_range = Some(comment_range);
                 pav.focus = PlanApprovalFocus::Commenting;
@@ -432,7 +518,9 @@ impl AgentView {
             }
         }
         if let Some(ref mut pav) = self.plan_approval_view {
-            pav.stashed_feedback_prompt = Some(self.prompt.stash());
+            if pav.stashed_feedback_prompt.is_none() {
+                pav.stashed_feedback_prompt = Some(self.prompt.stash());
+            }
             pav.commenting_range = Some(range);
             pav.editing_comment_id = None;
             pav.focus = PlanApprovalFocus::Commenting;
@@ -870,5 +958,507 @@ mod plan_chip_tests {
             a_on.handle_scrollback_key(&down, &registry),
             InputOutcome::Action(Action::SelectNext)
         ));
+    }
+}
+#[cfg(test)]
+mod plan_approval_enter_tests {
+    use super::test_fixtures::make_agent;
+    use super::*;
+    use crate::views::plan_approval_view::PlanApprovalFocus;
+    fn enter_key() -> KeyEvent {
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
+    }
+    fn agent_with_revise_prompt() -> AgentView {
+        let mut agent = make_agent();
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        let request = crate::views::plan_approval_view::ExitPlanModeExtRequest {
+            session_id: "test-session".into(),
+            tool_call_id: "call-1".into(),
+            plan_content: Some("# Plan\n\n## Step 1\nDo something".into()),
+        };
+        let mut pav = crate::views::plan_approval_view::PlanApprovalViewState::new(
+            request,
+            crate::views::prompt_widget::StashedPrompt {
+                text: String::new(),
+                cursor: 0,
+                images: Vec::new(),
+                chip_elements: Vec::new(),
+                image_counter: 0,
+                image_undo_stash: Vec::new(),
+            },
+            tx,
+        );
+        pav.focus = PlanApprovalFocus::Prompt;
+        agent.plan_approval_view = Some(pav);
+        agent.prompt.set_text("");
+        agent
+    }
+    #[test]
+    fn empty_enter_on_revise_prompt_does_not_approve() {
+        let mut agent = agent_with_revise_prompt();
+        let outcome = agent.handle_plan_feedback_key(&enter_key());
+        assert!(matches!(outcome, InputOutcome::Changed));
+        assert!(
+            agent.plan_approval_view.is_some(),
+            "empty Enter must leave plan approval open"
+        );
+        assert_eq!(
+            agent.toast.as_ref().map(|(msg, _)| msg.as_str()),
+            Some("Type revision notes, or press a to approve.")
+        );
+    }
+    #[test]
+    fn enter_with_revision_text_requests_changes() {
+        let mut agent = agent_with_revise_prompt();
+        agent.prompt.set_text("please use auth middleware");
+        let outcome = agent.handle_plan_feedback_key(&enter_key());
+        assert!(matches!(outcome, InputOutcome::Changed));
+        assert!(agent.plan_approval_view.is_none());
+        assert_eq!(
+            agent.toast.as_ref().map(|(msg, _)| msg.as_str()),
+            Some("Plan revision sent.")
+        );
+    }
+    #[test]
+    fn empty_enter_with_pending_comments_still_requests_changes() {
+        let mut agent = agent_with_revise_prompt();
+        if let Some(ref mut pav) = agent.plan_approval_view {
+            pav.comments.push(PlanComment {
+                id: 1,
+                line_range: 0..1,
+                text: "nit".into(),
+            });
+        }
+        let outcome = agent.handle_plan_feedback_key(&enter_key());
+        assert!(matches!(outcome, InputOutcome::Changed));
+        assert!(agent.plan_approval_view.is_none());
+        assert_eq!(
+            agent.toast.as_ref().map(|(msg, _)| msg.as_str()),
+            Some("Plan revision sent.")
+        );
+    }
+    #[test]
+    fn a_on_empty_revise_prompt_approves() {
+        let mut agent = agent_with_revise_prompt();
+        let a = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE);
+        let outcome = agent.handle_plan_feedback_key(&a);
+        assert!(matches!(outcome, InputOutcome::Changed));
+        assert!(agent.plan_approval_view.is_none(), "`a` must approve");
+        assert_ne!(
+            agent.toast.as_ref().map(|(msg, _)| msg.as_str()),
+            Some("Plan revision sent.")
+        );
+    }
+    #[test]
+    fn a_with_pending_comments_and_empty_freeform_approves() {
+        let mut agent = agent_with_revise_prompt();
+        if let Some(ref mut pav) = agent.plan_approval_view {
+            pav.comments.push(PlanComment {
+                id: 1,
+                line_range: 0..1,
+                text: "nit".into(),
+            });
+        }
+        let a = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE);
+        let outcome = agent.handle_plan_feedback_key(&a);
+        assert!(
+            agent.plan_approval_view.is_none(),
+            "empty freeform + comments: `a` must approve with comments"
+        );
+        assert!(matches!(
+            outcome,
+            InputOutcome::Action(Action::Interject { .. })
+        ));
+    }
+    #[test]
+    fn a_with_nonempty_freeform_types_letter() {
+        let mut agent = agent_with_revise_prompt();
+        agent.prompt.set_text("notes");
+        agent.prompt.set_cursor(agent.prompt.text().len());
+        let a = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE);
+        let _ = agent.handle_plan_feedback_key(&a);
+        assert!(
+            agent.plan_approval_view.is_some(),
+            "non-empty freeform: `a` must type into the revision notes"
+        );
+        assert_eq!(agent.prompt.text(), "notesa");
+    }
+    #[test]
+    fn tab_out_of_commenting_restores_freeform() {
+        let mut agent = agent_with_revise_prompt();
+        agent.prompt.set_text("keep my freeform notes");
+        if let Some(ref mut pav) = agent.plan_approval_view {
+            pav.stashed_feedback_prompt = Some(agent.prompt.stash());
+            pav.commenting_range = Some(0..1);
+            pav.focus = PlanApprovalFocus::Commenting;
+        }
+        agent.prompt.set_text("unsaved comment draft");
+        let tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
+        let _ = agent.handle_plan_feedback_key(&tab);
+        assert_eq!(agent.prompt.text(), "keep my freeform notes");
+        assert_eq!(
+            agent.plan_approval_view.as_ref().map(|p| p.focus),
+            Some(PlanApprovalFocus::Preview)
+        );
+    }
+    #[test]
+    fn reopen_plan_approval_does_not_clobber_session_draft() {
+        let mut agent = agent_with_revise_prompt();
+        if let Some(ref mut pav) = agent.plan_approval_view {
+            pav.stashed_prompt = crate::views::prompt_widget::StashedPrompt {
+                text: "session draft from mid-thinking".into(),
+                cursor: 0,
+                images: Vec::new(),
+                chip_elements: Vec::new(),
+                image_counter: 0,
+                image_undo_stash: Vec::new(),
+            };
+        }
+        agent.prompt.set_text("revision freeform");
+        agent.reopen_plan_approval();
+        assert_eq!(
+            agent
+                .plan_approval_view
+                .as_ref()
+                .map(|p| p.stashed_prompt.text.as_str()),
+            Some("session draft from mid-thinking"),
+        );
+        assert_eq!(agent.prompt.text(), "revision freeform");
+        agent.abandon_plan();
+        assert_eq!(agent.prompt.text(), "session draft from mid-thinking");
+    }
+    #[test]
+    fn approve_includes_freeform_notes() {
+        let mut agent = agent_with_revise_prompt();
+        if let Some(ref mut pav) = agent.plan_approval_view {
+            pav.stashed_prompt = crate::views::prompt_widget::StashedPrompt {
+                text: "session draft".into(),
+                cursor: 0,
+                images: Vec::new(),
+                chip_elements: Vec::new(),
+                image_counter: 0,
+                image_undo_stash: Vec::new(),
+            };
+        }
+        agent.prompt.set_text("please also fix auth");
+        let outcome = agent.approve_plan();
+        assert!(matches!(
+            outcome,
+            InputOutcome::Action(Action::Interject { ref text, .. })
+                if text.contains("please also fix auth")
+        ));
+        assert_eq!(
+            agent.prompt.text(),
+            "session draft",
+            "approve restores session draft after including freeform"
+        );
+    }
+    #[test]
+    fn approve_does_not_duplicate_prefilled_session_images() {
+        let mut agent = agent_with_revise_prompt();
+        let session_img = crate::prompt_images::PastedImage {
+            element_id: xai_ratatui_textarea::ElementId::from_raw(1),
+            display_number: 1,
+            mime_type: "image/png".into(),
+            dimensions: Some((100, 80)),
+            byte_len: 16,
+            encoded_bytes: Some(vec![0u8; 16].into()),
+            source_path: None,
+            staged_temp_path: None,
+            session_image_path: None,
+            preview: crate::prompt_images::PromptImagePreview::default(),
+        };
+        if let Some(ref mut pav) = agent.plan_approval_view {
+            pav.stashed_prompt = crate::views::prompt_widget::StashedPrompt {
+                text: "see [Image #1] ".into(),
+                cursor: 0,
+                images: vec![session_img.clone()],
+                chip_elements: vec![crate::app::agent::ChipElement {
+                    range: 4..14,
+                    kind: crate::views::prompt_widget::KIND_IMAGE,
+                    display: None,
+                }],
+                image_counter: 1,
+                image_undo_stash: Vec::new(),
+            };
+        }
+        let mut freeform_img = session_img;
+        freeform_img.element_id = xai_ratatui_textarea::ElementId::from_raw(2);
+        agent.prompt.set_text("see [Image #1] ");
+        agent.prompt.set_images(vec![freeform_img]);
+        agent.approve_plan();
+        assert_eq!(agent.prompt.images.len(), 1);
+        assert_eq!(agent.prompt.images[0].display_number, 1);
+    }
+    #[test]
+    fn approve_merges_new_freeform_image_despite_reused_display_number() {
+        let mut agent = agent_with_revise_prompt();
+        let session_img = crate::prompt_images::PastedImage {
+            element_id: xai_ratatui_textarea::ElementId::from_raw(1),
+            display_number: 1,
+            mime_type: "image/png".into(),
+            dimensions: Some((100, 80)),
+            byte_len: 16,
+            encoded_bytes: Some(vec![1u8; 16].into()),
+            source_path: None,
+            staged_temp_path: None,
+            session_image_path: None,
+            preview: crate::prompt_images::PromptImagePreview::default(),
+        };
+        if let Some(ref mut pav) = agent.plan_approval_view {
+            pav.stashed_prompt = crate::views::prompt_widget::StashedPrompt {
+                text: "session [Image #1] ".into(),
+                cursor: 0,
+                images: vec![session_img],
+                chip_elements: vec![crate::app::agent::ChipElement {
+                    range: 8..18,
+                    kind: crate::views::prompt_widget::KIND_IMAGE,
+                    display: None,
+                }],
+                image_counter: 1,
+                image_undo_stash: Vec::new(),
+            };
+        }
+        agent.prompt.set_text("");
+        let new_img = crate::prompt_images::PastedImage {
+            element_id: xai_ratatui_textarea::ElementId::from_raw(0),
+            display_number: 0,
+            mime_type: "image/png".into(),
+            dimensions: Some((100, 80)),
+            byte_len: 16,
+            encoded_bytes: Some(vec![9u8; 16].into()),
+            source_path: None,
+            staged_temp_path: None,
+            session_image_path: None,
+            preview: crate::prompt_images::PromptImagePreview::default(),
+        };
+        agent
+            .prompt
+            .insert_image(new_img)
+            .expect("paste freeform image after clear");
+        assert_eq!(
+            agent.prompt.images[0].display_number, 1,
+            "precondition: freeform counter reset reuses #1"
+        );
+        agent.approve_plan();
+        assert_eq!(
+            agent.prompt.images.len(),
+            2,
+            "new freeform image must merge beside session image"
+        );
+        let numbers: Vec<_> = agent
+            .prompt
+            .images
+            .iter()
+            .map(|i| i.display_number)
+            .collect();
+        assert!(
+            numbers.contains(&1) && numbers.contains(&2),
+            "got {numbers:?}"
+        );
+        assert!(
+            agent.prompt.text().contains("[Image #2]"),
+            "renumbered chip must appear in session draft text, got {:?}",
+            agent.prompt.text()
+        );
+    }
+    #[test]
+    fn approve_strips_image_chips_from_interjection_text() {
+        let mut agent = agent_with_revise_prompt();
+        agent.prompt.set_text("also check auth ");
+        let img = crate::prompt_images::PastedImage {
+            element_id: xai_ratatui_textarea::ElementId::from_raw(0),
+            display_number: 0,
+            mime_type: "image/png".into(),
+            dimensions: Some((100, 80)),
+            byte_len: 16,
+            encoded_bytes: Some(vec![0u8; 16].into()),
+            source_path: None,
+            staged_temp_path: None,
+            session_image_path: None,
+            preview: crate::prompt_images::PromptImagePreview::default(),
+        };
+        agent
+            .prompt
+            .insert_image(img)
+            .expect("insert freeform image chip");
+        assert!(
+            agent.prompt.text().contains("[Image #1]"),
+            "precondition: chip in freeform text"
+        );
+        let outcome = agent.approve_plan();
+        match outcome {
+            InputOutcome::Action(Action::Interject { text, images }) => {
+                assert!(
+                    !text.contains("[Image #"),
+                    "approve interjection must not leak image chip tokens, got {text:?}"
+                );
+                assert!(
+                    text.contains("also check auth"),
+                    "non-chip freeform text must still ship, got {text:?}"
+                );
+                assert!(
+                    images.is_empty(),
+                    "approve interjection stays text-only; images merge into session draft"
+                );
+            }
+            other => panic!("expected Interject with freeform, got {other:?}"),
+        }
+        assert!(
+            agent.prompt.text().contains("[Image #1]"),
+            "merged freeform image must restore with a chip in session draft text, got {:?}",
+            agent.prompt.text()
+        );
+        assert_eq!(
+            agent.prompt.images.len(),
+            1,
+            "freeform image must merge into restored session draft"
+        );
+        let stashed = agent.prompt.stash();
+        agent.prompt.restore(stashed);
+        assert_eq!(agent.prompt.images.len(), 1);
+        assert!(agent.prompt.text().contains("[Image #1]"));
+    }
+    #[test]
+    fn a_on_image_only_freeform_approves() {
+        let mut agent = agent_with_revise_prompt();
+        let img = crate::prompt_images::PastedImage {
+            element_id: xai_ratatui_textarea::ElementId::from_raw(0),
+            display_number: 0,
+            mime_type: "image/png".into(),
+            dimensions: Some((100, 80)),
+            byte_len: 16,
+            encoded_bytes: Some(vec![0u8; 16].into()),
+            source_path: None,
+            staged_temp_path: None,
+            session_image_path: None,
+            preview: crate::prompt_images::PromptImagePreview::default(),
+        };
+        agent
+            .prompt
+            .insert_image(img)
+            .expect("insert freeform image chip");
+        let a = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE);
+        let outcome = agent.handle_plan_feedback_key(&a);
+        assert!(
+            agent.plan_approval_view.is_none(),
+            "image-only freeform: `a` must approve (not type the letter)"
+        );
+        assert!(matches!(outcome, InputOutcome::Changed));
+        assert!(
+            agent.prompt.text().contains("[Image #1]"),
+            "freeform image folds into restored session draft"
+        );
+    }
+    #[test]
+    fn image_only_freeform_enter_toasts_instead_of_empty_revision() {
+        let mut agent = agent_with_revise_prompt();
+        let img = crate::prompt_images::PastedImage {
+            element_id: xai_ratatui_textarea::ElementId::from_raw(0),
+            display_number: 0,
+            mime_type: "image/png".into(),
+            dimensions: Some((100, 80)),
+            byte_len: 16,
+            encoded_bytes: Some(vec![0u8; 16].into()),
+            source_path: None,
+            staged_temp_path: None,
+            session_image_path: None,
+            preview: crate::prompt_images::PromptImagePreview::default(),
+        };
+        agent
+            .prompt
+            .insert_image(img)
+            .expect("insert freeform image chip");
+        let outcome = agent.handle_plan_feedback_key(&enter_key());
+        assert!(matches!(outcome, InputOutcome::Changed));
+        assert!(
+            agent.plan_approval_view.is_some(),
+            "image-only freeform must not cancel the plan with empty feedback"
+        );
+        assert_eq!(
+            agent.toast.as_ref().map(|(msg, _)| msg.as_str()),
+            Some("Type revision notes, or press a to approve.")
+        );
+    }
+}
+/// The mode indicator renders
+/// `plan_mode_pending.unwrap_or(plan_mode_active)`, and the shell's
+/// confirming `CurrentModeUpdate("default")` only arrives after the exit
+/// tool runs (and can be lost entirely). Resolving the review with a
+/// decision must therefore optimistically clear the effective plan mode
+/// on BOTH decision paths — approve and abandon.
+#[cfg(test)]
+mod plan_approval_optimistic_mode_tests {
+    use super::test_fixtures::make_agent;
+    use super::*;
+    use agent_client_protocol as acp;
+    fn agent_in_plan_mode_with_approval() -> (
+        AgentView,
+        tokio::sync::oneshot::Receiver<xai_acp_lib::AcpResult<acp::ExtResponse>>,
+    ) {
+        let mut agent = make_agent();
+        agent.plan_mode_active = true;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let request = crate::views::plan_approval_view::ExitPlanModeExtRequest {
+            session_id: "test-session".into(),
+            tool_call_id: "call-1".into(),
+            plan_content: Some("# Plan\n\n## Step 1\nDo something".into()),
+        };
+        let pav = crate::views::plan_approval_view::PlanApprovalViewState::new(
+            request,
+            agent.prompt.stash(),
+            tx,
+        );
+        agent.plan_approval_view = Some(pav);
+        (agent, rx)
+    }
+    fn effective_plan_mode(agent: &AgentView) -> bool {
+        agent.plan_mode_pending.unwrap_or(agent.plan_mode_active)
+    }
+    #[test]
+    fn approve_plan_optimistically_clears_plan_mode() {
+        let (mut agent, mut rx) = agent_in_plan_mode_with_approval();
+        assert!(effective_plan_mode(&agent));
+        agent.approve_plan();
+        assert_eq!(agent.plan_mode_pending, Some(false));
+        assert!(
+            !effective_plan_mode(&agent),
+            "indicator must leave plan mode immediately on approve, \
+             not wait for the shell's CurrentModeUpdate"
+        );
+        let raw = rx
+            .try_recv()
+            .expect("approval response must be sent")
+            .expect("Ok");
+        let parsed: serde_json::Value = serde_json::from_str(raw.0.get()).unwrap();
+        assert_eq!(parsed["outcome"], "approved");
+    }
+    /// Approve with review comments takes the early `Action::Interject`
+    /// return — the optimistic clear must happen before that branch.
+    #[test]
+    fn approve_plan_with_comments_still_clears_plan_mode() {
+        let (mut agent, _rx) = agent_in_plan_mode_with_approval();
+        if let Some(ref mut pav) = agent.plan_approval_view {
+            pav.comments
+                .push(crate::views::plan_approval_view::PlanComment {
+                    id: 1,
+                    line_range: 1..2,
+                    text: "use the existing helper".into(),
+                });
+        }
+        let outcome = agent.approve_plan();
+        assert!(matches!(
+            outcome,
+            InputOutcome::Action(Action::Interject { .. })
+        ));
+        assert_eq!(agent.plan_mode_pending, Some(false));
+        assert!(!effective_plan_mode(&agent));
+    }
+    #[test]
+    fn abandon_plan_optimistically_clears_plan_mode() {
+        let (mut agent, _rx) = agent_in_plan_mode_with_approval();
+        agent.abandon_plan();
+        assert_eq!(agent.plan_mode_pending, Some(false));
+        assert!(!effective_plan_mode(&agent));
     }
 }

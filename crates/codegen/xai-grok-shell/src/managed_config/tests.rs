@@ -444,3 +444,44 @@ fn claim_persists_only_when_bound_to_served_principal() {
 fn absent_claim_is_skipped() {
     assert!(verified_claim_sidecar(&ManagedConfigResponse::default(), Some("team-007")).is_none());
 }
+
+/// The startup label: a deployment key wins outright, and an unreadable
+/// `auth.json` is `unknown`, never `personal` — the sync still runs and
+/// mislabeling it would hide the deployment-cost split.
+#[test]
+fn auth_mode_classification() {
+    use xai_grok_telemetry::startup::AuthMode;
+    let err = || std::io::Error::other("unreadable");
+    assert_eq!(auth_mode(true, &Ok(true)), AuthMode::Deployment);
+    assert_eq!(auth_mode(true, &Err(err())), AuthMode::Deployment);
+    assert_eq!(auth_mode(false, &Ok(true)), AuthMode::Team);
+    assert_eq!(auth_mode(false, &Ok(false)), AuthMode::Personal);
+    assert_eq!(auth_mode(false, &Err(err())), AuthMode::Unknown);
+}
+
+/// The `GROK_CONFIG` overlay must not arm or disarm the managed-config sync gate:
+/// the reader is overlay-free, so an overlay value never reaches it in either
+/// direction. Requirements/managed layers still resolve normally.
+#[test]
+fn managed_config_gate_ignores_the_overlay_in_both_directions() {
+    use crate::config::ConfigLayers;
+
+    fn features_managed_config(v: bool) -> toml::Value {
+        toml::from_str(&format!("[features]\nmanaged_config = {v}\n")).unwrap()
+    }
+
+    let mut layers = ConfigLayers {
+        user: features_managed_config(true),
+        env_overlay: Some(features_managed_config(false)),
+        ..Default::default()
+    };
+    assert_eq!(managed_config_enabled_from_layers(&layers), Some(true));
+
+    layers.user = features_managed_config(false);
+    layers.env_overlay = Some(features_managed_config(true));
+    assert_eq!(managed_config_enabled_from_layers(&layers), Some(false));
+
+    layers.user = toml::Value::Table(Default::default());
+    layers.env_overlay = Some(features_managed_config(false));
+    assert_eq!(managed_config_enabled_from_layers(&layers), None);
+}
