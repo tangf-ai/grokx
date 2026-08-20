@@ -34,6 +34,9 @@ Local packaging patches currently in the subtree (re-apply after pull if they dr
 
 - `bin/protoc`: add `windows-x86_64` DotSlash platform (protobuf 29.3 win64).
 - `crates/build/xai-proto-build`: also look for `bin/protoc.exe` / `protoc.exe`.
+- `crates/build/xai-proto-build`: skip the Unix `bin/protoc` shebang on Windows,
+  accept Git-Bash `PROTOC` paths, and write dep files to a temp dir instead of
+  `/dev/stdout` + `/dev/null`.
 
 These are build-host fixes for Windows CI; they do not change ACP behavior.
 

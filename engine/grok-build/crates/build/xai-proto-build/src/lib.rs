@@ -4,7 +4,7 @@ pub mod find_protoc;
 use anyhow::Context;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::{fs, iter};
+use std::fs;
 
 /// Find the protoc well-known types include directory.
 ///
@@ -126,11 +126,16 @@ impl XaiProtoBuilder {
         }
 
         // Can only process one input file when using --dependency_out=FILE.
-        for proto in protos {
+        // `/dev/stdout` and `/dev/null` do not exist on Windows, so write both
+        // to a temp dir and parse the makefile-style dep file.
+        let tmp = tempfile::TempDir::new().context("temp dir for protoc deps")?;
+        for (i, proto) in protos.into_iter().enumerate() {
+            let dep_path = tmp.path().join(format!("deps-{i}"));
+            let desc_path = tmp.path().join(format!("desc-{i}.pb"));
             let mut command = Command::new(protoc.unwrap_or(Path::new("protoc")));
             command
-                .arg("--dependency_out=/dev/stdout")
-                .arg("--descriptor_set_out=/dev/null");
+                .arg(format!("--dependency_out={}", dep_path.display()))
+                .arg(format!("--descriptor_set_out={}", desc_path.display()));
 
             // Add protoc's well-known types include directory first (if found).
             // This is needed for Bazel sandboxed builds where protoc and its
@@ -151,27 +156,24 @@ impl XaiProtoBuilder {
             command.stdin(Stdio::null());
             command.stderr(Stdio::inherit());
 
-            let output = command.output().context("protoc command failed")?;
-            if !output.status.success() {
+            let status = command.status().context("protoc command failed")?;
+            if !status.success() {
                 return Err(anyhow::anyhow!("protoc command failed"));
             }
 
-            let output =
-                String::from_utf8(output.stdout).context("protoc command output not UTF-8")?;
-
-            let mut lines = output.lines();
-            let first_line = lines.next().context("protoc command output is empty")?;
-            let prefix = "/dev/null:";
-            let rem = first_line.strip_prefix(prefix).with_context(|| {
-                format!("protoc command output must start with /dev/null: {output:?}")
+            let output = fs::read_to_string(&dep_path).with_context(|| {
+                format!("protoc dep file missing: {}", dep_path.display())
             })?;
-            for line in iter::once(rem).chain(lines) {
+            for line in parse_makefile_dep_inputs(&output) {
                 let line = line.trim();
-                let line = line.strip_suffix("\\").unwrap_or(line);
+                if line.is_empty() {
+                    continue;
+                }
                 // Depending on absolute paths like
                 // /Users/user/homebrew/Cellar/protobuf/29.1/include/google/protobuf/timestamp.proto
                 // is valid, but we want to have output more deterministic.
-                if line.contains("/include/google/protobuf/") {
+                let normalized = line.replace('\\', "/");
+                if normalized.contains("/include/google/protobuf/") {
                     continue;
                 }
 
@@ -311,6 +313,20 @@ impl XaiProtoBuilder {
     }
 }
 
+/// Parse `target: dep1 dep2 \` makefile output from `protoc --dependency_out`.
+/// Split on `: ` so Windows drive letters (`C:`) are not treated as the separator.
+fn parse_makefile_dep_inputs(output: &str) -> Vec<String> {
+    let collapsed = output.replace("\\\r\n", " ").replace("\\\n", " ");
+    let rest = collapsed
+        .split_once(": ")
+        .map(|(_, rest)| rest)
+        .unwrap_or(&collapsed);
+    rest.split_whitespace()
+        .map(|s| s.trim_end_matches('\\').to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
 pub fn configure() -> XaiProtoBuilder {
     let builder = tonic_prost_build::configure()
         .compile_well_known_types(true)
@@ -324,5 +340,28 @@ pub fn configure() -> XaiProtoBuilder {
         pbjson_preserve_proto_field_names: false,
         file_descriptor_set_path: None,
         honor_debug_redact: false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_makefile_dep_inputs;
+
+    #[test]
+    fn parses_unix_protoc_dep_file() {
+        let out = "/tmp/desc.pb: proto/a.proto \\\n proto/b.proto\n";
+        assert_eq!(
+            parse_makefile_dep_inputs(out),
+            vec!["proto/a.proto".to_string(), "proto/b.proto".to_string()]
+        );
+    }
+
+    #[test]
+    fn parses_windows_drive_letter_dep_file() {
+        let out = r"C:\tmp\desc.pb: proto\a.proto proto\b.proto";
+        assert_eq!(
+            parse_makefile_dep_inputs(out),
+            vec![r"proto\a.proto".to_string(), r"proto\b.proto".to_string()]
+        );
     }
 }

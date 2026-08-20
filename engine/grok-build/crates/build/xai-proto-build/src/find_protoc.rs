@@ -3,6 +3,37 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+fn is_unix_dotslash_wrapper(path: &Path) -> bool {
+    path.file_name().and_then(|n| n.to_str()) == Some("protoc") && path.extension().is_none()
+}
+
+/// Git-Bash `command -v` / `cygpath -u` yields `/d/a/...`; MSVC cargo needs `D:\a\...`.
+fn unix_style_to_windows(raw: &str) -> Option<PathBuf> {
+    let trimmed = raw.trim();
+    let bytes = trimmed.as_bytes();
+    if bytes.len() >= 3 && bytes[0] == b'/' && bytes[1].is_ascii_alphabetic() && bytes[2] == b'/' {
+        let drive = (bytes[1] as char).to_ascii_uppercase();
+        let rest = trimmed[3..].replace('/', "\\");
+        return Some(PathBuf::from(format!("{drive}:\\{rest}")));
+    }
+    None
+}
+
+fn resolve_protoc_env_path(raw: &str) -> PathBuf {
+    let path = PathBuf::from(raw);
+    if path.exists() {
+        return path;
+    }
+    if cfg!(windows) {
+        if let Some(converted) = unix_style_to_windows(raw) {
+            if converted.exists() {
+                return converted;
+            }
+        }
+    }
+    path
+}
+
 fn check_protoc_good(protoc: &Path) -> anyhow::Result<()> {
     let output = Command::new(protoc)
         .arg("--version")
@@ -41,7 +72,7 @@ pub fn find_protoc() -> anyhow::Result<Option<PathBuf>> {
     //    and is set by Bazel cargo_build_script build_script_env to point at a hermetic
     //    protoc binary instead of the dotslash wrapper.
     if let Ok(protoc_env) = env::var("PROTOC") {
-        let protoc = PathBuf::from(&protoc_env);
+        let protoc = resolve_protoc_env_path(&protoc_env);
         if protoc.try_exists()? {
             check_protoc_good(&protoc)?;
             return Ok(Some(protoc));
@@ -54,12 +85,15 @@ pub fn find_protoc() -> anyhow::Result<Option<PathBuf>> {
     let mut dir_rel = PathBuf::new();
     loop {
         // Return relative path to make build more deterministic.
-        // Unix uses the shebang wrapper `bin/protoc`; Windows needs `bin/protoc.exe`
-        // (or the same wrapper if Git/MSYS can run it).
+        // Unix uses the shebang wrapper `bin/protoc`; Windows cannot execute that
+        // text file (Win32 error 193), so skip it and look for `bin/protoc.exe`.
         let candidates = [dir_rel.join("bin/protoc"), dir_rel.join("bin/protoc.exe")];
         let mut wrapper_failed = false;
         for protoc in candidates {
             if !protoc.try_exists()? {
+                continue;
+            }
+            if cfg!(windows) && is_unix_dotslash_wrapper(&protoc) {
                 continue;
             }
             match check_protoc_good(&protoc) {
@@ -102,4 +136,23 @@ pub fn find_protoc() -> anyhow::Result<Option<PathBuf>> {
     }
     eprintln!("`protoc` not found; likely it is missing in docker image");
     Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_unix_dotslash_wrapper, unix_style_to_windows};
+    use std::path::Path;
+
+    #[test]
+    fn unix_dotslash_wrapper_is_bare_protoc() {
+        assert!(is_unix_dotslash_wrapper(Path::new("bin/protoc")));
+        assert!(!is_unix_dotslash_wrapper(Path::new("bin/protoc.exe")));
+        assert!(!is_unix_dotslash_wrapper(Path::new("protoc.exe")));
+    }
+
+    #[test]
+    fn converts_git_bash_path() {
+        let converted = unix_style_to_windows("/d/a/grokx/protoc.exe").unwrap();
+        assert_eq!(converted, std::path::PathBuf::from(r"D:\a\grokx\protoc.exe"));
+    }
 }

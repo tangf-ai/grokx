@@ -75,12 +75,13 @@ jobs:
             echo "error: protoc not found after setup-protoc" >&2
             exit 1
           fi
-          if command -v cygpath >/dev/null 2>&1 && [[ "$PROTOC" == *\\* || "$PROTOC" == [A-Za-z]:* ]]; then
-            PROTOC="$(cygpath -u "$PROTOC")"
+          # Cargo/MSVC cannot execute Git-Bash unix paths (`/d/a/...`).
+          if command -v cygpath >/dev/null 2>&1; then
+            PROTOC="$(cygpath -w "$PROTOC")"
             export PROTOC
           fi
           echo "Using PROTOC=$PROTOC"
-          "$PROTOC" --version
+          protoc --version || "$PROTOC" --version
           ./tools/build-engine.sh
           ./packaging/bundle_runtime.sh
           test -f apps/desktop/src-tauri/resources/runtime/grok.exe
