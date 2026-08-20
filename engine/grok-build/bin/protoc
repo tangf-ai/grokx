@@ -41,6 +41,19 @@
                     "url": "https://github.com/protocolbuffers/protobuf/releases/download/v29.3/protoc-29.3-linux-aarch_64.zip"
                 }
             ]
+        },
+        "windows-x86_64": {
+            "arg0": "underlying-executable",
+            "size": 3188624,
+            "hash": "sha256",
+            "digest": "57ea59e9f551ad8d71ffaa9b5cfbe0ca1f4e720972a1db7ec2d12ab44bff9383",
+            "format": "zip",
+            "path": "bin/protoc.exe",
+            "providers": [
+                {
+                    "url": "https://github.com/protocolbuffers/protobuf/releases/download/v29.3/protoc-29.3-win64.zip"
+                }
+            ]
         }
     }
 }

@@ -54,10 +54,21 @@ else
   chmod +x "$OUT_DIR/grok"
 fi
 
-COMMIT="$(git -C "$ROOT" log -1 --format=%h -- engine/grok-build 2>/dev/null || echo unknown)"
+APP_VERSION=""
+if [[ -f "$ROOT/packaging/version_manifest.json" ]]; then
+  APP_VERSION="$(sed -n 's/.*"app_version": *"\([^"]*\)".*/\1/p' "$ROOT/packaging/version_manifest.json" | head -n1)"
+fi
+APP_VERSION="${APP_VERSION:-0.1.0}"
+
+COMMIT="$(git -C "$ROOT" log -1 --format=%h -- engine/grok-build 2>/dev/null || true)"
+if [[ -z "$COMMIT" && -f "$ROOT/engine/VERSION" ]]; then
+  COMMIT="$(sed -n 's/^engine_commit_short=//p' "$ROOT/engine/VERSION" | head -n1)"
+fi
+COMMIT="${COMMIT:-unknown}"
+
 cat >"$OUT_DIR/version.json" <<EOF
 {
-  "app_version": "0.1.0",
+  "app_version": "$APP_VERSION",
   "engine_name": "grok-build",
   "engine_version": "subtree",
   "engine_commit": "$COMMIT",

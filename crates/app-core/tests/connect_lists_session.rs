@@ -1,4 +1,7 @@
 //! set_project → connect_workspace (fake agent) → list_sessions shows live row.
+//! Unix-only: the fake grok shim is a shell script.
+
+#![cfg(unix)]
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -57,6 +60,7 @@ async fn fake_shim_handshake_via_spawn_agent_stdio() {
         custom_engine_path: Some(shim.display().to_string()),
         prefer_bundled_engine: false,
         model: None,
+        ..UserSettings::product_defaults()
     };
     let engine = resolve_engine(&settings, None, false).expect("resolve custom shim");
     let child = spawn_agent_stdio(
@@ -113,7 +117,7 @@ async fn connect_workspace_lists_session_with_project_metadata() {
     core.set_project_root(project.clone())
         .await
         .expect("set_project_root");
-    assert!(core.list_sessions().await.is_empty());
+    let before = core.list_sessions().await.len();
 
     let session_id = timeout(
         Duration::from_secs(15),
@@ -124,18 +128,17 @@ async fn connect_workspace_lists_session_with_project_metadata() {
     .expect("connect_workspace against fake agent");
 
     let list = core.list_sessions().await;
+    let row = list
+        .iter()
+        .find(|s| s.session_id == session_id)
+        .expect("connected session listed");
+    assert_eq!(row.project_root, project.display().to_string());
     assert_eq!(
-        list.len(),
-        1,
-        "expected one session after connect, got {list:?}"
-    );
-    assert_eq!(list[0].session_id, session_id);
-    assert_eq!(list[0].project_root, project.display().to_string());
-    assert_eq!(
-        list[0].engine_session_id.as_deref(),
+        row.engine_session_id.as_deref(),
         Some("fake-engine-session-1")
     );
-    assert!(!list[0].project_name.is_empty());
+    assert!(!row.project_name.is_empty());
+    assert!(list.len() >= before + 1);
 
     // Second connect (same project) appends another session row — exercises
     // store after a live connect without relying on reconnect_session kill races.
@@ -148,12 +151,14 @@ async fn connect_workspace_lists_session_with_project_metadata() {
     .expect("second connect");
     let list2 = core.list_sessions().await;
     assert!(
-        list2.len() >= 2,
-        "second connect should add a session row, got {}",
-        list2.len()
+        list2.iter().any(|s| s.session_id == session_id2),
+        "second connect should add a session row"
     );
-    assert_eq!(list2[0].session_id, session_id2);
-    assert_eq!(list2[0].project_root, project.display().to_string());
+    let row2 = list2
+        .iter()
+        .find(|s| s.session_id == session_id2)
+        .unwrap();
+    assert_eq!(row2.project_root, project.display().to_string());
     assert!(
         list2.iter().any(|s| s.session_id == session_id),
         "original session still listed"

@@ -13,6 +13,42 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State};
 use uuid::Uuid;
 
+fn allow_asset_dir(app: &AppHandle, path: &std::path::Path) {
+    if path.as_os_str().is_empty() {
+        return;
+    }
+    // Never re-open the entire home directory (the previous $HOME/** hole).
+    if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
+        if path == std::path::Path::new(&home) {
+            tracing::warn!(
+                path = %path.display(),
+                "refusing to allow home directory as asset scope"
+            );
+            return;
+        }
+    }
+    if let Err(err) = app.asset_protocol_scope().allow_directory(path, true) {
+        tracing::warn!(
+            path = %path.display(),
+            error = %err,
+            "failed to allow asset protocol directory"
+        );
+    }
+}
+
+fn allow_asset_file(app: &AppHandle, path: &std::path::Path) {
+    if !path.is_file() {
+        return;
+    }
+    if let Err(err) = app.asset_protocol_scope().allow_file(path) {
+        tracing::warn!(
+            path = %path.display(),
+            error = %err,
+            "failed to allow asset protocol file"
+        );
+    }
+}
+
 struct CoreState(Arc<AppCore>);
 
 #[derive(Debug, Serialize)]
@@ -342,11 +378,15 @@ async fn connect_workspace(
         .await
         .map_err(|e| e.to_string())?;
 
+    allow_asset_dir(&app, &root);
     let work_path = core
         .0
         .current_work_path()
         .await
         .map(|p| p.display().to_string());
+    if let Some(ref wp) = work_path {
+        allow_asset_dir(&app, &PathBuf::from(wp));
+    }
     Ok(SessionInfo {
         session_id: session_id.0.to_string(),
         project_root: Some(root.display().to_string()),
@@ -380,6 +420,12 @@ async fn reconnect_session(
         .current_work_path()
         .await
         .map(|p| p.display().to_string());
+    if let Some(ref root) = project_root {
+        allow_asset_dir(&app, &PathBuf::from(root));
+    }
+    if let Some(ref wp) = work_path {
+        allow_asset_dir(&app, &PathBuf::from(wp));
+    }
     Ok(SessionInfo {
         session_id: new_id.0.to_string(),
         project_root,
@@ -933,6 +979,7 @@ async fn pick_attachments(app: AppHandle) -> Result<Vec<AttachmentInput>, String
             .unwrap_or_else(|| path.display().to_string());
         let size = std::fs::metadata(&path).ok().map(|m| m.len());
         let mime = mime_from_path_or_name(&path, &name);
+        allow_asset_file(&app, &path);
         out.push(AttachmentInput {
             path: path.display().to_string(),
             name: Some(name),
@@ -1622,6 +1669,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .manage(CoreState(core.clone()))
         .setup(move |app| {
+            allow_asset_dir(app.handle(), &std::env::temp_dir().join("grokx-pastes"));
             spawn_event_forwarder(app.handle().clone(), core);
             Ok(())
         })

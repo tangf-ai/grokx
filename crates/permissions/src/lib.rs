@@ -32,12 +32,12 @@ pub enum AutoDecision {
     Deny,
 }
 
-/// Very small policy skeleton — expand with path/command rules later.
+/// Product-side auto vs ask. Full trust is handled by skipping the ACP gate.
 pub fn evaluate(policy: &Policy, tool_name: &str, risk: PermissionRisk) -> AutoDecision {
     match policy.mode {
         PermissionMode::Strict => AutoDecision::Ask,
         PermissionMode::Standard => {
-            if is_read_like(tool_name) && risk == PermissionRisk::Low {
+            if is_read_like(tool_name) && risk != PermissionRisk::High {
                 AutoDecision::Allow
             } else {
                 AutoDecision::Ask
@@ -52,14 +52,44 @@ pub fn evaluate(policy: &Policy, tool_name: &str, risk: PermissionRisk) -> AutoD
                 AutoDecision::Ask
             }
         }
+        PermissionMode::FullTrust => AutoDecision::Allow,
     }
 }
 
-fn is_read_like(tool: &str) -> bool {
-    matches!(
-        tool,
-        "read_file" | "grep" | "list_dir" | "Read" | "Grep" | "Glob"
+/// Infer risk from the tool name / summary when ACP does not send one.
+pub fn classify_risk(tool_name: &str, summary: Option<&str>) -> PermissionRisk {
+    let blob = format!(
+        "{} {}",
+        tool_name,
+        summary.unwrap_or("")
     )
+    .to_ascii_lowercase();
+    if is_shell_like(&blob) {
+        PermissionRisk::High
+    } else if is_read_like(tool_name) {
+        PermissionRisk::Low
+    } else {
+        PermissionRisk::Medium
+    }
+}
+
+pub fn is_read_like(tool: &str) -> bool {
+    let lower = tool.trim().to_ascii_lowercase().replace('-', "_");
+    matches!(
+        lower.as_str(),
+        "read_file"
+            | "read"
+            | "grep"
+            | "glob"
+            | "list_dir"
+            | "list_directory"
+            | "ls"
+            | "search"
+            | "codebase_search"
+            | "glob_file_search"
+            | "find"
+    ) || lower.starts_with("read_")
+        || lower.ends_with("_read")
 }
 
 fn is_edit_like(tool: &str) -> bool {
@@ -67,6 +97,14 @@ fn is_edit_like(tool: &str) -> bool {
         tool,
         "search_replace" | "write" | "Edit" | "Write" | "MultiEdit"
     )
+}
+
+fn is_shell_like(blob: &str) -> bool {
+    blob.contains("terminal")
+        || blob.contains("bash")
+        || blob.contains("shell")
+        || blob.contains("execute")
+        || blob.contains("run_terminal")
 }
 
 #[derive(Debug, Default)]
@@ -138,5 +176,69 @@ mod tests {
         assert_eq!(broker.pending_count(), 1);
         broker.resolve(&id, PermissionDecision::Deny).unwrap();
         assert!(!broker.is_pending(&id));
+    }
+
+    #[test]
+    fn ui_ask_always_asks() {
+        let policy = Policy {
+            mode: PermissionMode::from_ui("ask"),
+        };
+        assert_eq!(
+            evaluate(&policy, "read_file", PermissionRisk::Low),
+            AutoDecision::Ask
+        );
+        assert_eq!(
+            evaluate(&policy, "run_terminal_command", PermissionRisk::High),
+            AutoDecision::Ask
+        );
+    }
+
+    #[test]
+    fn ui_auto_allows_read_like_and_asks_shell() {
+        let policy = Policy {
+            mode: PermissionMode::from_ui("auto"),
+        };
+        assert_eq!(
+            evaluate(&policy, "read_file", PermissionRisk::Low),
+            AutoDecision::Allow
+        );
+        assert_eq!(
+            evaluate(&policy, "Grep", PermissionRisk::Low),
+            AutoDecision::Allow
+        );
+        assert_eq!(
+            evaluate(&policy, "run_terminal_command", PermissionRisk::High),
+            AutoDecision::Ask
+        );
+        assert_eq!(
+            evaluate(&policy, "Write", PermissionRisk::Medium),
+            AutoDecision::Ask
+        );
+    }
+
+    #[test]
+    fn ui_full_trust_allows_everything() {
+        let policy = Policy {
+            mode: PermissionMode::from_ui("always-approve"),
+        };
+        assert_eq!(
+            evaluate(&policy, "Bash", PermissionRisk::High),
+            AutoDecision::Allow
+        );
+        assert_eq!(
+            evaluate(&policy, "Write", PermissionRisk::Medium),
+            AutoDecision::Allow
+        );
+    }
+
+    #[test]
+    fn classify_risk_reads_low_shell_high() {
+        assert_eq!(classify_risk("read_file", None), PermissionRisk::Low);
+        assert_eq!(classify_risk("list_dir", None), PermissionRisk::Low);
+        assert_eq!(
+            classify_risk("run_terminal_command", Some("npm start")),
+            PermissionRisk::High
+        );
+        assert_eq!(classify_risk("Write", None), PermissionRisk::Medium);
     }
 }

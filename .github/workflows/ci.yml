@@ -6,6 +6,28 @@ on:
   pull_request:
 
 jobs:
+  desktop-typecheck:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/desktop
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+          cache-dependency-path: apps/desktop/pnpm-lock.yaml
+      - name: Install UI deps
+        run: pnpm install --frozen-lockfile
+      - name: Typecheck
+        run: pnpm exec tsc --noEmit
+      - name: Unit tests
+        run: pnpm test:lib
+
   product-crates:
     runs-on: ubuntu-latest
     steps:
@@ -14,4 +36,13 @@ jobs:
       - name: Check product crates
         run: cargo check -p domain -p app-config -p agent-process -p acp-bridge -p permissions -p session-store -p app-core
       - name: Test libraries
-        run: cargo test -p domain -p app-config -p agent-process -p acp-bridge -p permissions -p session-store
+        run: cargo test -p domain -p app-config -p agent-process -p acp-bridge -p permissions -p session-store -p app-core
+
+  product-crates-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Test libraries
+        shell: bash
+        run: cargo test -p domain -p app-config -p agent-process -p acp-bridge -p permissions -p session-store -p app-core

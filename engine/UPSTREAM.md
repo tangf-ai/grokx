@@ -30,6 +30,13 @@ After sync:
 3. Run product tests / smoke ACP.
 4. Bundle via `./packaging/bundle_runtime.sh`.
 
+Local packaging patches currently in the subtree (re-apply after pull if they drop):
+
+- `bin/protoc`: add `windows-x86_64` DotSlash platform (protobuf 29.3 win64).
+- `crates/build/xai-proto-build`: also look for `bin/protoc.exe` / `protoc.exe`.
+
+These are build-host fixes for Windows CI; they do not change ACP behavior.
+
 ## Contributing patches upstream
 
 Keep commits small and describe them so they can be proposed upstream when appropriate.

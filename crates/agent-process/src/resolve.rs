@@ -30,24 +30,36 @@ pub struct ResolvedEngine {
 /// `bundle.resources` is declared the layout may be either:
 /// - `Resources/runtime/grok`            (ideal)
 /// - `Resources/resources/runtime/grok`  (when source path includes `resources/`)
+fn bundled_engine_names() -> &'static [&'static str] {
+    if cfg!(windows) {
+        &["grok.exe", "grok"]
+    } else {
+        &["grok"]
+    }
+}
+
 fn bundled_candidates(resource_dir: &Path) -> Vec<PathBuf> {
-    let rel = bundled_runtime_relative(); // e.g. "runtime/grok"
+    let rel = bundled_runtime_relative(); // e.g. "runtime/grok" or "runtime/grok.exe"
+    let names = bundled_engine_names();
     let mut out = vec![
         resource_dir.join(rel),
         resource_dir.join("resources").join(rel),
     ];
-    // Also try next to the current executable (macOS .app Contents/MacOS/../Resources/...)
+    // Also try next to the current executable:
+    // - macOS .app: Contents/MacOS/../Resources/...
+    // - Windows NSIS: <install_dir>\resources\runtime\grok.exe
     if let Ok(exe) = std::env::current_exe() {
-        if let Some(mac_os) = exe.parent() {
-            // Contents/MacOS -> Contents/Resources
-            if let Some(contents) = mac_os.parent() {
+        if let Some(exe_dir) = exe.parent() {
+            if let Some(contents) = exe_dir.parent() {
                 let resources = contents.join("Resources");
                 out.push(resources.join(rel));
                 out.push(resources.join("resources").join(rel));
             }
-            // Loose binary next to engine (dev / portable layouts)
-            out.push(mac_os.join("grok"));
-            out.push(mac_os.join("runtime").join("grok"));
+            for name in names {
+                out.push(exe_dir.join(name));
+                out.push(exe_dir.join("runtime").join(name));
+                out.push(exe_dir.join("resources").join("runtime").join(name));
+            }
         }
     }
     out

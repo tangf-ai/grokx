@@ -8,6 +8,7 @@ description = "ACP JSON-RPC client adapter producing domain AppEvents"
 [dependencies]
 base64 = { workspace = true }
 domain = { workspace = true }
+permissions = { workspace = true }
 mime_guess = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

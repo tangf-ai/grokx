@@ -1,7 +1,7 @@
 use domain::{
-    AppEvent, PermissionRequest, PermissionRisk, SessionId, ToolCall, ToolCallId, ToolCallStatus,
-    TurnState,
+    AppEvent, PermissionRequest, SessionId, ToolCall, ToolCallId, ToolCallStatus, TurnState,
 };
+use permissions::classify_risk;
 use serde_json::Value;
 
 /// Pull `totalTokens` from ACP update / notification `_meta` when present.
@@ -182,6 +182,17 @@ pub fn map_permission_request(
         .and_then(|v| v.as_str())
         .map(|s| ToolCallId(s.to_string()));
 
+    let kind = params
+        .pointer("/toolCall/kind")
+        .and_then(|v| v.as_str());
+    let risk_blob = format!(
+        "{} {} {}",
+        tool_name,
+        kind.unwrap_or(""),
+        detail.as_deref().unwrap_or("")
+    );
+    let risk = classify_risk(&tool_name, Some(risk_blob.as_str()));
+
     AppEvent::PermissionNeeded {
         session_id,
         request: PermissionRequest {
@@ -190,7 +201,7 @@ pub fn map_permission_request(
             tool_name,
             summary,
             detail,
-            risk: PermissionRisk::Medium,
+            risk,
         },
     }
 }
@@ -279,6 +290,7 @@ fn extract_tool_output(update: &Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use domain::PermissionRisk;
     use serde_json::json;
 
     #[test]
@@ -318,6 +330,47 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    #[test]
+    fn maps_permission_request_infers_read_risk() {
+        let sid = SessionId::new();
+        let event = map_permission_request(
+            sid,
+            &json!({
+                "toolCall": { "title": "read_file", "kind": "read" }
+            }),
+            "req-1".into(),
+        );
+        match event {
+            AppEvent::PermissionNeeded { request, .. } => {
+                assert_eq!(request.tool_name, "read_file");
+                assert_eq!(request.risk, PermissionRisk::Low);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn maps_permission_request_infers_shell_risk() {
+        let sid = SessionId::new();
+        let event = map_permission_request(
+            sid,
+            &json!({
+                "toolCall": {
+                    "title": "run_terminal_command",
+                    "kind": "execute",
+                    "rawInput": { "command": "rm -rf /" }
+                }
+            }),
+            "req-2".into(),
+        );
+        match event {
+            AppEvent::PermissionNeeded { request, .. } => {
+                assert_eq!(request.risk, PermissionRisk::High);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
     }
 
     #[test]

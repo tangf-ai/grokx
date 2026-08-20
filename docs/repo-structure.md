@@ -49,5 +49,5 @@ Hard rules:
 ## Runtime resolution order
 
 1. User `custom_engine_path`
-2. Bundled `resources/runtime/grok` (+ `version.json`)
+2. Bundled `resources/runtime/grok` (or `grok.exe` on Windows) (+ `version.json`)
 3. `PATH` lookup (dev fallback only by default)

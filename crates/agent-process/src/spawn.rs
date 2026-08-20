@@ -52,6 +52,13 @@ pub fn spawn_agent_stdio(
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    // The engine is a console subsystem binary. Without this flag, Windows
+    // flashes a cmd window every time Grokx starts `grok agent stdio`.
+    #[cfg(windows)]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
 
     for (k, v) in &options.env {
         cmd.env(k, v);

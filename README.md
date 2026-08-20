@@ -32,11 +32,11 @@ Grokx is a **cross-platform** desktop app (macOS, Windows, Linux) built with Tau
 | Platform | Prebuilt installer | How to run |
 |----------|--------------------|------------|
 | **macOS** (Apple Silicon) | Yes — DMG on [Releases](https://github.com/tangf-ai/grokx/releases) | Download → install |
-| **Windows** | Not published yet | Clone repo → build yourself |
+| **Windows** (x64) | Yes — NSIS installer on [Releases](https://github.com/tangf-ai/grokx/releases) | Download `Grokx_*_x64-setup.exe` → install |
 | **Linux** | Not published yet | Clone repo → build yourself |
 
-Official GitHub Releases currently ship **macOS Apple Silicon** packages only.  
-**Windows and Linux users: download the source and compile locally** (see [Build from source](#build-from-source)). Contributors who produce installers for other targets are welcome to share them.
+Official GitHub Releases currently ship **macOS Apple Silicon** and **Windows x64** packages.  
+**Linux (and Intel Mac) users: download the source and compile locally** (see [Build from source](#build-from-source)). Contributors who produce installers for other targets are welcome to share them.
 
 ## Screenshots
 
@@ -67,7 +67,7 @@ User prompt, collapsible thinking trace with duration, final assistant reply.
 - Permission modes: Needs approval · Auto · Full trust (synced to `~/.grok/config.toml`)
 - Settings for API base URL, key, model, and engine path
 - Task rename / delete; chat + task list persistence across restarts
-- Bundled runtime resolution (prefer `resources/runtime/grok` over PATH)
+- Bundled runtime resolution (prefer `resources/runtime/grok` / `grok.exe` over PATH)
 
 ## Repository layout
 
@@ -95,10 +95,14 @@ See [docs/repo-structure.md](docs/repo-structure.md) and [docs/engine-policy.md]
 ## Install (prebuilt)
 
 1. Open [GitHub Releases](https://github.com/tangf-ai/grokx/releases)
-2. Download the asset for your platform (currently `Grokx_*_aarch64.dmg` for **macOS Apple Silicon**)
-3. Install and launch; if macOS Gatekeeper blocks the app, see [FAQ](#macos-app-is-damaged--gatekeeper-blocks-grokx-after-download)
+2. Download the asset for your platform:
+   - macOS Apple Silicon: `Grokx_*_aarch64.dmg`
+   - Windows x64: `Grokx_*_x64-setup.exe`
+3. Install and launch
+   - macOS Gatekeeper: see [FAQ](#macos-app-is-damaged--gatekeeper-blocks-grokx-after-download)
+   - Windows SmartScreen: see [FAQ](#windows-smartscreen-blocks-the-installer)
 
-For **Windows / Linux** (or Intel Mac), use [Build from source](#build-from-source) below.
+For **Linux** (or Intel Mac), use [Build from source](#build-from-source) below.
 
 ## Quick start (dev)
 
@@ -167,7 +171,16 @@ See also [packaging/README.md](packaging/README.md).
 
 ### Do you support Windows and Linux?
 
-**Yes.** The app stack (Tauri + React + Rust) is multi-platform. Prebuilt installers on GitHub Releases are currently **macOS-only**; on Windows and Linux, [build from source](#build-from-source).
+**Yes.** The app stack (Tauri + React + Rust) is multi-platform. Prebuilt installers on GitHub Releases currently cover **macOS Apple Silicon** and **Windows x64**. Linux (and Intel Mac) still [build from source](#build-from-source).
+
+### Windows: SmartScreen blocks the installer
+
+The Windows build is not Authenticode-signed yet, so SmartScreen / Defender may warn on first run.
+
+1. Click **More info**
+2. Click **Run anyway**
+
+If Windows still refuses the file, unblock it from the file properties (**Unblock**) and retry.
 
 ### macOS: “app is damaged” / Gatekeeper blocks Grokx after download
 

@@ -54,8 +54,14 @@ pub fn find_protoc() -> anyhow::Result<Option<PathBuf>> {
     let mut dir_rel = PathBuf::new();
     loop {
         // Return relative path to make build more deterministic.
-        let protoc = dir_rel.join("bin/protoc");
-        if protoc.try_exists()? {
+        // Unix uses the shebang wrapper `bin/protoc`; Windows needs `bin/protoc.exe`
+        // (or the same wrapper if Git/MSYS can run it).
+        let candidates = [dir_rel.join("bin/protoc"), dir_rel.join("bin/protoc.exe")];
+        let mut wrapper_failed = false;
+        for protoc in candidates {
+            if !protoc.try_exists()? {
+                continue;
+            }
             match check_protoc_good(&protoc) {
                 Ok(()) => return Ok(Some(protoc)),
                 Err(e) => {
@@ -67,9 +73,13 @@ pub fn find_protoc() -> anyhow::Result<Option<PathBuf>> {
                          trying protoc from PATH as fallback",
                         protoc.display()
                     );
+                    wrapper_failed = true;
                     break;
                 }
             }
+        }
+        if wrapper_failed {
+            break;
         }
         if !dir.pop() {
             break;
@@ -78,8 +88,10 @@ pub fn find_protoc() -> anyhow::Result<Option<PathBuf>> {
     }
 
     // 3. Try protoc from PATH (system install or other tooling).
-    if check_protoc_good(Path::new("protoc")).is_ok() {
-        return Ok(Some(PathBuf::from("protoc")));
+    for name in ["protoc", "protoc.exe"] {
+        if check_protoc_good(Path::new(name)).is_ok() {
+            return Ok(Some(PathBuf::from(name)));
+        }
     }
 
     // 4. Not found anywhere.

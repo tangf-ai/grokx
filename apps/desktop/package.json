@@ -1,14 +1,15 @@
 {
   "name": "grokx-desktop",
   "private": true,
-  "version": "0.2.6",
+  "version": "0.2.7",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview",
     "tauri": "tauri",
-    "test:verbal": "npx --yes tsx src/lib/verbalCompletion.test.ts"
+    "test:verbal": "npx --yes tsx src/lib/verbalCompletion.test.ts",
+    "test:lib": "npx --yes tsx src/lib/verbalCompletion.test.ts && npx --yes tsx src/lib/streamMarkdown.test.ts && npx --yes tsx src/lib/processTree.test.ts"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.5.0",

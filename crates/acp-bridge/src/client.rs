@@ -7,7 +7,7 @@ use std::path::Path;
 
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use domain::{
-    AgentConnectionStatus, AppEvent, ModelInfo, PermissionDecision, PromptRequest,
+    AgentConnectionStatus, AppEvent, ModelInfo, PermissionDecision, PermissionMode, PromptRequest,
     ReasoningEffort, SessionId, TurnState,
 };
 use serde_json::{json, Value};
@@ -38,6 +38,8 @@ pub struct ConnectOptions {
     pub rpc_timeout: Duration,
     /// Auto-allow permission requests (dev / trusted only).
     pub auto_approve: bool,
+    /// UI permission mode: `ask` | `auto` | `always-approve`.
+    pub permission_mode: String,
 }
 
 impl Default for ConnectOptions {
@@ -47,6 +49,7 @@ impl Default for ConnectOptions {
             model: None,
             rpc_timeout: DEFAULT_RPC_TIMEOUT,
             auto_approve: false,
+            permission_mode: "ask".into(),
         }
     }
 }
@@ -740,7 +743,29 @@ async fn handle_incoming(shared: Arc<Shared>, value: Value) -> Result<(), Bridge
             let event =
                 map_permission_request(app_session_id.clone(), &params, request_id.clone());
 
-            if PermissionGate::should_park(shared.options.auto_approve) {
+            let auto_allow_all = !PermissionGate::should_park(
+                shared.options.auto_approve,
+                &shared.options.permission_mode,
+            );
+            let auto_allow_this = match &event {
+                AppEvent::PermissionNeeded { request, .. } => {
+                    let policy = permissions::Policy {
+                        mode: PermissionMode::from_ui(&shared.options.permission_mode),
+                    };
+                    matches!(
+                        permissions::evaluate(&policy, &request.tool_name, request.risk),
+                        permissions::AutoDecision::Allow
+                    )
+                }
+                _ => false,
+            };
+
+            if auto_allow_all || auto_allow_this {
+                // Already answered — do not park or prompt the UI.
+                let _ = event;
+                let result = permission_outcome_value(PermissionDecision::AllowOnce);
+                let _ = write_response(&shared, rpc_id, result).await;
+            } else {
                 shared.permission_gate.lock().await.park(ParkedPermission {
                     request_id: request_id.clone(),
                     rpc_id,
@@ -752,11 +777,6 @@ async fn handle_incoming(shared: Arc<Shared>, value: Value) -> Result<(), Bridge
                     session_id: app_session_id,
                     state: TurnState::WaitingPermission,
                 });
-                // Do NOT write a response — agent waits until resolve_permission.
-            } else {
-                let _ = shared.events.send(event);
-                let result = permission_outcome_value(PermissionDecision::AllowOnce);
-                let _ = write_response(&shared, rpc_id, result).await;
             }
         }
         "" => {}

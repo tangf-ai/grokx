@@ -687,6 +687,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn bundled_runtime_relative_matches_os() {
+        if cfg!(windows) {
+            assert_eq!(bundled_runtime_relative(), "runtime/grok.exe");
+        } else {
+            assert_eq!(bundled_runtime_relative(), "runtime/grok");
+        }
+    }
+
+    #[test]
     fn merge_writes_model_section() {
         let ep = ModelEndpointSettings {
             model_id: "grok-4.5".into(),

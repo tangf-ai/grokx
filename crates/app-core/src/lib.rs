@@ -3,10 +3,19 @@
 //! Multiple tasks can each keep a live agent process so switching tasks does
 //! not cancel work in progress on another session.
 
+mod process;
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+
+use crate::process::{
+    find_related_orphans, include_related_orphans, list_descendant_processes, orphans_opt_in,
+    process_cwd, process_exists, process_snapshot, signal_process, signal_process_tree,
+    snap_to_info, spawn_restarted,
+};
+pub use crate::process::SessionProcessInfo;
 
 use acp_bridge::{AcpClient, AcpClientHandle, BridgeError, ConnectOptions};
 use agent_process::{resolve_engine, spawn_agent_stdio, ResolvedEngine, SpawnOptions};
@@ -63,23 +72,6 @@ struct LiveAgent {
     managed_extra: Mutex<Vec<(u32, String)>>,
 }
 
-/// A process started under the session agent (tool shells, servers, etc.).
-#[derive(Debug, Clone, Serialize)]
-pub struct SessionProcessInfo {
-    pub pid: u32,
-    pub ppid: u32,
-    pub command: String,
-    pub etime: String,
-    pub state: String,
-    pub cpu: String,
-    pub mem: String,
-    /// Depth under the agent (1 = direct child).
-    pub depth: u32,
-    /// Working directory when available (macOS `lsof` / Linux `/proc`).
-    pub cwd: Option<String>,
-    pub paused: bool,
-}
-
 #[derive(Debug, Clone, Serialize)]
 pub struct RestartedProcessInfo {
     pub pid: u32,
@@ -126,12 +118,13 @@ impl AppCore {
         }
 
         let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let policy_mode = domain::PermissionMode::from_ui(settings.permission_mode_normalized());
         Ok(Arc::new(Self {
             paths,
             settings: RwLock::new(settings),
             store: Mutex::new(store),
             permissions: Mutex::new(PermissionBroker::new()),
-            policy: RwLock::new(Policy::default()),
+            policy: RwLock::new(Policy { mode: policy_mode }),
             engine: RwLock::new(None),
             status: RwLock::new(AgentConnectionStatus::MissingBinary),
             selected_project: RwLock::new(None),
@@ -157,10 +150,11 @@ impl AppCore {
     }
 
     pub async fn update_settings(&self, update: SettingsUpdate) -> Result<PublicUserSettings, CoreError> {
-        let public = {
+        let (public, mode) = {
             let mut settings = self.settings.write().await;
             let prev_mode = settings.permission_mode_normalized().to_string();
             settings.apply_update(update);
+            let mode = settings.permission_mode_normalized().to_string();
             settings
                 .save(&self.paths.config_file)
                 .map_err(CoreError::Config)?;
@@ -168,12 +162,15 @@ impl AppCore {
                 warn!(error = %err, "failed to sync endpoint to ~/.grok/config.toml");
             }
             // Keep engine permission mode aligned when the UI mode changes.
-            if settings.permission_mode_normalized() != prev_mode {
+            if mode != prev_mode {
                 if let Err(err) = settings.sync_permission_mode_to_grok_toml() {
                     warn!(error = %err, "failed to sync permission mode to ~/.grok/config.toml");
                 }
             }
-            settings.public_view()
+            (settings.public_view(), mode)
+        };
+        *self.policy.write().await = Policy {
+            mode: domain::PermissionMode::from_ui(&mode),
         };
         Ok(public)
     }
@@ -326,12 +323,15 @@ impl AppCore {
             *agent.managed_extra.lock().await = still;
         }
 
-        // Orphans: match work_path / project_root (cwd or command line).
-        // Skip the agent binary itself and our desktop shell.
-        let skip_pids: std::collections::HashSet<u32> = agent_pid.into_iter().collect();
-        for p in find_related_orphans(&work_path, &project_root, &skip_pids) {
-            if seen.insert(p.pid) {
-                out.push(p);
+        // Orphans (cwd/command heuristics) stay off by default — they can
+        // match unrelated tools in the same project folder. Opt in with
+        // GROKX_OUTPUTS_ORPHANS=1 for recovery after agent restarts.
+        if include_related_orphans(orphans_opt_in()) {
+            let skip_pids: std::collections::HashSet<u32> = agent_pid.into_iter().collect();
+            for p in find_related_orphans(&work_path, &project_root, &skip_pids) {
+                if seen.insert(p.pid) {
+                    out.push(p);
+                }
             }
         }
 
@@ -413,20 +413,7 @@ impl AppCore {
             tokio::time::sleep(std::time::Duration::from_millis(150)).await;
         }
 
-        let child = std::process::Command::new("sh")
-            .arg("-c")
-            .arg(&snap.command)
-            .current_dir(&run_cwd)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .map_err(|e| {
-                CoreError::Message(format!("restart failed: {e}"))
-            })?;
-        let new_pid = child.id();
-        // Detach: don't wait; leave running in background.
-        std::mem::forget(child);
+        let new_pid = spawn_restarted(&snap.command, &run_cwd)?;
 
         // Track under session so it still appears in Outputs after re-parent.
         if let Some(agent) = self.live.lock().await.get(session_id) {
@@ -809,6 +796,7 @@ impl AppCore {
                 "chat history must be a JSON array".into(),
             ));
         }
+        let value = cap_chat_history_value(value);
         // Canonical UTF-8 (no lone surrogates / odd escapes from the webview).
         let canonical = serde_json::to_string(&value)
             .map_err(|e| CoreError::Message(format!("serialize chat history: {e}")))?;
@@ -991,9 +979,12 @@ impl AppCore {
                 ))
             })?;
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
         {
-            // Best-effort: write a pointer file if symlink is unavailable.
+            link_project_windows(project_root, &link)?;
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
             std::fs::write(&link, project_root.display().to_string()).map_err(|e| {
                 CoreError::Message(format!(
                     "failed to write project pointer in task workspace: {e}"
@@ -1018,7 +1009,44 @@ impl AppCore {
 
         Ok(work)
     }
+}
 
+#[cfg(windows)]
+fn link_project_windows(project_root: &Path, link: &Path) -> Result<(), CoreError> {
+    use std::os::windows::fs::{symlink_dir, symlink_file};
+    match symlink_dir(project_root, link) {
+        Ok(()) => return Ok(()),
+        Err(e) => {
+            warn!(
+                error = %e,
+                "directory symlink failed; trying mklink /J junction"
+            );
+        }
+    }
+    let status = std::process::Command::new("cmd")
+        .args([
+            "/C",
+            "mklink",
+            "/J",
+            &link.display().to_string(),
+            &project_root.display().to_string(),
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map_err(|e| CoreError::Message(format!("mklink /J: {e}")))?;
+    if status.success() {
+        return Ok(());
+    }
+    let _ = symlink_file(project_root, link);
+    std::fs::write(link, project_root.display().to_string()).map_err(|e| {
+        CoreError::Message(format!(
+            "failed to write project pointer in task workspace: {e}"
+        ))
+    })
+}
+
+impl AppCore {
     /// Shared spawn path.
     /// - `reuse_session = None` → create a new SessionId + list row + task dir
     /// - `reuse_session = Some(id)` → keep that id/title/work_path, only refresh engine
@@ -1167,6 +1195,7 @@ impl AppCore {
             cwd: work_path.display().to_string(),
             model: settings.model.clone(),
             auto_approve: mode == app_config::permission_modes::ALWAYS_APPROVE,
+            permission_mode: mode.to_string(),
             ..ConnectOptions::default()
         };
 
@@ -1567,6 +1596,27 @@ impl AppCore {
     }
 }
 
+/// Keep the newest turns; drop oldest when the array or JSON is too large.
+const CHAT_HISTORY_MAX_ITEMS: usize = 400;
+const CHAT_HISTORY_MAX_BYTES: usize = 2 * 1024 * 1024;
+
+fn cap_chat_history_value(value: serde_json::Value) -> serde_json::Value {
+    let serde_json::Value::Array(mut items) = value else {
+        return value;
+    };
+    if items.len() > CHAT_HISTORY_MAX_ITEMS {
+        let drop = items.len() - CHAT_HISTORY_MAX_ITEMS;
+        items.drain(0..drop);
+    }
+    let mut encoded = serde_json::to_vec(&items).unwrap_or_default();
+    while encoded.len() > CHAT_HISTORY_MAX_BYTES && items.len() > 20 {
+        let drop = (items.len() / 10).max(1);
+        items.drain(0..drop);
+        encoded = serde_json::to_vec(&items).unwrap_or_default();
+    }
+    serde_json::Value::Array(items)
+}
+
 fn default_models() -> Vec<ModelInfo> {
     vec![
         ModelInfo {
@@ -1592,10 +1642,36 @@ mod tests {
     use serde_json::json;
 
     /// Drive the same gate used by the bridge: pending until resolve; deny blocks.
+    #[test]
+    fn cap_chat_history_drops_oldest_over_item_limit() {
+        let items: Vec<serde_json::Value> = (0..450)
+            .map(|i| json!({"id": i, "kind": "assistant", "text": "x"}))
+            .collect();
+        let capped = cap_chat_history_value(serde_json::Value::Array(items));
+        let arr = capped.as_array().unwrap();
+        assert_eq!(arr.len(), CHAT_HISTORY_MAX_ITEMS);
+        assert_eq!(arr[0]["id"], 50);
+        assert_eq!(arr[arr.len() - 1]["id"], 449);
+    }
+
+    #[test]
+    fn cap_chat_history_shrinks_huge_payload() {
+        let blob = "y".repeat(80_000);
+        let items: Vec<serde_json::Value> = (0..80)
+            .map(|i| json!({"id": i, "kind": "assistant", "text": blob}))
+            .collect();
+        let capped = cap_chat_history_value(serde_json::Value::Array(items));
+        let arr = capped.as_array().unwrap();
+        let bytes = serde_json::to_vec(&arr).unwrap().len();
+        assert!(arr.len() < 80, "should drop oldest bulky items");
+        assert!(bytes <= CHAT_HISTORY_MAX_BYTES);
+        assert_eq!(arr.last().unwrap()["id"], 79);
+    }
+
     #[tokio::test]
     async fn permission_pending_until_resolved_via_gate() {
         let mut gate = PermissionGate::new();
-        assert!(PermissionGate::should_park(false));
+        assert!(PermissionGate::should_park(false, "ask"));
         gate.park(ParkedPermission {
             request_id: "ui-req".into(),
             rpc_id: json!(7),
@@ -1644,11 +1720,13 @@ mod tests {
         drop(store);
 
         let list = core.list_sessions().await;
-        assert_eq!(list.len(), 1);
-        assert_eq!(list[0].session_id, sid);
-        assert_eq!(list[0].project_root, root.display().to_string());
-        assert_eq!(list[0].work_path, "/tmp/tasks/test");
-        assert!(list[0].updated_at <= Utc::now());
+        let row = list
+            .iter()
+            .find(|s| s.session_id == sid)
+            .expect("inserted session listed");
+        assert_eq!(row.project_root, root.display().to_string());
+        assert_eq!(row.work_path, "/tmp/tasks/test");
+        assert!(row.updated_at <= Utc::now());
     }
 
     #[test]
@@ -1668,373 +1746,15 @@ mod tests {
             let target = std::fs::read_link(&link).unwrap();
             assert_eq!(target, project);
         }
+        #[cfg(windows)]
+        {
+            let meta = std::fs::metadata(&link).expect("project link exists");
+            assert!(
+                meta.is_dir() || meta.is_file(),
+                "Windows project link should be a junction/dir or pointer file"
+            );
+        }
         // Cleanup this test task dir
         let _ = std::fs::remove_dir_all(&work);
     }
 }
-
-// ─── Session process tree (agent tool children) ─────────────────────────────
-
-#[derive(Debug, Clone)]
-struct ProcSnap {
-    pid: u32,
-    ppid: u32,
-    etime: String,
-    cpu: String,
-    mem: String,
-    state: String,
-    command: String,
-}
-
-fn process_exists(pid: u32) -> bool {
-    std::path::Path::new(&format!("/proc/{pid}")).exists()
-        || std::process::Command::new("kill")
-            .args(["-0", &pid.to_string()])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
-}
-
-fn process_snapshot(pid: u32) -> Option<ProcSnap> {
-    let out = std::process::Command::new("ps")
-        .args([
-            "-p",
-            &pid.to_string(),
-            "-o",
-            "pid=,ppid=,etime=,pcpu=,pmem=,state=,command=",
-        ])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    parse_ps_line(&String::from_utf8_lossy(&out.stdout))
-}
-
-fn parse_ps_line(line: &str) -> Option<ProcSnap> {
-    let line = line.trim();
-    if line.is_empty() {
-        return None;
-    }
-    let mut parts = line.split_whitespace();
-    let pid: u32 = parts.next()?.parse().ok()?;
-    let ppid: u32 = parts.next()?.parse().ok()?;
-    let etime = parts.next()?.to_string();
-    let cpu = parts.next()?.to_string();
-    let mem = parts.next()?.to_string();
-    let state = parts.next()?.to_string();
-    let command = parts.collect::<Vec<_>>().join(" ");
-    if command.is_empty() {
-        return None;
-    }
-    Some(ProcSnap {
-        pid,
-        ppid,
-        etime,
-        cpu,
-        mem,
-        state,
-        command,
-    })
-}
-
-fn process_cwd(pid: u32) -> Option<String> {
-    #[cfg(target_os = "linux")]
-    {
-        return std::fs::read_link(format!("/proc/{pid}/cwd"))
-            .ok()
-            .map(|p| p.display().to_string());
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let out = std::process::Command::new("lsof")
-            .args(["-a", "-p", &pid.to_string(), "-d", "cwd", "-Fn"])
-            .output()
-            .ok()?;
-        if !out.status.success() {
-            return None;
-        }
-        for line in String::from_utf8_lossy(&out.stdout).lines() {
-            if let Some(rest) = line.strip_prefix('n') {
-                if !rest.is_empty() {
-                    return Some(rest.to_string());
-                }
-            }
-        }
-        None
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        let _ = pid;
-        None
-    }
-}
-
-fn list_all_processes() -> Vec<ProcSnap> {
-    let out = match std::process::Command::new("ps")
-        .args(["-axo", "pid=,ppid=,etime=,pcpu=,pmem=,state=,command="])
-        .output()
-    {
-        Ok(o) if o.status.success() => o,
-        _ => return Vec::new(),
-    };
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .filter_map(parse_ps_line)
-        .collect()
-}
-
-fn snap_to_info(pid: u32, command_fallback: Option<String>, depth: u32) -> Option<SessionProcessInfo> {
-    let snap = process_snapshot(pid);
-    let command = snap
-        .as_ref()
-        .map(|s| s.command.clone())
-        .or(command_fallback)?;
-    let paused = snap
-        .as_ref()
-        .map(|s| s.state.starts_with('T'))
-        .unwrap_or(false);
-    Some(SessionProcessInfo {
-        pid,
-        ppid: snap.as_ref().map(|s| s.ppid).unwrap_or(0),
-        command,
-        etime: snap
-            .as_ref()
-            .map(|s| s.etime.clone())
-            .unwrap_or_else(|| "—".into()),
-        state: snap
-            .as_ref()
-            .map(|s| s.state.clone())
-            .unwrap_or_else(|| "?".into()),
-        cpu: snap
-            .as_ref()
-            .map(|s| s.cpu.clone())
-            .unwrap_or_else(|| "0".into()),
-        mem: snap
-            .as_ref()
-            .map(|s| s.mem.clone())
-            .unwrap_or_else(|| "0".into()),
-        depth,
-        cwd: process_cwd(pid),
-        paused,
-    })
-}
-
-fn list_descendant_processes(agent_pid: u32) -> Vec<SessionProcessInfo> {
-    if agent_pid == 0 {
-        return Vec::new();
-    }
-    let all = list_all_processes();
-    let mut by_ppid: std::collections::HashMap<u32, Vec<&ProcSnap>> =
-        std::collections::HashMap::new();
-    for p in &all {
-        by_ppid.entry(p.ppid).or_default().push(p);
-    }
-    let mut out = Vec::new();
-    let mut stack: Vec<(u32, u32)> = vec![(agent_pid, 0)];
-    while let Some((parent, depth)) = stack.pop() {
-        if let Some(children) = by_ppid.get(&parent) {
-            for c in children {
-                // depth 0 is the agent itself — only collect descendants.
-                let d = depth + 1;
-                let paused = c.state.starts_with('T');
-                out.push(SessionProcessInfo {
-                    pid: c.pid,
-                    ppid: c.ppid,
-                    command: c.command.clone(),
-                    etime: c.etime.clone(),
-                    state: c.state.clone(),
-                    cpu: c.cpu.clone(),
-                    mem: c.mem.clone(),
-                    depth: d,
-                    cwd: process_cwd(c.pid),
-                    paused,
-                });
-                stack.push((c.pid, d));
-            }
-        }
-    }
-    // Stable-ish: shallower first, then pid.
-    out.sort_by(|a, b| a.depth.cmp(&b.depth).then(a.pid.cmp(&b.pid)));
-    out
-}
-
-/// Find long-lived processes that look like they belong to this task/project
-/// even when no longer parented under the agent (PPID=1 after agent restart).
-fn find_related_orphans(
-    work_path: &Path,
-    project_root: &Path,
-    skip_pids: &std::collections::HashSet<u32>,
-) -> Vec<SessionProcessInfo> {
-    let work_s = work_path.display().to_string();
-    let proj_s = project_root.display().to_string();
-    // Avoid matching everything when paths are empty / too short.
-    if work_s.len() < 8 && proj_s.len() < 8 {
-        return Vec::new();
-    }
-    let work_norm = work_s.trim_end_matches('/').to_string();
-    let proj_norm = proj_s.trim_end_matches('/').to_string();
-    let self_pid = std::process::id();
-
-    let mut out = Vec::new();
-    for p in list_all_processes() {
-        if skip_pids.contains(&p.pid) || p.pid == self_pid {
-            continue;
-        }
-        // Never list our own shell / UI tooling as "task processes".
-        let cmd = &p.command;
-        if cmd.contains("grokx-desktop")
-            || cmd.contains("tauri.js")
-            || cmd.contains("vite")
-            || cmd.contains("/grok agent")
-            || cmd.contains("runtime/grok")
-        {
-            continue;
-        }
-        // Skip system / unrelated noise.
-        if cmd.starts_with("/System/")
-            || cmd.starts_with("/usr/libexec/")
-            || cmd.starts_with("/sbin/")
-            || cmd.contains("cloudflared")
-            || cmd.contains("Cursor Helper")
-            || cmd.contains("Google Chrome")
-        {
-            continue;
-        }
-
-        let cwd = process_cwd(p.pid);
-        let cwd_match = cwd
-            .as_deref()
-            .map(|c| {
-                let c = c.trim_end_matches('/');
-                (!work_norm.is_empty()
-                    && (c == work_norm || c.starts_with(&format!("{work_norm}/"))))
-                    || (!proj_norm.is_empty()
-                        && (c == proj_norm || c.starts_with(&format!("{proj_norm}/"))))
-            })
-            .unwrap_or(false);
-
-        let cmd_match = (!work_norm.is_empty() && cmd.contains(&work_norm))
-            || (!proj_norm.is_empty() && cmd.contains(&proj_norm));
-
-        // Also catch `uv run mykg …` when project leaf name is distinctive and
-        // cwd is under project (already covered) OR command includes project venv.
-        if !cwd_match && !cmd_match {
-            continue;
-        }
-
-        // Prefer root-ish processes (not every python helper under the server).
-        // Include if: listening-style long runners OR direct match on work/project.
-        let looks_like_server = cmd.contains(" web ")
-            || cmd.contains(" serve")
-            || cmd.contains("uvicorn")
-            || cmd.contains("flask")
-            || cmd.contains("django")
-            || cmd.contains("next ")
-            || cmd.contains("vite")
-            || cmd.contains("--port")
-            || cmd.contains("0.0.0.0")
-            || cmd.contains("127.0.0.1")
-            || cmd.contains("mykg web")
-            || cmd.contains("npm run")
-            || cmd.contains("pnpm ")
-            || cmd.contains("yarn ");
-
-        // Include parent shells (`uv run …`) and actual servers.
-        if !looks_like_server && !cmd_match {
-            // cwd-only match: only keep if it still looks like a user tool.
-            if !(cmd.contains("python")
-                || cmd.contains("node")
-                || cmd.contains("uv ")
-                || cmd.contains("cargo ")
-                || cmd.contains("ruby")
-                || cmd.contains("java"))
-            {
-                continue;
-            }
-        }
-
-        out.push(SessionProcessInfo {
-            pid: p.pid,
-            ppid: p.ppid,
-            command: p.command.clone(),
-            etime: p.etime.clone(),
-            state: p.state.clone(),
-            cpu: p.cpu.clone(),
-            mem: p.mem.clone(),
-            // depth 1 for orphans so they show as top-level task processes.
-            depth: 1,
-            cwd,
-            paused: p.state.starts_with('T'),
-        });
-    }
-    out
-}
-
-fn signal_process(pid: u32, kind: &str) -> Result<(), CoreError> {
-    let flag = match kind {
-        "term" => "-TERM",
-        "kill" => "-KILL",
-        "stop" => "-STOP",
-        "cont" => "-CONT",
-        other => {
-            return Err(CoreError::Message(format!("unknown signal {other}")));
-        }
-    };
-    let status = std::process::Command::new("kill")
-        .args([flag, &pid.to_string()])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map_err(|e| CoreError::Message(format!("kill {pid}: {e}")))?;
-    if status.success() || kind == "kill" {
-        Ok(())
-    } else {
-        // ESRCH / already gone is fine for stop/kill paths.
-        if !process_exists(pid) {
-            return Ok(());
-        }
-        Err(CoreError::Message(format!(
-            "kill {flag} {pid} failed ({status})"
-        )))
-    }
-}
-
-/// Signal a process and its descendants (deepest first for TERM/KILL).
-fn signal_process_tree(root: u32, kind: &str) -> Result<(), CoreError> {
-    let mut pids: Vec<u32> = list_descendant_processes(root)
-        .into_iter()
-        .map(|p| p.pid)
-        .collect();
-    pids.push(root);
-    // Deepest first so children die before parents when terminating.
-    pids.reverse();
-    let mut last_err: Option<CoreError> = None;
-    for pid in pids {
-        if let Err(e) = signal_process(pid, kind) {
-            last_err = Some(e);
-        }
-    }
-    if process_exists(root) {
-        if let Some(e) = last_err {
-            return Err(e);
-        }
-    }
-    Ok(())
-}
-
-#[cfg(test)]
-mod session_process_tests {
-    use super::*;
-
-    #[test]
-    fn parse_ps_line_basic() {
-        let s = parse_ps_line(" 123  1 01:02 0.1 0.2 S /bin/sleep 10").unwrap();
-        assert_eq!(s.pid, 123);
-        assert_eq!(s.ppid, 1);
-        assert_eq!(s.command, "/bin/sleep 10");
-    }
-}
-

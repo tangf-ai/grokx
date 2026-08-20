@@ -37,9 +37,17 @@ impl PermissionGate {
         Self::default()
     }
 
-    /// Park a permission request. Returns false if auto_approve should answer immediately.
-    pub fn should_park(auto_approve: bool) -> bool {
-        !auto_approve
+    /// Park unless full trust / YOLO. `auto` still parks so read-like tools
+    /// can be auto-allowed and everything else still reaches the UI.
+    pub fn should_park(auto_approve: bool, permission_mode: impl AsRef<str>) -> bool {
+        if auto_approve {
+            return false;
+        }
+        match permission_mode.as_ref().trim().to_ascii_lowercase().as_str() {
+            "always-approve" | "always_approve" | "yolo" | "full-trust" | "full_trust"
+            | "trusted" => false,
+            _ => true,
+        }
     }
 
     pub fn park(&mut self, entry: ParkedPermission) {
@@ -104,8 +112,8 @@ mod tests {
 
     #[test]
     fn parks_until_allow() {
-        assert!(PermissionGate::should_park(false));
-        assert!(!PermissionGate::should_park(true));
+        assert!(PermissionGate::should_park(false, "ask"));
+        assert!(!PermissionGate::should_park(true, "ask"));
 
         let mut gate = PermissionGate::new();
         gate.park(ParkedPermission {
@@ -124,6 +132,14 @@ mod tests {
         assert_eq!(outcome["outcome"]["optionId"], "allow-once");
         assert!(!gate.is_pending("req-1"));
         assert!(!decision_blocks_tool(PermissionDecision::AllowOnce));
+    }
+
+    #[test]
+    fn should_park_only_skips_full_trust() {
+        assert!(PermissionGate::should_park(false, "ask"));
+        assert!(PermissionGate::should_park(false, "auto"));
+        assert!(!PermissionGate::should_park(true, "ask"));
+        assert!(!PermissionGate::should_park(false, "always-approve"));
     }
 
     #[test]

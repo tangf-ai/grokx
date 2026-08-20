@@ -11,11 +11,25 @@ pub enum PermissionMode {
     Strict,
     /// Project-local writes auto; dangerous shell still gated.
     TrustedProject,
+    /// Skip the product gate (engine YOLO / full trust).
+    FullTrust,
 }
 
 impl Default for PermissionMode {
     fn default() -> Self {
         Self::Standard
+    }
+}
+
+impl PermissionMode {
+    /// Map the UI / settings string (`ask` | `auto` | `always-approve`).
+    pub fn from_ui(raw: &str) -> Self {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "auto" => Self::Standard,
+            "always-approve" | "always_approve" | "yolo" | "full-trust" | "full_trust"
+            | "trusted" => Self::FullTrust,
+            _ => Self::Strict,
+        }
     }
 }
 

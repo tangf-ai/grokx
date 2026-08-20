@@ -1,0 +1,140 @@
+name: release-windows
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing GitHub release tag to attach the Windows installer to (e.g. app-v0.2.6). Leave empty to create/update app-v<version> from tauri.conf.json."
+        required: false
+        type: string
+  push:
+    tags:
+      - "app-v*"
+      - "v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-windows-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 180
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+          cache-dependency-path: apps/desktop/pnpm-lock.yaml
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.94.0
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache cargo
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            engine/grok-build
+            apps/desktop/src-tauri
+
+      - name: Install protobuf compiler
+        uses: arduino/setup-protoc@v3
+        with:
+          version: "29.3"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install frontend deps
+        run: pnpm install --frozen-lockfile
+        working-directory: apps/desktop
+
+      - name: Build and bundle engine runtime
+        run: |
+          set -euo pipefail
+          if [[ -z "${PROTOC:-}" ]]; then
+            PROTOC="$(command -v protoc || true)"
+            export PROTOC
+          fi
+          if [[ -z "${PROTOC:-}" ]]; then
+            echo "error: protoc not found after setup-protoc" >&2
+            exit 1
+          fi
+          if command -v cygpath >/dev/null 2>&1 && [[ "$PROTOC" == *\\* || "$PROTOC" == [A-Za-z]:* ]]; then
+            PROTOC="$(cygpath -u "$PROTOC")"
+            export PROTOC
+          fi
+          echo "Using PROTOC=$PROTOC"
+          "$PROTOC" --version
+          ./tools/build-engine.sh
+          ./packaging/bundle_runtime.sh
+          test -f apps/desktop/src-tauri/resources/runtime/grok.exe
+          ls -la runtime-dist apps/desktop/src-tauri/resources/runtime
+          ./runtime-dist/grok.exe --version || true
+
+      - name: Resolve release tag
+        id: meta
+        run: |
+          set -euo pipefail
+          VERSION="$(node -p "require('./apps/desktop/src-tauri/tauri.conf.json').version")"
+          TAG="${{ github.event.inputs.tag || '' }}"
+          if [[ -z "$TAG" ]]; then
+            if [[ "${GITHUB_REF_TYPE:-}" == "tag" ]]; then
+              TAG="${GITHUB_REF_NAME}"
+            else
+              TAG="app-v${VERSION}"
+            fi
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "Building Grokx ${VERSION} for Windows; attach to ${TAG}"
+
+      - name: Ensure GitHub release exists
+        id: release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.meta.outputs.tag }}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Using existing release $TAG"
+          else
+            echo "Creating release $TAG"
+            gh release create "$TAG" \
+              --title "v${{ steps.meta.outputs.version }}" \
+              --notes "Windows installer for Grokx ${{ steps.meta.outputs.version }}." \
+              --target "${GITHUB_SHA}"
+          fi
+          ID="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" --jq .id)"
+          echo "id=${ID}" >> "$GITHUB_OUTPUT"
+
+      - name: Build Windows installer
+        uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CARGO_TERM_COLOR: always
+        with:
+          projectPath: apps/desktop
+          tauriScript: pnpm tauri
+          args: --bundles nsis --target x86_64-pc-windows-msvc
+          tagName: ${{ steps.meta.outputs.tag }}
+          releaseId: ${{ steps.release.outputs.id }}
+          releaseName: v${{ steps.meta.outputs.version }}
+          releaseDraft: false
+          prerelease: false
+          includeUpdaterJson: false
